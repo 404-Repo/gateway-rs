@@ -1,0 +1,6 @@
+ip = "0.0.0.0"
+port = "8080"
+name = "primary-node"
+nodes = ["127.0.0.1:8081", "127.0.0.1:8082"]
+log_path = "/var/log/node.log"
+log_level = "INFO"
