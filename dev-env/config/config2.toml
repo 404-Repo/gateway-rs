@@ -1,10 +1,11 @@
 [network]
-ip = "0.0.0.0"
-node_id = 1
-server_port = 8080
-name = "primary-node"
-node_endpoints = ["127.0.0.1:8081", "127.0.0.1:8082"]
-node_dns_names = ["primary-node", "secondary-node-1", "secondary-node-2"]
+node_id = 2
+ip = "172.25.0.3"
+server_port = 9090
+name = "secondary-node-1"
+node_endpoints = ["172.25.0.2:9090", "172.25.0.4:9090"]
+node_ids = [1,3]
+node_dns_names = ["primary-node", "secondary-node-2"]
 
 [basic]
 max_restart_attempts = 2
@@ -15,8 +16,8 @@ level = "Info"
 
 [raft]
 cluster_name = "gateway_cluster"
-election_timeout_min = 1500
-election_timeout_max = 3000
+election_timeout_min = 10000
+election_timeout_max = 15000
 heartbeat_interval = 500
 max_payload_entries = 300
 replication_lag_threshold = 500

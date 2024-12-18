@@ -1,8 +1,11 @@
+use std::time::Duration;
 use std::{env, sync::Arc};
 
 use clap::{Arg, Command};
 use common::init_tracing;
 use config::{read_config, NodeConfig};
+use raft::start_gateway;
+use tracing::info;
 
 mod common;
 mod config;
@@ -14,9 +17,9 @@ use crate::common::log_build_information;
 
 #[tokio::main]
 async fn main() {
-    let matches = Command::new("CloudStorage")
+    let matches = Command::new("Gateway")
         .version("1.0")
-        .about("Cloud storage for assets")
+        .about("Gateway")
         .arg(
             Arg::new("config")
                 .short('c')
@@ -26,7 +29,7 @@ async fn main() {
         )
         .get_matches();
 
-    let env_config = env::var("CLOUD_STORAGE_CONFIG").ok();
+    let env_config = env::var("GATEWAY_CONFIG").ok();
     let config_path: Option<&String> = matches.get_one::<String>("config").or(env_config.as_ref());
 
     let node_config: Arc<NodeConfig> = Arc::new(
@@ -35,8 +38,39 @@ async fn main() {
             .unwrap_or_else(|e| panic!("Failed to load config file: {}", e)),
     );
 
-    let _guards = init_tracing(&node_config.log_path, (&node_config.log_level).into());
+    let _guards = init_tracing(&node_config.log.path, (&node_config.log.level).into());
 
     log_build_information();
     log_app_config(&node_config);
+
+    let max_attempts = node_config.basic.max_restart_attempts;
+    let mut attempts = 0;
+
+    loop {
+        match start_gateway(node_config.clone()).await {
+            Ok(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("Received CTRL+C, shutting down...");
+                break;
+            }
+            Err(e) => {
+                attempts += 1;
+                info!(
+                    "Failed to start gateway: {e}, attempt {}/{}",
+                    attempts, max_attempts
+                );
+
+                if attempts >= max_attempts {
+                    info!(
+                        "Reached maximum restart attempts ({}). Stopping.",
+                        max_attempts
+                    );
+                    break;
+                } else {
+                    info!("Retrying...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
 }

@@ -1,0 +1,54 @@
+services:
+  primary-node:
+    image: gateway:latest
+    container_name: primary-node
+    environment:
+      - GATEWAY_CONFIG=/usr/local/bin/config.toml
+    volumes:
+      - ./config/config1.toml:/usr/local/bin/config.toml
+    networks:
+      my_network:
+        ipv4_address: 172.25.0.2
+    expose:
+      - "9090"
+      - "9091"
+
+  secondary-node-1:
+    image: gateway:latest
+    container_name: secondary-node-1
+    environment:
+      - GATEWAY_CONFIG=/usr/local/bin/config.toml
+    volumes:
+      - ./config/config2.toml:/usr/local/bin/config.toml
+    networks:
+      my_network:
+        ipv4_address: 172.25.0.3
+    expose:
+      - "9090"
+      - "9091"
+    depends_on:
+      - primary-node
+
+  secondary-node-2:
+    image: gateway:latest
+    container_name: secondary-node-2
+    environment:
+      - GATEWAY_CONFIG=/usr/local/bin/config.toml
+    volumes:
+      - ./config/config3.toml:/usr/local/bin/config.toml
+    networks:
+      my_network:
+        ipv4_address: 172.25.0.4
+    expose:
+      - "9090"
+      - "9091"
+    depends_on:
+      - primary-node
+
+networks:
+  my_network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.25.0.0/16"

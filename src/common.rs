@@ -85,6 +85,6 @@ pub fn get_build_information(html: bool) -> String {
 }
 
 pub fn log_app_config(app_config: &NodeConfig) {
-    info!("Starting cloud storage services with the following config:");
+    info!("Starting gateway service with the following config:");
     info!("{}", app_config);
 }

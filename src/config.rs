@@ -10,13 +10,45 @@ use std::{fmt, path::Path};
 use tracing::Level;
 
 #[derive(Debug, Deserialize)]
-pub struct NodeConfig {
+pub struct BasicConfig {
+    pub max_restart_attempts: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NetworkConfig {
     pub ip: String,
-    pub port: usize,
-    pub nodes: Vec<String>,
+    pub server_port: usize,
+    pub node_id: u64,
+    pub node_endpoints: Vec<String>,
+    pub node_ids: Vec<u64>,
+    pub node_dns_names: Vec<String>,
     pub name: String,
-    pub log_path: String,
-    pub log_level: LogLevel,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogConfig {
+    pub path: String,
+    pub level: LogLevel,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RaftConfig {
+    pub cluster_name: String,
+    pub election_timeout_min: u64,
+    pub election_timeout_max: u64,
+    pub heartbeat_interval: u64,
+    pub max_payload_entries: u64,
+    pub replication_lag_threshold: u64,
+    pub snapshot_max_chunk_size: u64,
+    pub max_in_snapshot_log_to_keep: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NodeConfig {
+    pub basic: BasicConfig,
+    pub network: NetworkConfig,
+    pub log: LogConfig,
+    pub raft: RaftConfig,
 }
 
 #[derive(Debug)]
@@ -74,8 +106,45 @@ impl fmt::Display for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Running a node '{}' at {}:{}",
-            self.name, self.ip, self.port
+            "NodeConfig:\n\
+            Basic:\n\
+            - Max Restart Attempts: {}\n\
+            Network:\n\
+            - Name: {}\n\
+            - IP: {}\n\
+            - Server Port: {}\n\
+            - Node ID: {}\n\
+            - Node Endpoints: {:?}\n\
+            - Node DNS Names: {:?}\n\
+            Log:\n\
+            - Path: {}\n\
+            - Level: {:?}\n\
+            Raft:\n\
+            - Cluster Name: {}\n\
+            - Election Timeout Min: {}\n\
+            - Election Timeout Max: {}\n\
+            - Heartbeat Interval: {}\n\
+            - Max Payload Entries: {}\n\
+            - Replication Lag Threshold: {}\n\
+            - Snapshot Max Chunk Size: {}\n\
+            - Max In Snapshot Log To Keep: {}",
+            self.basic.max_restart_attempts,
+            self.network.name,
+            self.network.ip,
+            self.network.server_port,
+            self.network.node_id,
+            self.network.node_endpoints,
+            self.network.node_dns_names,
+            self.log.path,
+            self.log.level,
+            self.raft.cluster_name,
+            self.raft.election_timeout_min,
+            self.raft.election_timeout_max,
+            self.raft.heartbeat_interval,
+            self.raft.max_payload_entries,
+            self.raft.replication_lag_threshold,
+            self.raft.snapshot_max_chunk_size,
+            self.raft.max_in_snapshot_log_to_keep
         )
     }
 }

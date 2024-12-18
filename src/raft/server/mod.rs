@@ -5,8 +5,8 @@ use anyhow::Result;
 use quinn::{Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::RwLock;
-use tracing::{error, info};
+use tokio::{spawn, sync::RwLock, task::JoinHandle};
+use tracing::{debug, error, info};
 
 use crate::{protocol::Protocol, raft::TypeConfig};
 
@@ -14,10 +14,12 @@ pub struct RServer {
     endpoint: Endpoint,
     server_config: ServerConfig,
     raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
+    accept_task: JoinHandle<()>,
 }
 
 impl RServer {
-    pub fn new(
+    pub async fn new(
+        addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
         raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
     ) -> Result<Self> {
@@ -26,11 +28,29 @@ impl RServer {
             None => Self::generate_self_signed_config()?,
         };
 
-        let endpoint = Endpoint::server(server_config.clone(), "0.0.0.0:0".parse()?)?;
+        let bind_addr: SocketAddr = addr.parse()?;
+        let endpoint = Endpoint::server(server_config.clone(), bind_addr)?;
+        info!("QUIC server listening on {}", bind_addr);
+
+        let endpoint_clone = endpoint.clone();
+        let raft_clone = raft.clone();
+
+        let accept_task = spawn(async move {
+            while let Some(incoming) = endpoint_clone.accept().await {
+                let raft_inner = raft_clone.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = Self::handle_incoming(incoming, raft_inner).await {
+                        error!("Connection error: {}", e);
+                    }
+                });
+            }
+        });
+
         Ok(Self {
             endpoint,
             server_config,
             raft,
+            accept_task,
         })
     }
 
@@ -43,23 +63,6 @@ impl RServer {
             vec![cert_der],
             PrivateKeyDer::Pkcs8(key.into()),
         )?)
-    }
-
-    pub async fn start(&mut self, bind_addr: &str) -> Result<()> {
-        let bind_addr: SocketAddr = bind_addr.parse()?;
-        self.endpoint = Endpoint::server(self.server_config.clone(), bind_addr)?;
-        info!("QUIC server listening on {}", bind_addr);
-
-        while let Some(incoming) = self.endpoint.accept().await {
-            let raft = self.raft.clone();
-            tokio::spawn(async move {
-                if let Err(e) = Self::handle_incoming(incoming, raft).await {
-                    error!("Connection error: {}", e);
-                }
-            });
-        }
-
-        Ok(())
     }
 
     async fn handle_incoming(
@@ -97,24 +100,27 @@ impl RServer {
         raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
     ) -> Result<()> {
         let message = Protocol::receive_message(recv).await?;
-        tracing::info!("==> Received message: {:?}", message);
+        debug!("==> Received message: {:?}", message);
 
         let response = match Protocol::handle_message(message, raft).await {
             Ok(resp) => {
-                tracing::info!("==> Client got response: {:?}", resp);
+                debug!("==> Client got response: {:?}", resp);
                 resp
             }
             Err(e) => {
-                tracing::error!("==> Error handling message: {}", e);
+                error!("==> Error handling message: {}", e);
                 return Err(e);
             }
         };
 
-        tracing::info!("==> About to send response: {:?}", response);
         let result = protocol.send_message(send, response).await;
-        tracing::info!("==> Send result: {:?}", result);
+        debug!("==> Send result: {:?}", result);
 
         Ok(())
+    }
+
+    async fn abort(&self) {
+        self.accept_task.abort();
     }
 }
 
@@ -122,9 +128,12 @@ impl RServer {
 mod tests {
     use super::*;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
+    use anyhow::Result;
     use dashmap::DashMap;
     use openraft::Config;
     use std::net::UdpSocket;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     async fn create_test_raft_node(
         node_id: u64,
@@ -161,19 +170,16 @@ mod tests {
     async fn test_server_bind() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
 
-        let mut server = RServer::new(None, raft)?;
         let addr = "127.0.0.1:4444";
+        let _server = RServer::new(addr, None, raft).await?;
 
-        let server_handle = tokio::spawn(async move {
-            server.start(addr).await.unwrap();
-        });
-
+        // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        // Try binding to the same address with a UDP socket, it should fail
         let socket = UdpSocket::bind(addr);
-        assert!(socket.is_err(), "Port should be taken by QUIC server");
+        assert!(socket.is_err(), "Port should be taken by the QUIC server.");
 
-        server_handle.abort();
         Ok(())
     }
 
@@ -181,19 +187,16 @@ mod tests {
     async fn test_server_connection() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
 
-        let mut server = RServer::new(None, raft)?;
         let addr = "127.0.0.1:4445";
+        let _server = RServer::new(addr, None, raft).await?;
 
-        let server_handle = tokio::spawn(async move {
-            server.start(addr).await.unwrap();
-        });
-
+        // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = crate::raft::client::RClient::new(addr, "127.0.0.1:0", true).await?;
+        let client =
+            crate::raft::client::RClient::new(addr, "localhost", "127.0.0.1:0", true).await?;
         assert!(client.connection.stable_id() > 0);
 
-        server_handle.abort();
         Ok(())
     }
 }

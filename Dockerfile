@@ -1,7 +1,7 @@
-FROM rust:1.82-alpine3.20 AS builder
+FROM rust:1.83-alpine3.20 AS builder
 
 RUN apk add --no-cache build-base alpine-sdk musl-dev
-RUN apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community --no-cache mold=~2.34
+RUN apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community --no-cache mold=~2.35
 WORKDIR /app
 COPY . /app
 RUN cargo build --release
