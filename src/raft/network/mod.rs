@@ -7,7 +7,6 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
-use openraft::error::RemoteError;
 use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::network::RaftNetwork;
@@ -57,7 +56,7 @@ impl Network {
 
     pub async fn send_rpc<Resp, Err>(
         &self,
-        target: NodeId,
+        _target: NodeId,
         target_node: &BasicNode,
         message: RaftMessageType,
     ) -> Result<Resp, openraft::error::RPCError<NodeId, BasicNode, Err>>
@@ -73,18 +72,25 @@ impl Network {
             openraft::error::RPCError::Unreachable(Unreachable::new(&err))
         })?;
 
-        client
-            .send::<RaftMessageType, Result<Resp, Err>>(&message)
-            .await
-            .map_err(|e| {
-                let err = NetworkStringError(e.to_string());
-                if e.downcast_ref::<quinn::ConnectionError>().is_some() {
-                    openraft::error::RPCError::Unreachable(Unreachable::new(&err))
-                } else {
-                    openraft::error::RPCError::Network(NetworkError::new(&err))
-                }
-            })?
-            .map_err(|e| openraft::error::RPCError::RemoteError(RemoteError::new(target, e)))
+        let r: RaftMessageType = client.send::<RaftMessageType>(message).await.map_err(|e| {
+            let err = NetworkStringError(e.to_string());
+            if e.downcast_ref::<quinn::ConnectionError>().is_some() {
+                openraft::error::RPCError::Unreachable(Unreachable::new(&err))
+            } else {
+                openraft::error::RPCError::Network(NetworkError::new(&err))
+            }
+        })?;
+
+        match serde_json::from_value::<Resp>(serde_json::to_value(r).map_err(|e| {
+            let err = NetworkStringError(format!("Serialization error: {}", e));
+            openraft::error::RPCError::Network(NetworkError::new(&err))
+        })?) {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                let err = NetworkStringError(format!("Deserialization error: {}", e));
+                Err(openraft::error::RPCError::Network(NetworkError::new(&err)))
+            }
+        }
     }
 }
 
@@ -92,7 +98,6 @@ impl RaftNetworkFactory<TypeConfig> for Network {
     type Network = NetworkConnection;
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        tracing::info!("CREATING A NEW Network for {node}");
         NetworkConnection {
             owner: self.clone(),
             target,
@@ -114,7 +119,6 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
-        tracing::info!("Sending AppendEntriesRequest...");
         let resp: RaftMessageType = self
             .owner
             .send_rpc(
@@ -123,7 +127,6 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
                 RaftMessageType::AppendEntriesRequest(req),
             )
             .await?;
-        tracing::info!("Got response {:?}", resp);
         Ok(resp.into_append_entries_response())
     }
 

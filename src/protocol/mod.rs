@@ -1,6 +1,7 @@
 // TODO: Remove this after the code is finalized
 #![allow(dead_code)]
 
+use std::fmt;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -17,7 +18,7 @@ use crate::raft::TypeConfig;
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB default limit
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
+#[serde(untagged)]
 pub enum RaftMessageType {
     AppendEntriesRequest(AppendEntriesRequest<TypeConfig>),
     InstallSnapshotRequest(InstallSnapshotRequest<TypeConfig>),
@@ -25,6 +26,31 @@ pub enum RaftMessageType {
     AppendEntriesResponse(AppendEntriesResponse<u64>),
     InstallSnapshotResponse(InstallSnapshotResponse<u64>),
     VoteResponse(VoteResponse<u64>),
+}
+
+impl fmt::Display for RaftMessageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RaftMessageType::AppendEntriesRequest(_) => {
+                write!(f, "AppendEntriesRequest")
+            }
+            RaftMessageType::InstallSnapshotRequest(_) => {
+                write!(f, "InstallSnapshotRequest")
+            }
+            RaftMessageType::VoteRequest(_) => {
+                write!(f, "VoteRequest")
+            }
+            RaftMessageType::AppendEntriesResponse(_) => {
+                write!(f, "AppendEntriesResponse")
+            }
+            RaftMessageType::InstallSnapshotResponse(_) => {
+                write!(f, "InstallSnapshotResponse")
+            }
+            RaftMessageType::VoteResponse(_) => {
+                write!(f, "VoteResponse")
+            }
+        }
+    }
 }
 
 impl RaftMessageType {
@@ -61,22 +87,20 @@ impl Protocol {
     }
 
     pub async fn send_message(&self, mut send: SendStream, message: RaftMessageType) -> Result<()> {
-        tracing::info!("Starting send_message");
+        let serialized = rmp_serde::to_vec_named(&message)?;
 
-        let mut serializer = rmp_serde::encode::Serializer::new(Vec::new()).with_struct_map();
-        message.serialize(&mut serializer)?;
-        let serialized = serializer.into_inner();
-
-        tracing::info!("Serialized {} bytes", serialized.len());
+        if serialized.len() > MAX_MESSAGE_SIZE {
+            return Err(anyhow::anyhow!(
+                "Message size {} exceeds maximum allowed size of {}",
+                serialized.len(),
+                MAX_MESSAGE_SIZE
+            ));
+        }
 
         send.write_all(&serialized).await?;
         send.flush().await?;
-        tracing::info!("Stream flushed and data sent");
-
-        // Best effort wait for peer to process data
-        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), send.stopped()).await;
-
         send.finish()?;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(300), send.stopped()).await;
 
         Ok(())
     }
@@ -87,7 +111,7 @@ impl Protocol {
 
         let timeout_duration = tokio::time::Duration::from_secs(3);
         let read_result = tokio::time::timeout(timeout_duration, async {
-            while let Ok(Some(n)) = recv_stream.read(&mut buffer).await {
+            while let Some(n) = recv_stream.read(&mut buffer).await? {
                 message_data.extend_from_slice(&buffer[..n]);
                 if message_data.len() > MAX_MESSAGE_SIZE {
                     return Err(anyhow::anyhow!(
@@ -100,18 +124,14 @@ impl Protocol {
         })
         .await?;
 
-        let message_data = match read_result {
-            Ok(data) => data,
-            Err(e) => return Err(e),
-        };
-
+        let message_data = read_result?;
         if message_data.is_empty() {
             return Err(anyhow::anyhow!("Received empty message"));
         }
 
-        let mut deserializer =
-            rmp_serde::decode::Deserializer::new(std::io::Cursor::new(message_data));
-        let message = RaftMessageType::deserialize(&mut deserializer)?;
+        let message: RaftMessageType = rmp_serde::from_slice(&message_data)
+            .map_err(|e| anyhow::anyhow!("Deserialization error: {:?}", e))?;
+
         Ok(message)
     }
 

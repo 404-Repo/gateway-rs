@@ -2,22 +2,18 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout};
+use quinn::{Connection, Endpoint};
 use rustls::crypto::CryptoProvider;
-use rustls::RootCertStore;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use std::time::Duration;
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 use tracing::info;
 
-use crate::protocol::MAX_MESSAGE_SIZE;
+use crate::protocol::{Protocol, RaftMessageType};
 
 #[derive(Debug, Clone)]
 pub struct RClient {
     endpoint: Endpoint,
     pub connection: Connection,
+    protocol: Protocol,
 }
 
 #[derive(Debug)]
@@ -78,16 +74,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 impl RClient {
     pub async fn new(
         remote_addr: &str,
+        server_name: &str,
         local_bind_addr: &str,
         dangerous_skip_verification: bool,
     ) -> Result<Self> {
-        info!(
-            "Creating client connection to {} from {}",
-            remote_addr, local_bind_addr
-        );
-
-        let remote_addr: SocketAddr = remote_addr.parse()?;
-        let local_bind_addr: SocketAddr = local_bind_addr.parse()?;
+        let remote_addr: std::net::SocketAddr = remote_addr.parse()?;
+        let local_bind_addr: std::net::SocketAddr = local_bind_addr.parse()?;
 
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -104,90 +96,53 @@ impl RClient {
                 .with_no_client_auth()
         } else {
             rustls::ClientConfig::builder()
-                .with_root_certificates(RootCertStore::empty())
+                .with_root_certificates(rustls::RootCertStore::empty())
                 .with_no_client_auth()
         };
 
-        let mut client_config = ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(crypto)
-                .map_err(|e| anyhow::anyhow!("Failed to create QUIC client config: {}", e))?,
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
         ));
 
-        let timeout = IdleTimeout::try_from(Duration::from_secs(10))?;
-        // Configure timeouts and keep-alive
+        let timeout = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(10))?;
         client_config.transport_config(Arc::new({
             let mut transport_config = quinn::TransportConfig::default();
-            transport_config.keep_alive_interval(Some(Duration::from_millis(100)));
+            transport_config.keep_alive_interval(Some(std::time::Duration::from_millis(100)));
             transport_config.max_idle_timeout(Some(timeout));
             transport_config
         }));
 
         let mut endpoint = Endpoint::client(local_bind_addr)?;
-        info!("Created endpoint at {}", local_bind_addr);
-
         endpoint.set_default_client_config(client_config);
 
-        let connect = endpoint.connect(remote_addr, "localhost")?;
-        info!("Initiated connection to {}", remote_addr);
-
+        let connect = endpoint.connect(remote_addr, server_name)?;
         let connection = connect.await?;
+
         info!(
             "Successfully established connection with id: {}",
             connection.stable_id()
         );
 
+        let protocol = Protocol::new(connection.clone());
+
         Ok(Self {
             endpoint,
             connection,
+            protocol,
         })
     }
 
-    pub async fn send<T, R>(&self, data: &T) -> Result<R>
+    pub async fn send<T>(&self, data: T) -> Result<RaftMessageType>
     where
-        T: Serialize,
-        R: DeserializeOwned,
+        T: Into<RaftMessageType>,
     {
-        let (mut send_stream, mut recv_stream) = self.connection.open_bi().await?;
+        let (send_stream, recv_stream) = self.connection.open_bi().await?;
 
-        let mut serializer = rmp_serde::encode::Serializer::new(Vec::new()).with_struct_map();
-        data.serialize(&mut serializer)?;
-        let serialized = serializer.into_inner();
+        let message: RaftMessageType = data.into();
+        self.protocol.send_message(send_stream, message).await?;
+        let response = Protocol::receive_message(recv_stream).await?;
 
-        send_stream.write_all(&serialized).await?;
-        send_stream.finish()?;
-
-        let mut message_data = Vec::new();
-        let mut buffer = vec![0; 8192];
-
-        let timeout_duration = tokio::time::Duration::from_secs(3);
-        let read_result = tokio::time::timeout(timeout_duration, async {
-            while let Ok(Some(n)) = recv_stream.read(&mut buffer).await {
-                message_data.extend_from_slice(&buffer[..n]);
-                if message_data.len() > MAX_MESSAGE_SIZE {
-                    return Err(anyhow::anyhow!(
-                        "Response exceeded maximum size limit of {} bytes",
-                        MAX_MESSAGE_SIZE
-                    ));
-                }
-            }
-            Ok(message_data)
-        })
-        .await?;
-
-        let message_data = match read_result {
-            Ok(data) => data,
-            Err(e) => return Err(e),
-        };
-
-        if message_data.is_empty() {
-            return Err(anyhow::anyhow!("Received empty response"));
-        }
-
-        let mut deserializer =
-            rmp_serde::decode::Deserializer::new(std::io::Cursor::new(message_data));
-        let result = R::deserialize(&mut deserializer)?;
-
-        Ok(result)
+        Ok(response)
     }
 }
 
@@ -232,42 +187,34 @@ mod tests {
     #[tokio::test]
     async fn test_client_connection() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
-        let mut server = RServer::new(None, raft)?;
         let server_addr = "127.0.0.1:8888";
 
-        let server_handle = tokio::spawn(async move {
-            server.start(server_addr).await.unwrap();
-        });
+        let _server = RServer::new(server_addr, None, raft).await?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client_addr = "127.0.0.1:8889";
-        let client = RClient::new(server_addr, client_addr, true).await?;
+        let client = RClient::new(server_addr, "localhost", client_addr, true).await?;
 
         assert!(client.connection.stable_id() > 0);
 
-        server_handle.abort();
         Ok(())
     }
 
     #[tokio::test]
     async fn test_send_data() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
-        let mut server = RServer::new(None, raft)?;
         let server_addr = "127.0.0.1:7777";
 
+        let _server = RServer::new(server_addr, None, raft).await?;
+
         println!("Starting server on {}", server_addr);
-        let server_handle = tokio::spawn(async move {
-            if let Err(e) = server.start(server_addr).await {
-                println!("Server error: {}", e);
-            }
-        });
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         println!("Creating client");
         let client_addr = "127.0.0.1:7778";
-        let client = RClient::new(server_addr, client_addr, true).await?;
+        let client = RClient::new(server_addr, "localhost", client_addr, true).await?;
 
         println!("Testing initial connection");
         assert!(client.connection.stable_id() > 0);
@@ -287,11 +234,11 @@ mod tests {
 
         println!("Sending AppendEntries request");
 
-        let response = client.send(&append_entries).await?;
+        let response = client.send(append_entries).await?;
 
         match response {
             RaftMessageType::AppendEntriesResponse(aer) => {
-                println!("Received AppendEntriesResponse {aer}");
+                println!("Received AppendEntriesResponse {}", aer);
                 Ok(())
             }
             _ => {
@@ -300,7 +247,6 @@ mod tests {
             }
         }?;
 
-        server_handle.abort();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok(())
@@ -308,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_failure() -> Result<()> {
-        let result = RClient::new("127.0.0.1:9999", "127.0.0.1:9998", true).await;
+        let result = RClient::new("127.0.0.1:9999", "localhost", "127.0.0.1:9998", true).await;
         assert!(result.is_err());
         Ok(())
     }
