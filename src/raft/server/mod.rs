@@ -119,7 +119,7 @@ impl RServer {
         Ok(())
     }
 
-    async fn abort(&self) {
+    pub async fn abort(&self) {
         self.accept_task.abort();
     }
 }

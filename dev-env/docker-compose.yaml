@@ -1,7 +1,7 @@
 services:
-  primary-node:
+  node-1:
     image: gateway:latest
-    container_name: primary-node
+    container_name: node-1
     environment:
       - GATEWAY_CONFIG=/usr/local/bin/config.toml
     volumes:
@@ -13,9 +13,9 @@ services:
       - "9090"
       - "9091"
 
-  secondary-node-1:
+  node-2:
     image: gateway:latest
-    container_name: secondary-node-1
+    container_name: node-2
     environment:
       - GATEWAY_CONFIG=/usr/local/bin/config.toml
     volumes:
@@ -26,12 +26,10 @@ services:
     expose:
       - "9090"
       - "9091"
-    depends_on:
-      - primary-node
 
-  secondary-node-2:
+  node-3:
     image: gateway:latest
-    container_name: secondary-node-2
+    container_name: node-3
     environment:
       - GATEWAY_CONFIG=/usr/local/bin/config.toml
     volumes:
@@ -42,8 +40,6 @@ services:
     expose:
       - "9090"
       - "9091"
-    depends_on:
-      - primary-node
 
 networks:
   my_network:
