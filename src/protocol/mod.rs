@@ -18,7 +18,7 @@ use crate::raft::TypeConfig;
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB default limit
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "msg_type", content = "data")]
 pub enum RaftMessageType {
     AppendEntriesRequest(AppendEntriesRequest<TypeConfig>),
     InstallSnapshotRequest(InstallSnapshotRequest<TypeConfig>),

@@ -4,7 +4,7 @@ use std::{env, sync::Arc};
 use clap::{Arg, Command};
 use common::init_tracing;
 use config::{read_config, NodeConfig};
-use raft::start_gateway;
+use raft::start_gateway_vote;
 use tracing::info;
 
 mod common;
@@ -47,7 +47,7 @@ async fn main() {
     let mut attempts = 0;
 
     loop {
-        match start_gateway(node_config.clone()).await {
+        match start_gateway_vote(node_config.clone()).await {
             Ok(_) => {
                 let _ = tokio::signal::ctrl_c().await;
                 info!("Received CTRL+C, shutting down...");
