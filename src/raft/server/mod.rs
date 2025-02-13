@@ -1,27 +1,29 @@
 // TODO: Remove this after the code is finalized
 #![allow(dead_code)]
 
+use crate::{protocol::Protocol, raft::TypeConfig};
 use anyhow::Result;
+use openraft::Raft;
 use quinn::{Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{spawn, sync::RwLock, task::JoinHandle};
+use tokio::{sync::RwLock, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
-
-use crate::{protocol::Protocol, raft::TypeConfig};
 
 pub struct RServer {
     endpoint: Endpoint,
     server_config: ServerConfig,
-    raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
+    raft: Arc<RwLock<Raft<TypeConfig>>>,
     accept_task: JoinHandle<()>,
+    cancel_token: CancellationToken,
 }
 
 impl RServer {
     pub async fn new(
         addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-        raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft<TypeConfig>>>,
     ) -> Result<Self> {
         let server_config = match cert {
             Some((cert_chain, key)) => ServerConfig::with_single_cert(cert_chain, key)?,
@@ -32,17 +34,43 @@ impl RServer {
         let endpoint = Endpoint::server(server_config.clone(), bind_addr)?;
         info!("QUIC server listening on {}", bind_addr);
 
+        let cancel_token = CancellationToken::new();
         let endpoint_clone = endpoint.clone();
         let raft_clone = raft.clone();
+        let accept_token = cancel_token.clone();
 
-        let accept_task = spawn(async move {
-            while let Some(incoming) = endpoint_clone.accept().await {
-                let raft_inner = raft_clone.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::handle_incoming(incoming, raft_inner).await {
-                        error!("Connection error: {}", e);
+        let accept_task: JoinHandle<()> = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = accept_token.cancelled() => {
+                        info!("Cancellation requested: stopping accept loop");
+                        break;
                     }
-                });
+                    maybe_incoming = endpoint_clone.accept() => {
+                        match maybe_incoming {
+                            Some(incoming) => {
+                                let connection_token = accept_token.clone();
+                                let raft_inner = raft_clone.clone();
+                                tokio::spawn(async move {
+                                    tokio::select! {
+                                        res = Self::handle_incoming(incoming, raft_inner) => {
+                                            if let Err(e) = res {
+                                                error!("Connection error: {}", e);
+                                            }
+                                        },
+                                        _ = connection_token.cancelled() => {
+                                            info!("Cancellation requested: stopping connection task");
+                                        }
+                                    }
+                                });
+                            },
+                            None => {
+                                info!("No more incoming connections");
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -51,6 +79,7 @@ impl RServer {
             server_config,
             raft,
             accept_task,
+            cancel_token,
         })
     }
 
@@ -67,13 +96,12 @@ impl RServer {
 
     async fn handle_incoming(
         incoming: Incoming,
-        raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft<TypeConfig>>>,
     ) -> Result<()> {
         let connection = incoming.await?;
         let remote_addr = connection.remote_address();
         info!("Incoming connection from {}", remote_addr);
 
-        // Keep handling requests on this connection until it's closed
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
@@ -88,7 +116,6 @@ impl RServer {
                 }
             }
         }
-
         info!("Connection closed from {}", remote_addr);
         Ok(())
     }
@@ -97,7 +124,7 @@ impl RServer {
         protocol: Protocol,
         send: SendStream,
         recv: RecvStream,
-        raft: Arc<RwLock<openraft::Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft<TypeConfig>>>,
     ) -> Result<()> {
         let message = Protocol::receive_message(recv).await?;
         debug!("==> Received message: {:?}", message);
@@ -120,6 +147,7 @@ impl RServer {
     }
 
     pub async fn abort(&self) {
+        self.cancel_token.cancel();
         self.accept_task.abort();
     }
 }

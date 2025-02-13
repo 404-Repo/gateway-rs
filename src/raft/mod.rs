@@ -15,7 +15,6 @@ use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -220,7 +219,6 @@ pub async fn start_gateway_vote(config: Arc<NodeConfig>) -> Result<Gateway> {
 
     let mut membership_nodes = BTreeMap::new();
 
-    // Add the node.
     membership_nodes.insert(
         node_id,
         BasicNode {
@@ -255,16 +253,29 @@ pub async fn start_gateway_vote(config: Arc<NodeConfig>) -> Result<Gateway> {
         ),
     }
 
-    let log_timeout = config.raft.election_timeout_max;
-
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(log_timeout)).await;
-        let binding = raft.read().await.metrics();
-        let metrics = binding.borrow();
-        if let Some(leader) = metrics.current_leader {
-            info!("Node {} sees current leader: {}", node_id, leader);
-        } else {
-            info!("Node {}: No leader elected yet", node_id);
+        let mut metrics_rx = { raft.read().await.metrics() };
+        let mut last_leader = None;
+
+        loop {
+            let current_leader = {
+                metrics_rx
+                    .changed()
+                    .await
+                    .expect("Failed to listen for metric changes");
+                let metrics = metrics_rx.borrow();
+                metrics.current_leader
+            };
+
+            if current_leader != last_leader {
+                if let Some(leader_id) = current_leader {
+                    info!("Leader changed to node {}", leader_id);
+                } else {
+                    info!("Leadership changed, but no leader is elected yet");
+                }
+
+                last_leader = current_leader;
+            }
         }
     });
 
@@ -294,7 +305,7 @@ mod tests {
     pub fn init_tracing() {
         TRACING.call_once(|| {
             tracing_subscriber::FmtSubscriber::builder()
-                .with_max_level(tracing::Level::INFO)
+                .with_max_level(tracing::Level::DEBUG)
                 .with_test_writer()
                 .init();
         });
@@ -371,6 +382,92 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    async fn wait_for_leader_consistent(
+        nodes: &[Arc<RwLock<Raft>>],
+        timeout: Duration,
+    ) -> anyhow::Result<u64> {
+        let start = std::time::Instant::now();
+
+        while start.elapsed() <= timeout {
+            let mut maybe_leader = None;
+            let mut all_agree = true;
+
+            for node in nodes {
+                let node_guard = node.read().await;
+                if let Some(current_leader) = node_guard.metrics().borrow().current_leader {
+                    match maybe_leader {
+                        Some(existing_leader) if existing_leader != current_leader => {
+                            all_agree = false;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => maybe_leader = Some(current_leader),
+                    }
+                } else {
+                    all_agree = false;
+                    break;
+                }
+            }
+
+            if all_agree {
+                if let Some(final_leader) = maybe_leader {
+                    return Ok(final_leader);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!("Not all nodes saw a consistent leader within the timeout");
+    }
+
+    async fn wait_for_leader_consistent_excluding(
+        nodes: &[Arc<RwLock<Raft>>],
+        exclude_node: u64,
+        timeout: Duration,
+    ) -> anyhow::Result<u64> {
+        let start = std::time::Instant::now();
+
+        while start.elapsed() <= timeout {
+            let mut maybe_leader = None;
+            let mut all_agree = true;
+
+            for node in nodes {
+                let node_guard = node.read().await;
+                if let Some(current_leader) = node_guard.metrics().borrow().current_leader {
+                    // Skip if the current leader is the excluded node
+                    if current_leader == exclude_node {
+                        all_agree = false;
+                        break;
+                    }
+
+                    match maybe_leader {
+                        Some(existing_leader) if existing_leader != current_leader => {
+                            all_agree = false;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => maybe_leader = Some(current_leader),
+                    }
+                } else {
+                    all_agree = false;
+                    break;
+                }
+            }
+
+            if all_agree {
+                if let Some(final_leader) = maybe_leader {
+                    return Ok(final_leader);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!("Not all nodes saw a consistent leader within the timeout");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_three_node_cluster() -> Result<()> {
         init_tracing();
@@ -578,7 +675,7 @@ mod tests {
         }
 
         // Wait until a leader is elected.
-        let leader_id = wait_for_leader(&raft_nodes, Duration::from_secs(10)).await?;
+        let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
 
         info!("Leader elected: {:?}", leader_id);
         for (i, raft) in raft_nodes.iter().enumerate() {
@@ -615,6 +712,152 @@ mod tests {
                 "State machine did not record the correct value"
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
+    async fn test_leader_failover() -> anyhow::Result<()> {
+        init_tracing();
+
+        let node_configs = vec![
+            (1, "127.0.0.1:24007"),
+            (2, "127.0.0.1:24008"),
+            (3, "127.0.0.1:24009"),
+            (4, "127.0.0.1:24010"),
+            (5, "127.0.0.1:24011"),
+        ];
+
+        let node_clients = Arc::new(DashMap::new());
+        let mut server_handles = Vec::new();
+        let mut raft_nodes = Vec::new();
+        let mut state_machines = Vec::new();
+
+        // Initialize each node in the cluster.
+        for (node_id, addr) in &node_configs {
+            let network = Network::new(node_clients.clone());
+            let log_store = LogStore::default();
+            let state_machine_store = Arc::new(StateMachineStore::default());
+            state_machines.push(state_machine_store.clone());
+
+            let config = Arc::new(
+                openraft::Config {
+                    heartbeat_interval: 500,
+                    election_timeout_min: 5000,
+                    election_timeout_max: 10000,
+                    install_snapshot_timeout: 500,
+                    enable_elect: true,
+                    enable_heartbeat: true,
+                    ..Default::default()
+                }
+                .validate()?,
+            );
+
+            let raft = Arc::new(RwLock::new(
+                Raft::new(
+                    *node_id,
+                    config.clone(),
+                    network,
+                    log_store,
+                    state_machine_store,
+                )
+                .await?,
+            ));
+            raft_nodes.push(raft.clone());
+
+            let server = RServer::new(addr, None, raft).await?;
+            server_handles.push(server);
+        }
+
+        // Give servers a moment to start up.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Connect a client to each node.
+        for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
+            let client_port = 26001 + i as u16;
+            let client_addr = format!("127.0.0.1:{}", client_port);
+            let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
+            node_clients.insert(server_addr.to_string(), client);
+        }
+
+        // Initialize the cluster membership on every node.
+        for (i, raft) in raft_nodes.clone().into_iter().enumerate() {
+            let mut initial_nodes = BTreeMap::new();
+            for (node_id, addr) in &node_configs {
+                initial_nodes.insert(
+                    *node_id,
+                    BasicNode {
+                        addr: addr.to_string(),
+                    },
+                );
+            }
+            let membership = openraft::Membership::from(initial_nodes);
+            info!(
+                "Node {} initializing with membership configuration: {:?}",
+                node_configs[i].0, membership
+            );
+
+            let init_members: BTreeMap<_, _> = membership
+                .nodes()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let raft_clone = raft.clone();
+            tokio::spawn(async move {
+                raft_clone
+                    .write()
+                    .await
+                    .initialize(init_members)
+                    .await
+                    .unwrap();
+            });
+        }
+
+        // Wait until all nodes agree on the leader.
+        let old_leader = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
+        info!("Initial leader elected: {:?}", old_leader);
+
+        // Verify that all nodes see the elected leader.
+        for (i, raft) in raft_nodes.iter().enumerate() {
+            let observed_leader = raft.read().await.metrics().borrow().current_leader;
+            assert_eq!(
+                observed_leader,
+                Some(old_leader),
+                "Node {} sees a different leader",
+                i + 1
+            );
+        }
+
+        // Simulate a leader failure by "killing" the leader's server.
+        let leader_index = node_configs
+            .iter()
+            .position(|(id, _)| *id == old_leader)
+            .expect("Leader must be one of the nodes");
+
+        info!(
+            "Simulating leader failure: killing leader node {} at {}",
+            old_leader, node_configs[leader_index].1
+        );
+        // Dropping the server handle simulates a crash.
+        let node = server_handles.remove(leader_index);
+        node.abort().await;
+        drop(node);
+
+        let raft = raft_nodes.remove(leader_index);
+        drop(raft);
+
+        let state_machine = state_machines.remove(leader_index);
+        drop(state_machine);
+
+        // Wait for a new leader to be elected and for all nodes to agree.
+        let new_leader =
+            wait_for_leader_consistent_excluding(&raft_nodes, old_leader, Duration::from_secs(30))
+                .await?;
+        info!("New leader elected: {:?}", new_leader);
+        assert_ne!(
+            new_leader, old_leader,
+            "The new leader should be different from the old leader."
+        );
 
         Ok(())
     }
