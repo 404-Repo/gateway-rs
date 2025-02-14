@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use crate::{protocol::Protocol, raft::TypeConfig};
 use anyhow::Result;
 use openraft::Raft;
