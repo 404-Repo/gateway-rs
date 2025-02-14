@@ -16,8 +16,8 @@ level = "Info"
 
 [raft]
 cluster_name = "gateway_cluster"
-election_timeout_min = 10000
-election_timeout_max = 15000
+election_timeout_min = 5000
+election_timeout_max = 10000
 heartbeat_interval = 500
 max_payload_entries = 300
 replication_lag_threshold = 500

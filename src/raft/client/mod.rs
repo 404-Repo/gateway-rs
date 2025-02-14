@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use anyhow::Result;
 use quinn::{Connection, Endpoint};
 use rustls::crypto::CryptoProvider;
