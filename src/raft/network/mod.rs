@@ -1,7 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
 use openraft::error::Unreachable;
@@ -37,11 +36,11 @@ impl StdError for NetworkStringError {}
 
 #[derive(Debug, Clone)]
 pub struct Network {
-    pub clients: Arc<DashMap<String, RClient>>,
+    pub clients: Arc<scc::HashMap<String, RClient>>,
 }
 
 impl Network {
-    pub fn new(clients: Arc<DashMap<String, RClient>>) -> Network {
+    pub fn new(clients: Arc<scc::HashMap<String, RClient>>) -> Network {
         Network { clients }
     }
 

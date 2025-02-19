@@ -1,36 +1,35 @@
-use std::time::Duration;
-use std::{env, sync::Arc};
+use clap::Parser;
+use common::log::{init_tracing, log_app_config, log_build_information};
+use std::{env, sync::Arc, time::Duration};
 
-use clap::{Arg, Command};
-use common::init_tracing;
 use config::{read_config, NodeConfig};
-use raft::start_gateway_vote;
+use raft::{start_gateway_single, start_gateway_vote};
 use tracing::info;
 
+mod api;
 mod common;
 mod config;
+mod http3;
 mod protocol;
 mod raft;
 
-use crate::common::log_app_config;
-use crate::common::log_build_information;
+#[derive(Parser, Debug)]
+#[command(name = "Gateway", version = "1.0", about = "Gateway")]
+struct Cli {
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<String>,
+
+    /// Run in single-node test mode
+    #[arg(short, long)]
+    test: bool,
+}
 
 #[tokio::main]
 async fn main() {
-    let matches = Command::new("Gateway")
-        .version("1.0")
-        .about("Gateway")
-        .arg(
-            Arg::new("config")
-                .short('c')
-                .long("config")
-                .value_name("FILE")
-                .help("Sets a custom config file"),
-        )
-        .get_matches();
+    let cli = Cli::parse();
 
     let env_config = env::var("GATEWAY_CONFIG").ok();
-    let config_path: Option<&String> = matches.get_one::<String>("config").or(env_config.as_ref());
+    let config_path: Option<&String> = cli.config.as_ref().or(env_config.as_ref());
 
     let node_config: Arc<NodeConfig> = Arc::new(
         read_config(config_path)
@@ -47,7 +46,13 @@ async fn main() {
     let mut attempts = 0;
 
     loop {
-        match start_gateway_vote(node_config.clone()).await {
+        let result = if cli.test {
+            start_gateway_single(node_config.clone()).await
+        } else {
+            start_gateway_vote(node_config.clone()).await
+        };
+
+        match result {
             Ok(_) => {
                 let _ = tokio::signal::ctrl_c().await;
                 info!("Received CTRL+C, shutting down...");
