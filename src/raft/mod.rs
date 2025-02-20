@@ -8,17 +8,23 @@ pub mod server;
 pub mod store;
 
 use anyhow::Result;
-use dashmap::DashMap;
 use network::Network;
 use openraft::BasicNode;
+use rustls::crypto::CryptoProvider;
+use salvo::conn::rustls::Keycert;
+use salvo::conn::rustls::RustlsConfig;
 use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::api::Task;
+use crate::common::queue::DupQueue;
 use crate::config::NodeConfig;
+use crate::http3::Http3Server;
 use crate::raft::client::RClient;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
@@ -31,6 +37,7 @@ pub type Raft = openraft::Raft<TypeConfig>;
 pub struct Gateway {
     pub id: NodeId,
     pub server: RServer,
+    pub http_server: Http3Server,
     pub log_store: LogStore,
     pub config: Arc<NodeConfig>,
 }
@@ -52,7 +59,25 @@ pub mod typ {
         openraft::error::RPCError<NodeId, BasicNode, RaftError<E>>;
 }
 
-pub async fn start_gateway_bootstrap(config: Arc<NodeConfig>) -> Result<Gateway> {
+#[derive(Debug)]
+pub enum GatewayMode {
+    Bootstrap,
+    Vote,
+    Single,
+}
+
+pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result<Gateway> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .or_else(|_| {
+            CryptoProvider::get_default()
+                .map(|_| ())
+                .ok_or_else(|| anyhow::anyhow!("Failed to locate any crypto provider"))
+        })?;
+
+    let task_queue: Arc<DupQueue<Task>> = Arc::new(DupQueue::new(3));
+
+    // Build the common Raft configuration.
     let raft_config = Arc::new(
         openraft::Config {
             cluster_name: config.raft.cluster_name.clone(),
@@ -70,11 +95,14 @@ pub async fn start_gateway_bootstrap(config: Arc<NodeConfig>) -> Result<Gateway>
 
     let log_store = LogStore::default();
     let state_machine_store = Arc::new(StateMachineStore::default());
-    let clients_map = Arc::new(DashMap::new());
+
+    // Set up the client map and network.
+    let clients_map = Arc::new(scc::HashMap::new());
     let network = Network {
         clients: clients_map.clone(),
     };
 
+    // Create the Raft instance.
     let raft = Arc::new(RwLock::new(
         openraft::Raft::new(
             config.network.node_id,
@@ -86,71 +114,172 @@ pub async fn start_gateway_bootstrap(config: Arc<NodeConfig>) -> Result<Gateway>
         .await?,
     ));
 
-    let server = RServer::new(
-        &format!("{}:{}", config.network.ip, config.network.server_port),
-        None,
-        raft.clone(),
-    )
-    .await?;
+    // Create the server.
+    let server_addr = format!("{}:{}", config.network.ip, config.network.server_port);
+    let server = RServer::new(&server_addr, None, raft.clone()).await?;
 
-    // Set up clients for communication with other nodes
-    for (endpoint, dns_name) in config
-        .network
-        .node_endpoints
-        .iter()
-        .zip(config.network.node_dns_names.iter())
-    {
-        let client = RClient::new(
-            endpoint,
-            dns_name,
-            &format!("{}:{}", config.network.ip, 0),
-            true,
-        )
-        .await?;
-        clients_map.insert(endpoint.clone(), client);
+    let http_addr: SocketAddr = format!("{}:{}", config.network.ip, config.http.port).parse()?;
+    let keycert = Keycert::new()
+        .cert_from_path(&config.cert.cert_file_path)?
+        .key_from_path(&config.cert.key_file_path)?;
+
+    let tls_config = RustlsConfig::new(Some(keycert));
+    let http_server =
+        Http3Server::run(http_addr, tls_config, &config.http, task_queue.clone()).await;
+
+    if let GatewayMode::Single = mode {
+        // Single-node mode: no remote client connections.
+    } else {
+        for (endpoint, dns_name) in config
+            .network
+            .node_endpoints
+            .iter()
+            .zip(config.network.node_dns_names.iter())
+        {
+            let client = RClient::new(
+                endpoint,
+                dns_name,
+                &format!("{}:{}", config.network.ip, 0),
+                true,
+            )
+            .await?;
+            clients_map
+                .insert(endpoint.clone(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
     }
 
     let node_id = config.network.node_id;
-    info!("Starting node {}", node_id);
+    info!("Starting node {} with mode {:?}", node_id, mode);
 
-    // If this node is node_id == 1, initialize the cluster.
-    if node_id == 1 {
-        let r = raft.write().await;
-        info!("Initializing the cluster with node {}", node_id);
-
-        let mut initial_nodes = BTreeMap::new();
-        initial_nodes.insert(
-            1,
-            BasicNode {
-                addr: format!("{}:{}", config.network.ip, config.network.server_port),
-            },
-        );
-
-        r.initialize(initial_nodes).await?;
-
-        for ((id, endpoint), _dns_name) in config
-            .network
-            .node_ids
-            .iter()
-            .zip(config.network.node_endpoints.iter())
-            .zip(config.network.node_dns_names.iter())
-        {
-            let node = BasicNode {
-                addr: endpoint.clone(),
-            };
-            info!(
-                "Adding node {} as a learner with endpoint: {}",
-                id, endpoint
-            );
-            r.add_learner(*id, node, true).await?;
+    match mode {
+        GatewayMode::Bootstrap => {
+            // In bootstrap mode, if this node is node 1, initialize the cluster.
+            if node_id == 1 {
+                info!("Initializing the cluster with node {}", node_id);
+                let mut initial_nodes = BTreeMap::new();
+                initial_nodes.insert(
+                    1,
+                    BasicNode {
+                        addr: server_addr.clone(),
+                    },
+                );
+                raft.write().await.initialize(initial_nodes).await?;
+                // Add the other nodes as learners.
+                for ((id, endpoint), _dns_name) in config
+                    .network
+                    .node_ids
+                    .iter()
+                    .zip(config.network.node_endpoints.iter())
+                    .zip(config.network.node_dns_names.iter())
+                {
+                    let node = BasicNode {
+                        addr: endpoint.clone(),
+                    };
+                    info!(
+                        "Adding node {} as a learner with endpoint: {}",
+                        id, endpoint
+                    );
+                    raft.write().await.add_learner(*id, node, true).await?;
+                }
+            } else {
+                info!(
+                    "Node {} started as a non-initialized node. It will be added as a learner by the leader.",
+                    node_id
+                );
+            }
         }
-    } else {
-        info!("Node {} started as a non-initialized node. It will be added as a learner by the leader.", node_id);
+        GatewayMode::Vote => {
+            let mut membership_nodes = BTreeMap::new();
+            membership_nodes.insert(
+                node_id,
+                BasicNode {
+                    addr: server_addr.clone(),
+                },
+            );
+            // Add remote nodes.
+            for (&peer_node_id, peer_endpoint) in config
+                .network
+                .node_ids
+                .iter()
+                .zip(config.network.node_endpoints.iter())
+            {
+                membership_nodes.insert(
+                    peer_node_id,
+                    BasicNode {
+                        addr: peer_endpoint.clone(),
+                    },
+                );
+            }
+            info!(
+                "Node {} initializing with membership configuration: {:?}",
+                node_id, membership_nodes
+            );
+            match raft.write().await.initialize(membership_nodes).await {
+                Ok(_) => info!("Node {} successfully initialized in vote mode", node_id),
+                Err(e) => info!(
+                    "Warning Node {} not initialized (likely already initialized): {:?}",
+                    node_id, e
+                ),
+            }
+        }
+        GatewayMode::Single => {
+            let mut membership_nodes = BTreeMap::new();
+            membership_nodes.insert(
+                node_id,
+                BasicNode {
+                    addr: server_addr.clone(),
+                },
+            );
+            info!(
+                "Node {} initializing with membership configuration: {:?}",
+                node_id, membership_nodes
+            );
+            match raft.write().await.initialize(membership_nodes).await {
+                Ok(_) => info!(
+                    "Node {} successfully initialized in single-node mode",
+                    node_id
+                ),
+                Err(e) => info!(
+                    "Warning: Node {} not initialized (likely already initialized): {:?}",
+                    node_id, e
+                ),
+            }
+        }
+    }
+
+    match mode {
+        GatewayMode::Vote | GatewayMode::Single => {
+            tokio::spawn(async move {
+                let mut metrics_rx = { raft.read().await.metrics() };
+                let mut last_leader = None;
+                loop {
+                    let current_leader = {
+                        metrics_rx
+                            .changed()
+                            .await
+                            .expect("Failed to listen for metric changes");
+                        let metrics = metrics_rx.borrow();
+                        metrics.current_leader
+                    };
+                    if current_leader != last_leader {
+                        if let Some(leader_id) = current_leader {
+                            info!("Leader changed to node {}", leader_id);
+                        } else {
+                            info!("Leadership changed, but no leader is elected yet");
+                        }
+                        last_leader = current_leader;
+                    }
+                }
+            });
+        }
+        _ => {}
     }
 
     let gateway = Gateway {
         config: config.clone(),
         id: node_id,
+        http_server,
         server,
         log_store,
     };
@@ -158,135 +287,16 @@ pub async fn start_gateway_bootstrap(config: Arc<NodeConfig>) -> Result<Gateway>
     Ok(gateway)
 }
 
+pub async fn start_gateway_bootstrap(config: Arc<NodeConfig>) -> Result<Gateway> {
+    start_gateway(GatewayMode::Bootstrap, config).await
+}
+
 pub async fn start_gateway_vote(config: Arc<NodeConfig>) -> Result<Gateway> {
-    let raft_config = Arc::new(
-        openraft::Config {
-            cluster_name: config.raft.cluster_name.clone(),
-            heartbeat_interval: config.raft.heartbeat_interval,
-            election_timeout_min: config.raft.election_timeout_min,
-            election_timeout_max: config.raft.election_timeout_max,
-            max_payload_entries: config.raft.max_payload_entries,
-            replication_lag_threshold: config.raft.replication_lag_threshold,
-            snapshot_max_chunk_size: config.raft.snapshot_max_chunk_size,
-            max_in_snapshot_log_to_keep: config.raft.max_in_snapshot_log_to_keep,
-            ..Default::default()
-        }
-        .validate()?,
-    );
+    start_gateway(GatewayMode::Vote, config).await
+}
 
-    let log_store = LogStore::default();
-    let state_machine_store = Arc::new(StateMachineStore::default());
-
-    let clients_map = Arc::new(DashMap::new());
-    let network = Network {
-        clients: clients_map.clone(),
-    };
-
-    let raft = Arc::new(RwLock::new(
-        openraft::Raft::new(
-            config.network.node_id,
-            raft_config.clone(),
-            network,
-            log_store.clone(),
-            state_machine_store,
-        )
-        .await?,
-    ));
-
-    let server_addr = format!("{}:{}", config.network.ip, config.network.server_port);
-    let server = RServer::new(&server_addr, None, raft.clone()).await?;
-
-    // Set up client connections to remote nodes.
-    // Note: The config.node_endpoints contains only remote nodes.
-    for (endpoint, dns_name) in config
-        .network
-        .node_endpoints
-        .iter()
-        .zip(config.network.node_dns_names.iter())
-    {
-        let client = RClient::new(
-            endpoint,
-            dns_name,
-            &format!("{}:{}", config.network.ip, 0),
-            true,
-        )
-        .await?;
-        clients_map.insert(endpoint.clone(), client);
-    }
-
-    let node_id = config.network.node_id;
-    info!("Starting node {} in vote mode", node_id);
-
-    let mut membership_nodes = BTreeMap::new();
-
-    membership_nodes.insert(
-        node_id,
-        BasicNode {
-            addr: format!("{}:{}", config.network.ip, config.network.server_port),
-        },
-    );
-
-    for (&peer_node_id, peer_endpoint) in config
-        .network
-        .node_ids
-        .iter()
-        .zip(config.network.node_endpoints.iter())
-    {
-        membership_nodes.insert(
-            peer_node_id,
-            BasicNode {
-                addr: peer_endpoint.clone(),
-            },
-        );
-    }
-
-    info!(
-        "Node {} initializing with membership configuration: {:?}",
-        node_id, membership_nodes
-    );
-
-    match raft.write().await.initialize(membership_nodes).await {
-        Ok(_) => info!("Node {} successfully initialized in vote mode", node_id),
-        Err(e) => info!(
-            "Warning Node {} not initialized (likely already initialized): {:?}",
-            node_id, e
-        ),
-    }
-
-    tokio::spawn(async move {
-        let mut metrics_rx = { raft.read().await.metrics() };
-        let mut last_leader = None;
-
-        loop {
-            let current_leader = {
-                metrics_rx
-                    .changed()
-                    .await
-                    .expect("Failed to listen for metric changes");
-                let metrics = metrics_rx.borrow();
-                metrics.current_leader
-            };
-
-            if current_leader != last_leader {
-                if let Some(leader_id) = current_leader {
-                    info!("Leader changed to node {}", leader_id);
-                } else {
-                    info!("Leadership changed, but no leader is elected yet");
-                }
-
-                last_leader = current_leader;
-            }
-        }
-    });
-
-    let gateway = Gateway {
-        config,
-        id: node_id,
-        server,
-        log_store,
-    };
-
-    Ok(gateway)
+pub async fn start_gateway_single(config: Arc<NodeConfig>) -> Result<Gateway> {
+    start_gateway(GatewayMode::Single, config).await
 }
 
 #[cfg(test)]
@@ -318,7 +328,7 @@ mod tests {
         node_id: u64,
         addr: &str,
         config: Arc<openraft::Config>,
-        node_clients: Arc<DashMap<String, RClient>>,
+        node_clients: Arc<scc::HashMap<String, RClient>>,
     ) -> Result<(Arc<RwLock<Raft>>, Arc<StateMachineStore>, RServer)> {
         let network = Network::new(node_clients.clone());
         let log_store = LogStore::default();
@@ -339,7 +349,7 @@ mod tests {
 
     async fn setup_cluster(
         node_configs: &[(u64, &str)],
-        node_clients: Arc<DashMap<String, RClient>>,
+        node_clients: Arc<scc::HashMap<String, RClient>>,
     ) -> Result<(
         Arc<Config>,
         Vec<Arc<RwLock<Raft>>>,
@@ -535,7 +545,7 @@ mod tests {
             (2, "127.0.0.1:21002"),
             (3, "127.0.0.1:21003"),
         ];
-        let node_clients = Arc::new(DashMap::new());
+        let node_clients = Arc::new(scc::HashMap::new());
 
         let (_config, raft_nodes, state_machines, _server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -546,7 +556,9 @@ mod tests {
             let client_port = 22001 + i;
             let client_addr = format!("127.0.0.1:{}", client_port);
             let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
-            node_clients.insert(server_addr.to_string(), client);
+            node_clients
+                .insert(server_addr.to_string(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
         // Initialize and configure the first node as leader
@@ -618,7 +630,7 @@ mod tests {
             (2, "127.0.0.1:24005"),
             (3, "127.0.0.1:24006"),
         ];
-        let node_clients = Arc::new(DashMap::new());
+        let node_clients = Arc::new(scc::HashMap::new());
 
         let (_config, raft_nodes, state_machines, _server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -629,7 +641,9 @@ mod tests {
             let client_port = 25001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
             let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
-            node_clients.insert(server_addr.to_string(), client);
+            node_clients
+                .insert(server_addr.to_string(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
         for (i, raft) in raft_nodes.clone().into_iter().enumerate() {
@@ -711,7 +725,7 @@ mod tests {
             (4, "127.0.0.1:24010"),
             (5, "127.0.0.1:24011"),
         ];
-        let node_clients = Arc::new(DashMap::new());
+        let node_clients = Arc::new(scc::HashMap::new());
 
         let (_config, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -724,7 +738,9 @@ mod tests {
             let client_port = 26001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
             let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
-            node_clients.insert(server_addr.to_string(), client);
+            node_clients
+                .insert(server_addr.to_string(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
         // Initialize the cluster membership on every node.
@@ -819,7 +835,7 @@ mod tests {
             (2, "127.0.0.1:27002"),
             (3, "127.0.0.1:27003"),
         ];
-        let node_clients = Arc::new(DashMap::new());
+        let node_clients = Arc::new(scc::HashMap::new());
 
         let (config, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&initial_configs, node_clients.clone()).await?;
@@ -830,7 +846,9 @@ mod tests {
             let client_port = 28001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
             let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
-            node_clients.insert(server_addr.to_string(), client);
+            node_clients
+                .insert(server_addr.to_string(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
         // Initialize the cluster membership with all three nodes as voters.
@@ -891,7 +909,9 @@ mod tests {
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:28004".to_string();
         let new_client = RClient::new(new_node_addr, "localhost", &new_client_addr, true).await?;
-        node_clients.insert(new_node_addr.to_string(), new_client);
+        node_clients
+            .insert(new_node_addr.to_string(), new_client)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         // Add the new node as a learner using the current leader.
         let add_learner_result = raft_nodes[leader_index]
@@ -926,7 +946,7 @@ mod tests {
             (3, "127.0.0.1:29003"),
         ];
 
-        let node_clients = Arc::new(DashMap::new());
+        let node_clients = Arc::new(scc::HashMap::new());
 
         let (config, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&initial_configs, node_clients.clone()).await?;
@@ -939,7 +959,9 @@ mod tests {
             let client_port = 30001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
             let client = RClient::new(server_addr, "localhost", &client_addr, true).await?;
-            node_clients.insert(server_addr.to_string(), client);
+            node_clients
+                .insert(server_addr.to_string(), client)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
         // Initialize the cluster membership for the initial three nodes.
@@ -982,7 +1004,9 @@ mod tests {
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:30004".to_string();
         let new_client = RClient::new(new_node_addr, "localhost", &new_client_addr, true).await?;
-        node_clients.insert(new_node_addr.to_string(), new_client);
+        node_clients
+            .insert(new_node_addr.to_string(), new_client)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         // Add the new node as a learner before promoting it to a voter.
         let add_learner_resp = raft_nodes[leader_index]

@@ -154,7 +154,6 @@ mod tests {
     use super::*;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
     use anyhow::Result;
-    use dashmap::DashMap;
     use openraft::Config;
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -166,7 +165,7 @@ mod tests {
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
-        let node_clients = DashMap::new();
+        let node_clients = scc::HashMap::new();
         let network = Network::new(Arc::new(node_clients));
 
         let config = Arc::new(

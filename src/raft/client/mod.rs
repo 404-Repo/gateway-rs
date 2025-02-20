@@ -68,6 +68,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             .supported_schemes()
     }
 }
+
 impl RClient {
     pub async fn new(
         remote_addr: &str,
@@ -150,7 +151,6 @@ mod tests {
     use crate::raft::network::Network;
     use crate::raft::server::RServer;
     use crate::raft::{LogStore, StateMachineStore, TypeConfig};
-    use dashmap::DashMap;
     use openraft::raft::AppendEntriesRequest;
     use openraft::{Config, LeaderId, Vote};
     use std::time::Duration;
@@ -162,7 +162,7 @@ mod tests {
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
-        let node_clients = DashMap::new();
+        let node_clients = scc::HashMap::new();
         let network = Network::new(Arc::new(node_clients));
 
         let config = Arc::new(

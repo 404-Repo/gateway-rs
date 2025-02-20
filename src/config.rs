@@ -14,6 +14,7 @@ pub struct BasicConfig {
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfig {
     pub ip: String,
+    pub domain: String,
     pub server_port: usize,
     pub node_id: u64,
     pub node_endpoints: Vec<String>,
@@ -40,10 +41,28 @@ pub struct RaftConfig {
     pub max_in_snapshot_log_to_keep: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HTTPConfig {
+    pub port: u32,
+    // Per minute rate limits
+    pub load_rate_limit: usize,
+    pub add_task_rate_limit: usize,
+    // Size limit for the request
+    pub request_size_limit: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Certificate {
+    pub cert_file_path: String,
+    pub key_file_path: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NodeConfig {
     pub basic: BasicConfig,
     pub network: NetworkConfig,
+    pub http: HTTPConfig,
+    pub cert: Certificate,
     pub log: LogConfig,
     pub raft: RaftConfig,
 }
@@ -104,34 +123,44 @@ impl fmt::Display for NodeConfig {
         write!(
             f,
             "NodeConfig:\n\
-            Basic:\n\
-            - Max Restart Attempts: {}\n\
-            Network:\n\
-            - Name: {}\n\
-            - IP: {}\n\
-            - Server Port: {}\n\
-            - Node ID: {}\n\
-            - Node Endpoints: {:?}\n\
-            - Node DNS Names: {:?}\n\
-            Log:\n\
-            - Path: {}\n\
-            - Level: {:?}\n\
-            Raft:\n\
-            - Cluster Name: {}\n\
-            - Election Timeout Min: {}\n\
-            - Election Timeout Max: {}\n\
-            - Heartbeat Interval: {}\n\
-            - Max Payload Entries: {}\n\
-            - Replication Lag Threshold: {}\n\
-            - Snapshot Max Chunk Size: {}\n\
-            - Max In Snapshot Log To Keep: {}",
+             Basic:\n\
+             - Max Restart Attempts: {}\n\
+             Network:\n\
+             - Name: {}\n\
+             - IP: {}\n\
+             - Domain: {}\n\
+             - Server Port: {}\n\
+             - Node ID: {}\n\
+             - Node Endpoints: {:?}\n\
+             - Node DNS Names: {:?}\n\
+             HTTP:\n\
+             - Port: {}\n\
+             Certificate:\n\
+             - Cert File Path: {}\n\
+             - Key File Path: {}\n\
+             Log:\n\
+             - Path: {}\n\
+             - Level: {:?}\n\
+             Raft:\n\
+             - Cluster Name: {}\n\
+             - Election Timeout Min: {}\n\
+             - Election Timeout Max: {}\n\
+             - Heartbeat Interval: {}\n\
+             - Max Payload Entries: {}\n\
+             - Replication Lag Threshold: {}\n\
+             - Snapshot Max Chunk Size: {}\n\
+             - Max In Snapshot Log To Keep: {}",
             self.basic.max_restart_attempts,
             self.network.name,
             self.network.ip,
+            self.network.domain,
             self.network.server_port,
             self.network.node_id,
             self.network.node_endpoints,
             self.network.node_dns_names,
+            self.http.port,
+            self.cert.cert_file_path,
+            self.cert.key_file_path,
             self.log.path,
             self.log.level,
             self.raft.cluster_name,

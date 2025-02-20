@@ -1,10 +1,22 @@
 [network]
 ip = "0.0.0.0"
+domain = ""
 node_id = 1
 server_port = 8080
 name = "primary-node"
 node_endpoints = ["127.0.0.1:8081", "127.0.0.1:8082"]
+node_ids = [2,3]
 node_dns_names = ["primary-node", "secondary-node-1", "secondary-node-2"]
+
+[http]
+port = 4443
+load_rate_limit = 10
+add_task_rate_limit = 100
+request_size_limit = 1572864
+
+[cert]
+cert_file_path = "/etc/letsencrypt/live/gateway.404.xyz/fullchain.pem"
+key_file_path = "/etc/letsencrypt/live/gateway.404.xyz/privkey.pem"
 
 [basic]
 max_restart_attempts = 2
