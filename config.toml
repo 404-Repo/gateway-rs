@@ -1,6 +1,6 @@
 [network]
 ip = "0.0.0.0"
-domain = ""
+domain = "localhost"
 node_id = 1
 server_port = 8080
 name = "primary-node"
@@ -8,18 +8,29 @@ node_endpoints = ["127.0.0.1:8081", "127.0.0.1:8082"]
 node_ids = [2,3]
 node_dns_names = ["primary-node", "secondary-node-1", "secondary-node-2"]
 
+[protocol]
+max_message_size = 65536
+send_timeout_ms = 300
+receive_message_timeout_ms = 2000
+
 [http]
+compression = true
+compression_lvl = 3
 port = 4443
 load_rate_limit = 10
+leader_rate_limit = 10
 add_task_rate_limit = 100
 request_size_limit = 1572864
 
 [cert]
-cert_file_path = "/etc/letsencrypt/live/gateway.404.xyz/fullchain.pem"
-key_file_path = "/etc/letsencrypt/live/gateway.404.xyz/privkey.pem"
+dangerous_skip_verification = true
+cert_file_path = ""
+key_file_path = ""
 
 [basic]
 max_restart_attempts = 2
+update_gateway_info_ms = 1000
+unique_validators_per_task = 3
 
 [log]
 path = "./logs/gateway.log"

@@ -4,23 +4,31 @@ use serde::Serialize;
 use super::Task;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Gateway {
-    // The identifier for this node.
-    pub id: u64,
-    // domain of the node
+pub struct GatewayInfo {
+    pub node_id: u64,
     pub domain: String,
-    // Available tasks on this gateway
-    pub available_tasks: u64,
+    pub ip: String,
+    pub name: String,
+    pub http_port: u16,
+    pub available_tasks: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadResponse {
-    pub gateways: Vec<Gateway>,
+    pub gateways: Vec<GatewayInfo>,
 }
 
 // It provides a vector of tasks, as well as number of tasks available per gateway
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTasksResponse {
     pub tasks: Vec<Task>,
-    pub gateways: Vec<Gateway>,
+    pub gateways: Vec<GatewayInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderResponse {
+    pub leader_id: u64,
+    pub domain: String,
+    pub ip: String,
+    pub http_port: u16,
 }

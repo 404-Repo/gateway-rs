@@ -9,18 +9,37 @@ use tracing::Level;
 #[derive(Debug, Deserialize)]
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
+    pub update_gateway_info_ms: u64,
+    pub unique_validators_per_task: usize,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfig {
     pub ip: String,
     pub domain: String,
-    pub server_port: usize,
+    pub server_port: u16,
     pub node_id: u64,
     pub node_endpoints: Vec<String>,
     pub node_ids: Vec<u64>,
     pub node_dns_names: Vec<String>,
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ProtocolConfig {
+    pub max_message_size: usize,
+    pub send_timeout_ms: u64,
+    pub receive_message_timeout_ms: u64,
+}
+
+impl Default for ProtocolConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: 64 * 1024,
+            send_timeout_ms: 300,
+            receive_message_timeout_ms: 2000,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,16 +62,20 @@ pub struct RaftConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HTTPConfig {
-    pub port: u32,
+    pub compression: bool,
+    pub compression_lvl: u32,
+    pub port: u16,
     // Per minute rate limits
     pub load_rate_limit: usize,
     pub add_task_rate_limit: usize,
+    pub leader_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Certificate {
+    pub dangerous_skip_verification: bool,
     pub cert_file_path: String,
     pub key_file_path: String,
 }
@@ -61,6 +84,7 @@ pub struct Certificate {
 pub struct NodeConfig {
     pub basic: BasicConfig,
     pub network: NetworkConfig,
+    pub protocol: ProtocolConfig,
     pub http: HTTPConfig,
     pub cert: Certificate,
     pub log: LogConfig,
@@ -79,6 +103,19 @@ pub enum LogLevel {
     Warn = 3,
     /// Designates very serious errors.
     Error = 4,
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let level_str = match self {
+            LogLevel::Trace => "trace",
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        };
+        write!(f, "{}", level_str)
+    }
 }
 
 impl From<&LogLevel> for Level {
@@ -120,56 +157,128 @@ impl FromStr for LogLevel {
 
 impl fmt::Display for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
+        writeln!(f, "Node Configuration:")?;
+        writeln!(f, "  [Basic]")?;
+        writeln!(
             f,
-            "NodeConfig:\n\
-             Basic:\n\
-             - Max Restart Attempts: {}\n\
-             Network:\n\
-             - Name: {}\n\
-             - IP: {}\n\
-             - Domain: {}\n\
-             - Server Port: {}\n\
-             - Node ID: {}\n\
-             - Node Endpoints: {:?}\n\
-             - Node DNS Names: {:?}\n\
-             HTTP:\n\
-             - Port: {}\n\
-             Certificate:\n\
-             - Cert File Path: {}\n\
-             - Key File Path: {}\n\
-             Log:\n\
-             - Path: {}\n\
-             - Level: {:?}\n\
-             Raft:\n\
-             - Cluster Name: {}\n\
-             - Election Timeout Min: {}\n\
-             - Election Timeout Max: {}\n\
-             - Heartbeat Interval: {}\n\
-             - Max Payload Entries: {}\n\
-             - Replication Lag Threshold: {}\n\
-             - Snapshot Max Chunk Size: {}\n\
-             - Max In Snapshot Log To Keep: {}",
-            self.basic.max_restart_attempts,
-            self.network.name,
-            self.network.ip,
-            self.network.domain,
-            self.network.server_port,
-            self.network.node_id,
-            self.network.node_endpoints,
-            self.network.node_dns_names,
-            self.http.port,
-            self.cert.cert_file_path,
-            self.cert.key_file_path,
-            self.log.path,
-            self.log.level,
-            self.raft.cluster_name,
-            self.raft.election_timeout_min,
-            self.raft.election_timeout_max,
-            self.raft.heartbeat_interval,
-            self.raft.max_payload_entries,
-            self.raft.replication_lag_threshold,
-            self.raft.snapshot_max_chunk_size,
+            "    Max Restart Attempts: {}",
+            self.basic.max_restart_attempts
+        )?;
+
+        writeln!(f, "\n  [Network]")?;
+        writeln!(f, "    Name            : {}", self.network.name)?;
+        writeln!(f, "    IP              : {}", self.network.ip)?;
+        writeln!(f, "    Domain          : {}", self.network.domain)?;
+        writeln!(f, "    Server Port     : {}", self.network.server_port)?;
+        writeln!(f, "    Node ID         : {}", self.network.node_id)?;
+        writeln!(f, "    Node Endpoints  :")?;
+        for endpoint in &self.network.node_endpoints {
+            writeln!(f, "      - {}", endpoint)?;
+        }
+        writeln!(f, "    Node IDs        :")?;
+        for nid in &self.network.node_ids {
+            writeln!(f, "      - {}", nid)?;
+        }
+        writeln!(f, "    Node DNS Names  :")?;
+        for dns in &self.network.node_dns_names {
+            writeln!(f, "      - {}", dns)?;
+        }
+
+        writeln!(f, "\n  [Protocol]")?;
+        writeln!(
+            f,
+            "    Max Message Size: {} bytes",
+            self.protocol.max_message_size
+        )?;
+
+        writeln!(f, "\n  [HTTP]")?;
+        writeln!(f, "    Port               : {}", self.http.port)?;
+        writeln!(
+            f,
+            "    Compression        : {}",
+            if self.http.compression {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )?;
+        writeln!(f, "    Compression Level  : {}", self.http.compression_lvl)?;
+        writeln!(
+            f,
+            "    Load Rate Limit    : {} per minute",
+            self.http.load_rate_limit
+        )?;
+        writeln!(
+            f,
+            "    Add Task Rate Limit: {} per minute",
+            self.http.add_task_rate_limit
+        )?;
+        writeln!(
+            f,
+            "    Leader Rate Limit  : {} per minute",
+            self.http.leader_rate_limit
+        )?;
+        writeln!(
+            f,
+            "    Request Size Limit : {} bytes",
+            self.http.request_size_limit
+        )?;
+
+        writeln!(f, "\n  [Certificate]")?;
+        writeln!(
+            f,
+            "    Dangerous Skip Verification: {}",
+            self.cert.dangerous_skip_verification
+        )?;
+        writeln!(
+            f,
+            "    Cert File Path             : {}",
+            self.cert.cert_file_path
+        )?;
+        writeln!(
+            f,
+            "    Key File Path              : {}",
+            self.cert.key_file_path
+        )?;
+
+        writeln!(f, "\n  [Log]")?;
+        writeln!(f, "    Path : {}", self.log.path)?;
+        writeln!(f, "    Level: {}", self.log.level)?;
+
+        writeln!(f, "\n  [Raft]")?;
+        writeln!(
+            f,
+            "    Cluster Name                 : {}",
+            self.raft.cluster_name
+        )?;
+        writeln!(
+            f,
+            "    Election Timeout [Min, Max]  : {} ms, {} ms",
+            self.raft.election_timeout_min, self.raft.election_timeout_max
+        )?;
+        writeln!(
+            f,
+            "    Heartbeat Interval           : {} ms",
+            self.raft.heartbeat_interval
+        )?;
+        writeln!(
+            f,
+            "    Max Payload Entries          : {}",
+            self.raft.max_payload_entries
+        )?;
+        writeln!(
+            f,
+            "    Replication Lag Threshold    : {} ms",
+            self.raft.replication_lag_threshold
+        )?;
+        writeln!(
+            f,
+            "    Snapshot Max Chunk Size      : {} bytes",
+            self.raft.snapshot_max_chunk_size
+        )?;
+        writeln!(
+            f,
+            "    Max In-Snapshot Log To Keep  : {}",
             self.raft.max_in_snapshot_log_to_keep
         )
     }

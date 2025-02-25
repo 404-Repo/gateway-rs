@@ -53,7 +53,7 @@ async fn main() {
         };
 
         match result {
-            Ok(_) => {
+            Ok(_gateway) => {
                 let _ = tokio::signal::ctrl_c().await;
                 info!("Received CTRL+C, shutting down...");
                 break;
