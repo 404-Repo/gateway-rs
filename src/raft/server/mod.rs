@@ -1,17 +1,20 @@
-use crate::{protocol::Protocol, raft::TypeConfig};
+use crate::{
+    common::cert::generate_self_signed_config, config::ProtocolConfig, protocol::Protocol,
+};
 use anyhow::Result;
-use openraft::Raft;
 use quinn::{Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use super::Raft;
+
 pub struct RServer {
     endpoint: Endpoint,
     server_config: ServerConfig,
-    raft: Arc<RwLock<Raft<TypeConfig>>>,
+    pub raft: Arc<RwLock<Raft>>,
     accept_task: JoinHandle<()>,
     cancel_token: CancellationToken,
 }
@@ -20,11 +23,12 @@ impl RServer {
     pub async fn new(
         addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-        raft: Arc<RwLock<Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft>>,
+        protocol_cfg: ProtocolConfig,
     ) -> Result<Self> {
         let server_config = match cert {
             Some((cert_chain, key)) => ServerConfig::with_single_cert(cert_chain, key)?,
-            None => Self::generate_self_signed_config()?,
+            None => generate_self_signed_config()?,
         };
 
         let bind_addr: SocketAddr = addr.parse()?;
@@ -48,9 +52,10 @@ impl RServer {
                             Some(incoming) => {
                                 let connection_token = accept_token.clone();
                                 let raft_inner = raft_clone.clone();
+                                let p_cfg = protocol_cfg.clone();
                                 tokio::spawn(async move {
                                     tokio::select! {
-                                        res = Self::handle_incoming(incoming, raft_inner) => {
+                                        res = Self::handle_incoming(incoming, raft_inner, p_cfg.clone()) => {
                                             if let Err(e) = res {
                                                 error!("Connection error: {}", e);
                                             }
@@ -80,20 +85,10 @@ impl RServer {
         })
     }
 
-    fn generate_self_signed_config() -> Result<ServerConfig> {
-        let rcgen_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-        let key = rcgen_cert.key_pair.serialize_der();
-        let cert_der: CertificateDer<'static> = rcgen_cert.cert.der().to_vec().into();
-
-        Ok(ServerConfig::with_single_cert(
-            vec![cert_der],
-            PrivateKeyDer::Pkcs8(key.into()),
-        )?)
-    }
-
     async fn handle_incoming(
         incoming: Incoming,
-        raft: Arc<RwLock<Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft>>,
+        protocol_cfg: ProtocolConfig,
     ) -> Result<()> {
         let connection = incoming.await?;
         let remote_addr = connection.remote_address();
@@ -102,7 +97,12 @@ impl RServer {
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    let protocol = Protocol::new(connection.clone());
+                    let protocol = Protocol::new(
+                        connection.clone(),
+                        protocol_cfg.max_message_size,
+                        Duration::from_millis(protocol_cfg.send_timeout_ms),
+                        Duration::from_millis(protocol_cfg.receive_message_timeout_ms),
+                    );
                     if let Err(e) = Self::handle_request(protocol, send, recv, raft.clone()).await {
                         error!("Error handling request: {}", e);
                     }
@@ -121,12 +121,12 @@ impl RServer {
         protocol: Protocol,
         send: SendStream,
         recv: RecvStream,
-        raft: Arc<RwLock<Raft<TypeConfig>>>,
+        raft: Arc<RwLock<Raft>>,
     ) -> Result<()> {
-        let message = Protocol::receive_message(recv).await?;
+        let message = protocol.receive_message(recv).await?;
         debug!("==> Received message: {:?}", message);
 
-        let response = match Protocol::handle_message(message, raft).await {
+        let response = match protocol.handle_message(message, raft).await {
             Ok(resp) => {
                 debug!("==> Client got response: {:?}", resp);
                 resp
@@ -152,6 +152,7 @@ impl RServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MAX_MESSAGE_SIZE;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
     use anyhow::Result;
     use openraft::Config;
@@ -193,9 +194,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_bind() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
+        let pcfg = ProtocolConfig::default();
 
         let addr = "127.0.0.1:4444";
-        let _server = RServer::new(addr, None, raft).await?;
+        let _server = RServer::new(addr, None, raft, pcfg).await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -210,15 +212,23 @@ mod tests {
     #[tokio::test]
     async fn test_server_connection() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
+        let pcfg = ProtocolConfig::default();
 
         let addr = "127.0.0.1:4445";
-        let _server = RServer::new(addr, None, raft).await?;
+        let _server = RServer::new(addr, None, raft, pcfg.clone()).await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client =
-            crate::raft::client::RClient::new(addr, "localhost", "127.0.0.1:0", true).await?;
+        let client = crate::raft::client::RClient::new(
+            addr,
+            "localhost",
+            "127.0.0.1:0",
+            MAX_MESSAGE_SIZE,
+            true,
+            pcfg,
+        )
+        .await?;
         assert!(client.connection.stable_id() > 0);
 
         Ok(())

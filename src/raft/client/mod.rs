@@ -1,72 +1,21 @@
 use anyhow::Result;
 use quinn::{Connection, Endpoint};
 use rustls::crypto::CryptoProvider;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::info;
 
-use crate::protocol::{Protocol, RaftMessageType};
+use crate::{
+    common::cert::SkipServerVerification,
+    config::ProtocolConfig,
+    protocol::{Protocol, RaftMessageType},
+};
 
 #[derive(Debug, Clone)]
 pub struct RClient {
     endpoint: Endpoint,
     pub connection: Connection,
     protocol: Protocol,
-}
-
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
+    max_message_size: usize,
 }
 
 impl RClient {
@@ -74,7 +23,9 @@ impl RClient {
         remote_addr: &str,
         server_name: &str,
         local_bind_addr: &str,
+        max_message_size: usize,
         dangerous_skip_verification: bool,
+        protocol_cfg: ProtocolConfig,
     ) -> Result<Self> {
         let remote_addr: std::net::SocketAddr = remote_addr.parse()?;
         let local_bind_addr: std::net::SocketAddr = local_bind_addr.parse()?;
@@ -121,12 +72,21 @@ impl RClient {
             connection.stable_id()
         );
 
-        let protocol = Protocol::new(connection.clone());
+        let send_timeout = Duration::from_millis(protocol_cfg.send_timeout_ms);
+        let receive_timeout = Duration::from_millis(protocol_cfg.receive_message_timeout_ms);
+
+        let protocol = Protocol::new(
+            connection.clone(),
+            protocol_cfg.max_message_size,
+            send_timeout,
+            receive_timeout,
+        );
 
         Ok(Self {
             endpoint,
             connection,
             protocol,
+            max_message_size,
         })
     }
 
@@ -138,7 +98,7 @@ impl RClient {
 
         let message: RaftMessageType = data.into();
         self.protocol.send_message(send_stream, message).await?;
-        let response = Protocol::receive_message(recv_stream).await?;
+        let response = self.protocol.receive_message(recv_stream).await?;
 
         Ok(response)
     }
@@ -147,7 +107,8 @@ impl RClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RaftMessageType;
+    use crate::config::ProtocolConfig;
+    use crate::protocol::{RaftMessageType, MAX_MESSAGE_SIZE};
     use crate::raft::network::Network;
     use crate::raft::server::RServer;
     use crate::raft::{LogStore, StateMachineStore, TypeConfig};
@@ -184,14 +145,23 @@ mod tests {
     #[tokio::test]
     async fn test_client_connection() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
+        let pcfg = ProtocolConfig::default();
         let server_addr = "127.0.0.1:8888";
 
-        let _server = RServer::new(server_addr, None, raft).await?;
+        let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client_addr = "127.0.0.1:8889";
-        let client = RClient::new(server_addr, "localhost", client_addr, true).await?;
+        let client = RClient::new(
+            server_addr,
+            "localhost",
+            client_addr,
+            MAX_MESSAGE_SIZE,
+            true,
+            pcfg,
+        )
+        .await?;
 
         assert!(client.connection.stable_id() > 0);
 
@@ -201,9 +171,10 @@ mod tests {
     #[tokio::test]
     async fn test_send_data() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
+        let pcfg = ProtocolConfig::default();
         let server_addr = "127.0.0.1:7777";
 
-        let _server = RServer::new(server_addr, None, raft).await?;
+        let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
 
         println!("Starting server on {}", server_addr);
 
@@ -211,7 +182,15 @@ mod tests {
 
         println!("Creating client");
         let client_addr = "127.0.0.1:7778";
-        let client = RClient::new(server_addr, "localhost", client_addr, true).await?;
+        let client = RClient::new(
+            server_addr,
+            "localhost",
+            client_addr,
+            MAX_MESSAGE_SIZE,
+            true,
+            pcfg.clone(),
+        )
+        .await?;
 
         println!("Testing initial connection");
         assert!(client.connection.stable_id() > 0);
@@ -251,7 +230,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_failure() -> Result<()> {
-        let result = RClient::new("127.0.0.1:9999", "localhost", "127.0.0.1:9998", true).await;
+        let pcfg = ProtocolConfig::default();
+        let result = RClient::new(
+            "127.0.0.1:9999",
+            "localhost",
+            "127.0.0.1:9998",
+            MAX_MESSAGE_SIZE,
+            true,
+            pcfg,
+        )
+        .await;
         assert!(result.is_err());
         Ok(())
     }

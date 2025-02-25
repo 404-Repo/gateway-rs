@@ -5,13 +5,13 @@ use serde::Serialize;
 // The Gateway will assign a unique ID, which will be included in the response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTaskRequest {
-    pub prompt: String,
     pub api_key: String,
+    pub prompt: String,
 }
 
 // Validator hotkey must be verified
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTasksRequest {
-    pub requested_task_count: usize,
     pub hotkey: String,
+    pub requested_task_count: usize,
 }

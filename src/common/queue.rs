@@ -1,9 +1,12 @@
-use scc::HashSet;
+use foldhash::quality::RandomState;
+use scc::HashMap;
 use scc::Queue;
 use std::hash::Hash;
 use uuid::Uuid;
 
 use crate::api::HasUuid;
+
+const HASHMAP_START_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 struct QueueEntry<T> {
@@ -14,15 +17,15 @@ struct QueueEntry<T> {
 pub struct DupQueue<T> {
     dup: usize,
     q: Queue<QueueEntry<T>>,
-    sent: HashSet<(Uuid, String)>,
+    sent: HashMap<(Uuid, String), (), RandomState>,
 }
 
-impl<T: Clone + Eq + Hash + HasUuid + 'static> DupQueue<T> {
+impl<T: Clone + Hash + HasUuid + 'static> DupQueue<T> {
     pub fn new(dup: usize) -> Self {
         Self {
             dup,
             q: Queue::default(),
-            sent: HashSet::default(),
+            sent: HashMap::with_capacity_and_hasher(HASHMAP_START_CAPACITY, RandomState::default()),
         }
     }
 
@@ -35,36 +38,36 @@ impl<T: Clone + Eq + Hash + HasUuid + 'static> DupQueue<T> {
 
     pub fn pop(&self, num: usize, hotkey: &str) -> Vec<T> {
         let mut result = Vec::with_capacity(num);
-        let mut tmp = Vec::new();
-
         while result.len() < num {
-            match self.q.pop() {
-                Some(shared_entry) => {
+            match self.q.pop_if(|entry| {
+                let key = (*entry.item.id(), hotkey.to_string());
+                !self.sent.contains(&key)
+            }) {
+                Ok(Some(shared_entry)) => {
                     let mut entry = (*shared_entry).clone();
                     let hotkey_str = hotkey.to_string();
                     let key = (*entry.item.id(), hotkey_str.clone());
-
-                    if self.sent.insert(key).is_ok() {
+                    // Try to insert the key into the map; if it was absent, then process.
+                    if self.sent.insert(key.clone(), ()).is_ok() {
                         result.push(entry.item.clone());
                         entry.count -= 1;
+                        // If there are duplicates remaining, push the entry back;
+                        // otherwise remove the key.
                         if entry.count > 0 {
                             self.q.push((*entry).clone());
                         } else {
-                            self.sent.remove(&(*entry.item.id(), hotkey_str));
+                            self.sent.remove(&key);
                         }
-                    } else {
-                        tmp.push(entry);
                     }
                 }
-                None => break,
+                Ok(None) | Err(_) => break,
             }
         }
-
-        for entry in tmp {
-            self.q.push((*entry).clone());
-        }
-
         result
+    }
+
+    pub fn len(&self) -> usize {
+        self.q.len()
     }
 }
 

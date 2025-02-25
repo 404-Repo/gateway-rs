@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use openraft::anyerror;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
 use openraft::error::Unreachable;
@@ -18,6 +19,7 @@ use serde::de::DeserializeOwned;
 use std::error::Error as StdError;
 
 use super::NodeId;
+use crate::protocol::ConversionError;
 use crate::protocol::RaftMessageType;
 use crate::raft::client::RClient;
 use crate::raft::typ;
@@ -123,7 +125,13 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
                 RaftMessageType::AppendEntriesRequest(req),
             )
             .await?;
-        Ok(resp.into_append_entries_response())
+
+        let message = resp.try_into().map_err(|e: ConversionError| {
+            typ::RPCError::Network(openraft::error::NetworkError::from(
+                anyerror::AnyError::new(&e),
+            ))
+        })?;
+        Ok(message)
     }
 
     async fn install_snapshot(
@@ -139,7 +147,13 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
                 RaftMessageType::InstallSnapshotRequest(req),
             )
             .await?;
-        Ok(resp.into_install_snapshot_response())
+
+        let message = resp.try_into().map_err(|e: ConversionError| {
+            typ::RPCError::Network(openraft::error::NetworkError::from(
+                anyerror::AnyError::new(&e),
+            ))
+        })?;
+        Ok(message)
     }
 
     async fn vote(
@@ -155,6 +169,12 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
                 RaftMessageType::VoteRequest(req),
             )
             .await?;
-        Ok(resp.into_vote_response())
+
+        let message = resp.try_into().map_err(|e: ConversionError| {
+            typ::RPCError::Network(openraft::error::NetworkError::from(
+                anyerror::AnyError::new(&e),
+            ))
+        })?;
+        Ok(message)
     }
 }
