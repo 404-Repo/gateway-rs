@@ -7,7 +7,6 @@ use std::sync::Arc;
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
-use salvo::http::Method;
 use salvo::prelude::*;
 use salvo::rate_limiter::{
     BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
@@ -22,6 +21,8 @@ use crate::common::queue::DupQueue;
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
 
+use super::error::ServerError;
+
 pub type H3RateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
@@ -29,211 +30,145 @@ pub type H3RateLimiter = RateLimiter<
     BasicQuota,
 >;
 
-// curl --http3 -X POST -H "Content-Type: application/json" -d '{"prompt": "mechanic robot"}' -k https://gateway.404.xyz:4443/add_task
+// curl --http3 -X POST -H "Content-Type: application/json" -d '{"api_key": "XXXX", "prompt": "mechanic robot"}' -k https://gateway.404.xyz:4443/add_task
 #[handler]
-async fn add_task_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if req.method() != Method::POST {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        res.render(Text::Plain("Method Not Allowed"));
-        return;
-    }
-
-    let add_task = match req.parse_json::<AddTaskRequest>().await {
-        Ok(task) => task,
-        Err(err) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(Text::Plain(format!("Bad Request: {}", err)));
-            return;
-        }
-    };
+async fn add_task_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let add_task = req
+        .parse_json::<AddTaskRequest>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let task = Task {
         id: Uuid::new_v4(),
         prompt: add_task.prompt,
     };
 
-    let queue = match depot.obtain::<Arc<DupQueue<Task>>>() {
-        Ok(queue) => queue,
-        Err(err_opt) => {
-            if let Some(err) = err_opt {
-                error!("Failed to obtain the task queue: {:?}", err);
-            } else {
-                error!("Failed to obtain the task queue: unknown error");
-            }
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Plain(
-                "Internal Server Error: Task queue unavailable.",
-            ));
-            return;
+    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+        if let Some(err) = err_opt {
+            error!("Failed to obtain the task queue: {:?}", err);
+            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
+        } else {
+            error!("Failed to obtain the task queue: unknown error");
+            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
         }
-    };
+    })?;
 
     queue.push(task.clone());
     info!("A new task has been pushed with ID: {}", task.id);
     res.render(Json(task));
+    Ok(())
 }
 
 #[handler]
-async fn get_tasks_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if req.method() != Method::POST {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        res.render(Text::Plain("Method Not Allowed"));
-        return;
-    }
+async fn get_tasks_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let get_tasks = req
+        .parse_json::<GetTasksRequest>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let get_tasks = match req.parse_json::<GetTasksRequest>().await {
-        Ok(gt) => gt,
-        Err(err) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(Text::Plain(format!("Bad Request: {}", err)));
-            return;
-        }
-    };
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain the state reader: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
 
-    let gateway_state = match depot.obtain::<GatewayState>() {
-        Ok(gt) => gt,
-        Err(e) => {
-            error!("Failed to obtain the state reader: {:?}", e);
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Plain("Internal Server Error"));
-            return;
+    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+        if let Some(err) = err_opt {
+            error!("Failed to obtain the task queue: {:?}", err);
+            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
+        } else {
+            error!("Failed to obtain the task queue: unknown error");
+            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
         }
-    };
-
-    // TODO: verify hotkey
-    let queue = match depot.obtain::<Arc<DupQueue<Task>>>() {
-        Ok(queue) => queue,
-        Err(err_opt) => {
-            if let Some(err) = err_opt {
-                error!("Failed to obtain the task queue: {:?}", err);
-            } else {
-                error!("Failed to obtain the task queue: unknown error");
-            }
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Plain(
-                "Internal Server Error: Task queue unavailable.",
-            ));
-            return;
-        }
-    };
+    })?;
 
     let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
-    let gateways = {
-        let membership = gateway_state.membership().await;
-        gateway_state.gateways(membership).await
-    };
+    let membership = gateway_state.membership().await;
+    let gateways = gateway_state
+        .gateways(membership)
+        .await
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
 
-    let gateways = match gateways {
-        Ok(g) => g,
-        Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Plain(format!("Internal Server Error: {e}")));
-            return;
-        }
-    };
-
-    // TODO: obtain and use gateway info
     let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));
+    Ok(())
 }
 
 // curl --http3 -X GET -k https://gateway.404.xyz:4443/load
 #[handler]
-async fn get_load_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if req.method() == Method::GET {
-        let gateway_state = match depot.obtain::<GatewayState>() {
-            Ok(gs) => gs,
-            Err(_) => {
-                error!("Failed to obtain the raft");
-                return;
-            }
-        };
+async fn get_load_handler(
+    depot: &mut Depot,
+    _req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
+    let membership = gateway_state.membership().await;
+    let gateways = gateway_state.gateways(membership).await.unwrap_or_default();
 
-        let membership = gateway_state.membership().await;
-        let gateways = gateway_state.gateways(membership).await.unwrap_or_default();
-
-        let load_response = LoadResponse { gateways };
-        res.render(Json(load_response));
-    } else {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        res.render(Text::Plain("Method Not Allowed"));
-    }
+    let load_response = LoadResponse { gateways };
+    res.render(Json(load_response));
+    Ok(())
 }
 
 #[handler]
-async fn write_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if req.method() != Method::POST {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        res.render(Text::Plain("Method Not Allowed"));
-        return;
-    }
+async fn write_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let gi = req
+        .parse_json::<GatewayInfo>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gi = match req.parse_json::<GatewayInfo>().await {
-        Ok(gt) => gt,
-        Err(err) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(Text::Plain(format!("Bad Request: {}", err)));
-            return;
-        }
-    };
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
 
-    let gateway_state = match depot.obtain::<GatewayState>() {
-        Ok(gs) => gs,
-        Err(_) => {
-            error!("Failed to obtain GatewayState");
-            return;
-        }
-    };
-
-    match gateway_state.set_gateway_info(gi).await {
-        Ok(_) => {
-            res.status_code(StatusCode::OK);
-            res.render(Text::Plain("Ok"));
-        }
-        Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(Text::Plain(format!("Error: {}", e)));
-            return;
-        }
-    }
+    gateway_state
+        .set_gateway_info(gi)
+        .await
+        .map_err(|e| ServerError::Internal(format!("Failed to set gateway info: {:?}", e)))?;
+    res.status_code(StatusCode::OK);
+    res.render(Text::Plain("Ok"));
+    Ok(())
 }
 
 #[handler]
-async fn get_leader_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if req.method() == Method::GET {
-        let gateway_state = match depot.obtain::<GatewayState>() {
-            Ok(gt) => gt,
-            Err(e) => {
-                error!("Failed to obtain GatewayState: {:?}", e);
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                res.render(Text::Plain("Internal Server Error"));
-                return;
-            }
-        };
+async fn get_leader_handler(
+    depot: &mut Depot,
+    _req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
+    let leader_id = gateway_state.leader().await.unwrap_or(0);
+    let gateway_info = gateway_state.gateway(leader_id).await.map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
 
-        let leader_id = gateway_state.leader().await.unwrap_or(0);
-
-        match gateway_state.gateway(leader_id).await {
-            Ok(gateway_info) => {
-                let load_response = LeaderResponse {
-                    leader_id,
-                    domain: gateway_info.domain,
-                    ip: gateway_info.ip,
-                    http_port: gateway_info.http_port,
-                };
-
-                res.render(Json(load_response));
-            }
-            Err(e) => {
-                error!("Failed to obtain GatewayState: {:?}", e);
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                res.render(Text::Plain("Internal Server Error"));
-            }
-        }
-    } else {
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        res.render(Text::Plain("Method Not Allowed"));
-    }
+    let response = LeaderResponse {
+        leader_id,
+        domain: gateway_info.domain,
+        ip: gateway_info.ip,
+        http_port: gateway_info.http_port,
+    };
+    res.render(Json(response));
+    Ok(())
 }
 
 pub struct Http3Server {
