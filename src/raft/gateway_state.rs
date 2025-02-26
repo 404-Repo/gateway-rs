@@ -1,30 +1,33 @@
 use super::store::Request;
-use super::{Raft, StateMachineStore};
+use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use anyhow::Result;
+use openraft::{BasicNode, RaftMetrics};
 use serde_json;
 use std::fmt;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 #[derive(Debug)]
-pub enum StateReaderError {
+pub enum GatewayStateError {
     NotFound(String),
     DeserializeError(serde_json::Error),
 }
 
-impl fmt::Display for StateReaderError {
+impl fmt::Display for GatewayStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StateReaderError::NotFound(key) => write!(f, "No gateway info found for key '{}'", key),
-            StateReaderError::DeserializeError(e) => {
+            GatewayStateError::NotFound(key) => {
+                write!(f, "No gateway info found for key '{}'", key)
+            }
+            GatewayStateError::DeserializeError(e) => {
                 write!(f, "Error deserializing gateway info: {}", e)
             }
         }
     }
 }
 
-impl std::error::Error for StateReaderError {}
+impl std::error::Error for GatewayStateError {}
 
 #[derive(Clone)]
 pub struct GatewayState {
@@ -41,6 +44,10 @@ impl GatewayState {
         self.raft.read().await.metrics().borrow().current_leader
     }
 
+    pub async fn metrics(&self) -> watch::Receiver<RaftMetrics<NodeId, BasicNode>> {
+        self.raft.read().await.metrics()
+    }
+
     pub async fn membership(&self) -> Vec<u64> {
         self.raft
             .read()
@@ -54,17 +61,17 @@ impl GatewayState {
             .collect()
     }
 
-    pub async fn gateway(&self, n: u64) -> Result<GatewayInfo, StateReaderError> {
+    pub async fn gateway(&self, n: u64) -> Result<GatewayInfo, GatewayStateError> {
         let guard = self.state.state_machine.read().await;
         let key = n.to_string();
         let json_str = guard
             .data
             .get(&key)
-            .ok_or_else(|| StateReaderError::NotFound(key.clone()))?;
-        serde_json::from_str::<GatewayInfo>(json_str).map_err(StateReaderError::DeserializeError)
+            .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?;
+        serde_json::from_str::<GatewayInfo>(json_str).map_err(GatewayStateError::DeserializeError)
     }
 
-    pub async fn gateways(&self, nodes: Vec<u64>) -> Result<Vec<GatewayInfo>, StateReaderError> {
+    pub async fn gateways(&self, nodes: Vec<u64>) -> Result<Vec<GatewayInfo>, GatewayStateError> {
         let guard = self.state.state_machine.read().await;
 
         nodes
@@ -74,9 +81,9 @@ impl GatewayState {
                 let json_str = guard
                     .data
                     .get(&key)
-                    .ok_or_else(|| StateReaderError::NotFound(key.clone()))?;
+                    .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?;
                 serde_json::from_str::<GatewayInfo>(json_str)
-                    .map_err(StateReaderError::DeserializeError)
+                    .map_err(GatewayStateError::DeserializeError)
             })
             .collect()
     }

@@ -90,6 +90,16 @@ async fn get_tasks_handler(depot: &mut Depot, req: &mut Request, res: &mut Respo
         }
     };
 
+    let gateway_state = match depot.obtain::<GatewayState>() {
+        Ok(gt) => gt,
+        Err(e) => {
+            error!("Failed to obtain the state reader: {:?}", e);
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Text::Plain("Internal Server Error"));
+            return;
+        }
+    };
+
     // TODO: verify hotkey
     let queue = match depot.obtain::<Arc<DupQueue<Task>>>() {
         Ok(queue) => queue,
@@ -108,11 +118,22 @@ async fn get_tasks_handler(depot: &mut Depot, req: &mut Request, res: &mut Respo
     };
 
     let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
-    // TODO: obtain and use gateway info
-    let response = GetTasksResponse {
-        tasks,
-        gateways: vec![],
+    let gateways = {
+        let membership = gateway_state.membership().await;
+        gateway_state.gateways(membership).await
     };
+
+    let gateways = match gateways {
+        Ok(g) => g,
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Text::Plain(format!("Internal Server Error: {e}")));
+            return;
+        }
+    };
+
+    // TODO: obtain and use gateway info
+    let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));
 }
 
@@ -121,7 +142,7 @@ async fn get_tasks_handler(depot: &mut Depot, req: &mut Request, res: &mut Respo
 async fn get_load_handler(depot: &mut Depot, req: &mut Request, res: &mut Response) {
     if req.method() == Method::GET {
         let gateway_state = match depot.obtain::<GatewayState>() {
-            Ok(sr) => sr,
+            Ok(gs) => gs,
             Err(_) => {
                 error!("Failed to obtain the raft");
                 return;
@@ -157,7 +178,7 @@ async fn write_handler(depot: &mut Depot, req: &mut Request, res: &mut Response)
     };
 
     let gateway_state = match depot.obtain::<GatewayState>() {
-        Ok(sr) => sr,
+        Ok(gs) => gs,
         Err(_) => {
             error!("Failed to obtain GatewayState");
             return;
@@ -183,7 +204,7 @@ async fn get_leader_handler(depot: &mut Depot, req: &mut Request, res: &mut Resp
         let gateway_state = match depot.obtain::<GatewayState>() {
             Ok(gt) => gt,
             Err(e) => {
-                error!("Failed to obtain the state reader: {:?}", e);
+                error!("Failed to obtain GatewayState: {:?}", e);
                 res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                 res.render(Text::Plain("Internal Server Error"));
                 return;
@@ -204,7 +225,7 @@ async fn get_leader_handler(depot: &mut Depot, req: &mut Request, res: &mut Resp
                 res.render(Json(load_response));
             }
             Err(e) => {
-                error!("Failed to obtain gateway info: {:?}", e);
+                error!("Failed to obtain GatewayState: {:?}", e);
                 res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                 res.render(Text::Plain("Internal Server Error"));
             }
@@ -311,7 +332,7 @@ impl Http3Server {
             .push(Router::with_path("/write").post(write_handler))
     }
 
-    pub async fn stop(&self) {
+    pub fn abort(&self) {
         self.join_handle.abort();
     }
 }

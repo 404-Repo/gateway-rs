@@ -112,6 +112,7 @@ mod tests {
     use crate::raft::network::Network;
     use crate::raft::server::RServer;
     use crate::raft::{LogStore, StateMachineStore, TypeConfig};
+    use foldhash::quality::RandomState;
     use openraft::raft::AppendEntriesRequest;
     use openraft::{Config, LeaderId, Vote};
     use std::time::Duration;
@@ -123,7 +124,7 @@ mod tests {
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
-        let node_clients = scc::HashMap::new();
+        let node_clients = scc::HashMap::with_capacity_and_hasher(5, RandomState::default());
         let network = Network::new(Arc::new(node_clients));
 
         let config = Arc::new(
