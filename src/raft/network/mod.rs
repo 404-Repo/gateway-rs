@@ -1,6 +1,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use foldhash::quality::RandomState;
+
 use openraft::anyerror;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
@@ -38,11 +40,11 @@ impl StdError for NetworkStringError {}
 
 #[derive(Debug, Clone)]
 pub struct Network {
-    pub clients: Arc<scc::HashMap<String, RClient>>,
+    pub clients: Arc<scc::HashMap<String, RClient, RandomState>>,
 }
 
 impl Network {
-    pub fn new(clients: Arc<scc::HashMap<String, RClient>>) -> Network {
+    pub fn new(clients: Arc<scc::HashMap<String, RClient, RandomState>>) -> Network {
         Network { clients }
     }
 

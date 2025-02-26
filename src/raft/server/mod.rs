@@ -143,7 +143,7 @@ impl RServer {
         Ok(())
     }
 
-    pub async fn abort(&self) {
+    pub fn abort(&self) {
         self.cancel_token.cancel();
         self.accept_task.abort();
     }
@@ -155,6 +155,7 @@ mod tests {
     use crate::protocol::MAX_MESSAGE_SIZE;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
     use anyhow::Result;
+    use foldhash::quality::RandomState;
     use openraft::Config;
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -166,7 +167,7 @@ mod tests {
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
-        let node_clients = scc::HashMap::new();
+        let node_clients = scc::HashMap::with_capacity_and_hasher(5, RandomState::default());
         let network = Network::new(Arc::new(node_clients));
 
         let config = Arc::new(

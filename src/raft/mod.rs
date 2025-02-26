@@ -10,6 +10,7 @@ pub mod store;
 
 use anyhow::Result;
 use bytes::Bytes;
+use foldhash::quality::RandomState;
 use gateway_state::GatewayState;
 use network::Network;
 use openraft::BasicNode;
@@ -23,6 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::error;
 use tracing::info;
@@ -63,12 +65,13 @@ pub mod typ {
         openraft::error::RPCError<NodeId, BasicNode, RaftError<E>>;
 }
 
-// TODO: Implement correct shutdown
 pub struct Gateway {
     pub id: NodeId,
     pub config: Arc<NodeConfig>,
     pub server: RServer,
     pub gateway_state: GatewayState,
+    pub gateway_info_updater: JoinHandle<()>,
+    pub gateway_leader_change: JoinHandle<()>,
     pub log_store: LogStore,
     pub http_server: Http3Server,
     pub task_queue: Arc<DupQueue<Task>>,
@@ -126,6 +129,35 @@ impl Gateway {
             }
         }
     }
+
+    pub async fn gateway_leader_change(gateway_state: GatewayState) {
+        let mut metrics_rx = gateway_state.metrics().await;
+        let mut last_leader = None;
+        loop {
+            metrics_rx
+                .changed()
+                .await
+                .expect("Failed to listen for metric changes");
+            let current_leader = metrics_rx.borrow().current_leader;
+            if current_leader != last_leader {
+                if let Some(leader_id) = current_leader {
+                    info!("Leader changed to node {}", leader_id);
+                } else {
+                    info!("Leadership changed, but no leader is elected yet");
+                }
+                last_leader = current_leader;
+            }
+        }
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        self.http_server.abort();
+        self.gateway_info_updater.abort();
+        self.gateway_leader_change.abort();
+        self.server.abort();
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -163,7 +195,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
 
     let log_store = LogStore::default();
     let state_machine_store = Arc::new(StateMachineStore::default());
-    let clients_map = Arc::new(scc::HashMap::new());
+    let clients_map = Arc::new(scc::HashMap::with_capacity_and_hasher(
+        config.network.node_endpoints.len(),
+        RandomState::default(),
+    ));
     let network = Network {
         clients: clients_map.clone(),
     };
@@ -326,35 +361,16 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         }
     }
 
-    // Spawn task to watch for leader changes in vote or single modes.
-    if matches!(mode, GatewayMode::Vote | GatewayMode::Single) {
-        let raft_cloned = raft.clone();
-        tokio::spawn(async move {
-            let mut metrics_rx = raft_cloned.read().await.metrics();
-            let mut last_leader = None;
-            loop {
-                metrics_rx
-                    .changed()
-                    .await
-                    .expect("Failed to listen for metric changes");
-                let current_leader = metrics_rx.borrow().current_leader;
-                if current_leader != last_leader {
-                    if let Some(leader_id) = current_leader {
-                        info!("Leader changed to node {}", leader_id);
-                    } else {
-                        info!("Leadership changed, but no leader is elected yet");
-                    }
-                    last_leader = current_leader;
-                }
-            }
-        });
-    }
-
     let c = config.clone();
     let gs = gateway_state.clone();
     let tq = task_queue.clone();
-    tokio::spawn(async move {
+    let gateway_info_updater = tokio::spawn(async move {
         Gateway::gateway_info_updater(c, gs, tq).await;
+    });
+
+    let gs = gateway_state.clone();
+    let gateway_leader_change = tokio::spawn(async move {
+        Gateway::gateway_leader_change(gs).await;
     });
 
     Ok(Gateway {
@@ -362,6 +378,8 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         id: node_id,
         server,
         gateway_state,
+        gateway_info_updater,
+        gateway_leader_change,
         log_store,
         http_server,
         task_queue,
@@ -409,7 +427,7 @@ mod tests {
         node_id: u64,
         addr: &str,
         config: Arc<openraft::Config>,
-        node_clients: Arc<scc::HashMap<String, RClient>>,
+        node_clients: Arc<scc::HashMap<String, RClient, RandomState>>,
     ) -> Result<(Arc<RwLock<Raft>>, Arc<StateMachineStore>, RServer)> {
         let network = Network::new(node_clients.clone());
         let log_store = LogStore::default();
@@ -431,7 +449,7 @@ mod tests {
 
     async fn setup_cluster(
         node_configs: &[(u64, &str)],
-        node_clients: Arc<scc::HashMap<String, RClient>>,
+        node_clients: Arc<scc::HashMap<String, RClient, RandomState>>,
     ) -> Result<(
         Arc<Config>,
         ProtocolConfig,
@@ -629,7 +647,10 @@ mod tests {
             (2, "127.0.0.1:21002"),
             (3, "127.0.0.1:21003"),
         ];
-        let node_clients = Arc::new(scc::HashMap::new());
+        let node_clients = Arc::new(scc::HashMap::with_capacity_and_hasher(
+            node_configs.len(),
+            RandomState::default(),
+        ));
 
         let (_config, pcfg, raft_nodes, state_machines, _server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -722,7 +743,10 @@ mod tests {
             (2, "127.0.0.1:24005"),
             (3, "127.0.0.1:24006"),
         ];
-        let node_clients = Arc::new(scc::HashMap::new());
+        let node_clients = Arc::new(scc::HashMap::with_capacity_and_hasher(
+            node_configs.len(),
+            RandomState::default(),
+        ));
 
         let (_config, pcfg, raft_nodes, state_machines, _server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -825,7 +849,10 @@ mod tests {
             (4, "127.0.0.1:24010"),
             (5, "127.0.0.1:24011"),
         ];
-        let node_clients = Arc::new(scc::HashMap::new());
+        let node_clients = Arc::new(scc::HashMap::with_capacity_and_hasher(
+            node_configs.len(),
+            RandomState::default(),
+        ));
 
         let (_config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&node_configs, node_clients.clone()).await?;
@@ -911,7 +938,7 @@ mod tests {
         );
         // Dropping the server handle simulates a crash.
         let node = server_handles.remove(leader_index);
-        node.abort().await;
+        node.abort();
         drop(node);
 
         let raft = raft_nodes.remove(leader_index);
@@ -943,7 +970,10 @@ mod tests {
             (2, "127.0.0.1:27002"),
             (3, "127.0.0.1:27003"),
         ];
-        let node_clients = Arc::new(scc::HashMap::new());
+        let node_clients = Arc::new(scc::HashMap::with_capacity_and_hasher(
+            initial_configs.len(),
+            RandomState::default(),
+        ));
 
         let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&initial_configs, node_clients.clone()).await?;
@@ -1070,7 +1100,10 @@ mod tests {
             (3, "127.0.0.1:29003"),
         ];
 
-        let node_clients = Arc::new(scc::HashMap::new());
+        let node_clients = Arc::new(scc::HashMap::with_capacity_and_hasher(
+            initial_configs.len(),
+            RandomState::default(),
+        ));
 
         let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
             setup_cluster(&initial_configs, node_clients.clone()).await?;
