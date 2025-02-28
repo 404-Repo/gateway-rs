@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
@@ -17,11 +18,16 @@ use uuid::Uuid;
 use crate::api::request::{AddTaskRequest, GetTasksRequest};
 use crate::api::response::{GatewayInfo, GetTasksResponse, LeaderResponse, LoadResponse};
 use crate::api::Task;
+use crate::bittensor::crypto::verify_hotkey;
+use crate::bittensor::subnet_state::SubnetState;
 use crate::common::queue::DupQueue;
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
 
 use super::error::ServerError;
+
+const SUBNET_404GEN: u16 = 17;
+const SUBNET_POLL_INTERVAL_SEC: u64 = 3600;
 
 pub type H3RateLimiter = RateLimiter<
     FixedGuard,
@@ -73,6 +79,31 @@ async fn get_tasks_handler(
         .parse_json::<GetTasksRequest>()
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
+        error!("Failed to obtain the HTTPConfig: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
+    })?;
+
+    let subnet_state = depot.obtain::<Arc<SubnetState>>().map_err(|e| {
+        error!("Failed to obtain the SubnetState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e))
+    })?;
+
+    subnet_state
+        .validate_hotkey(&get_tasks.hotkey)
+        .map_err(|e| {
+            error!(
+                "Hotkey {} is not registered in the subnet: {:?}",
+                get_tasks.hotkey, e
+            );
+            ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
+        })?;
+
+    verify_hotkey(&get_tasks, http_cfg.signature_freshness_threshold).map_err(|e| {
+        error!("Failed to verify GetTasksRequest: {:?}", e);
+        ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e))
+    })?;
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
         error!("Failed to obtain the state reader: {:?}", e);
@@ -155,7 +186,13 @@ async fn get_leader_handler(
         error!("Failed to obtain GatewayState: {:?}", e);
         ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
     })?;
-    let leader_id = gateway_state.leader().await.unwrap_or(0);
+    let leader_id = match gateway_state.leader().await {
+        Some(id) => id,
+        None => {
+            error!("The leader is not elected");
+            return Err(ServerError::Internal("The leader is not elected".into()));
+        }
+    };
     let gateway_info = gateway_state.gateway(leader_id).await.map_err(|e| {
         error!("Failed to obtain GatewayState: {:?}", e);
         ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
@@ -173,6 +210,7 @@ async fn get_leader_handler(
 
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
+    subnet_state: Arc<SubnetState>,
 }
 
 impl Http3Server {
@@ -187,13 +225,21 @@ impl Http3Server {
         let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
         let leader_limiter = Self::create_rate_limiter(http_config.leader_rate_limit);
 
+        let subnet_state = Arc::new(SubnetState::new(
+            http_config.bittensor_wss.clone(),
+            SUBNET_404GEN,
+            None,
+            Duration::from_secs(SUBNET_POLL_INTERVAL_SEC),
+        ));
+
         let router = Self::setup_router(
             task_queue,
+            subnet_state.clone(),
             gateway_state,
             task_limiter,
             load_limiter,
             leader_limiter,
-            http_config,
+            http_config.clone(),
         );
 
         let join_handle = tokio::spawn(async move {
@@ -205,7 +251,10 @@ impl Http3Server {
             Server::new(acceptor).serve(router).await;
         });
 
-        Self { join_handle }
+        Self {
+            join_handle,
+            subnet_state,
+        }
     }
 
     fn create_rate_limiter(
@@ -226,11 +275,12 @@ impl Http3Server {
 
     fn setup_router(
         task_queue: Arc<DupQueue<Task>>,
+        subnet_state: Arc<SubnetState>,
         gateway_state: GatewayState,
         task_limiter: H3RateLimiter,
         load_limiter: H3RateLimiter,
         leader_limiter: H3RateLimiter,
-        config: &HTTPConfig,
+        config: HTTPConfig,
     ) -> Router {
         let size_limit_handler = SecureMaxSize(config.request_size_limit as usize);
 
@@ -248,6 +298,8 @@ impl Http3Server {
             .hoop(size_limit_handler)
             .hoop(affix_state::inject(task_queue))
             .hoop(affix_state::inject(gateway_state))
+            .hoop(affix_state::inject(subnet_state))
+            .hoop(affix_state::inject(config))
             .push(
                 Router::with_path("/add_task")
                     .post(add_task_handler)
@@ -269,5 +321,6 @@ impl Http3Server {
 
     pub fn abort(&self) {
         self.join_handle.abort();
+        self.subnet_state.abort();
     }
 }

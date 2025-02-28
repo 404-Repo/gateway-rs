@@ -7,6 +7,7 @@ use raft::{start_gateway_single, start_gateway_vote};
 use tracing::info;
 
 mod api;
+mod bittensor;
 mod common;
 mod config;
 mod http3;

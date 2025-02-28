@@ -5,9 +5,10 @@ edition = "2021"
 
 [dependencies]
 salvo = { version = "0.76.2", features = ["quinn", "rustls", "rate-limiter", "affix-state", "size-limiter", "compression"] }
-salvo-http3 = { version = "0.4.0"}
 tokio = { version = "1.43.0", features = ["full"] }
+async-tungstenite = { version = "0.29.1", features = ["tokio-runtime", "tokio-rustls-native-certs"] }
 futures = "0.3.31"
+futures-util = "0.3.21"
 tokio-util = "0.7.13"
 clap = "4.5.31"
 tracing = "0.1"
@@ -20,18 +21,22 @@ http = "1.2.0"
 openraft = { version = "0.9.17", features = ["storage-v2", "serde"] }
 rustls = { version = "0.23.23" }
 toml = "0.8.20"
-uuid = { version = "1.15.0", features = ["v4", "serde"] }
+uuid = { version = "1.15.1", features = ["v4", "serde"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.139"
 rmp-serde = "1.3.0"
-anyhow = "1.0.96"
+anyhow = "1.0.97"
 bytes = "1.10.0"
-rcgen = { version = "0.13.1", features = ["pem"] }
+rcgen = { version = "0.13.2", features = ["pem"] }
 foldhash = "0.1.4"
 scc = "2.3.3"
-
-[dev-dependencies]
-futures = "0.3.31"
+hex = "0.4.3"
+schnorrkel = "0.11.4"
+base64 = "0.22.1"
+parity-scale-codec = { version = "3.7.4", features = ["derive"] }
+blake2 = "0.10.6"
+bs58 = "0.5.1"
+itertools = "0.14.0"
 
 [build-dependencies]
 vergen-git2 = { version = "1.0.5", features = ["build", "cargo", "rustc"] }
