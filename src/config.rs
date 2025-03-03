@@ -71,6 +71,8 @@ pub struct HTTPConfig {
     pub leader_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
+    pub bittensor_wss: String,
+    pub signature_freshness_threshold: u64,
 }
 
 #[derive(Debug, Deserialize)]

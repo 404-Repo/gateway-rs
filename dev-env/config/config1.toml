@@ -21,6 +21,8 @@ load_rate_limit = 10
 leader_rate_limit = 10
 add_task_rate_limit = 100
 request_size_limit = 1572864
+bittensor_wss = "wss://entrypoint-finney.opentensor.ai:443"
+signature_freshness_threshold = 30
 
 [cert]
 dangerous_skip_verification = true

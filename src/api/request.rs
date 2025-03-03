@@ -13,5 +13,7 @@ pub struct AddTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTasksRequest {
     pub hotkey: String,
+    pub signature: String,
+    pub timestamp: String,
     pub requested_task_count: usize,
 }
