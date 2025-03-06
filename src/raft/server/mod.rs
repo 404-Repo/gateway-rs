@@ -12,9 +12,8 @@ use tracing::{debug, error, info};
 use super::Raft;
 
 pub struct RServer {
-    endpoint: Endpoint,
-    server_config: ServerConfig,
-    pub raft: Arc<RwLock<Raft>>,
+    _endpoint: Endpoint,
+    _server_config: ServerConfig,
     accept_task: JoinHandle<()>,
     cancel_token: CancellationToken,
 }
@@ -77,9 +76,8 @@ impl RServer {
         });
 
         Ok(Self {
-            endpoint,
-            server_config,
-            raft,
+            _endpoint: endpoint,
+            _server_config: server_config,
             accept_task,
             cancel_token,
         })
@@ -152,7 +150,6 @@ impl RServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::MAX_MESSAGE_SIZE;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
     use anyhow::Result;
     use foldhash::quality::RandomState;
@@ -221,15 +218,8 @@ mod tests {
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = crate::raft::client::RClient::new(
-            addr,
-            "localhost",
-            "127.0.0.1:0",
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg,
-        )
-        .await?;
+        let client =
+            crate::raft::client::RClient::new(addr, "localhost", "127.0.0.1:0", true, pcfg).await?;
         assert!(client.connection.stable_id() > 0);
 
         Ok(())

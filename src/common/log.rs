@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use tracing::info;
 use tracing::{level_filters::LevelFilter, Level};
 use tracing_appender::{

@@ -2,6 +2,7 @@ use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use anyhow::Result;
+use foldhash::HashMap;
 use openraft::{BasicNode, RaftMetrics};
 use serde_json;
 use std::fmt;
@@ -33,11 +34,20 @@ impl std::error::Error for GatewayStateError {}
 pub struct GatewayState {
     state: Arc<StateMachineStore>,
     raft: Arc<RwLock<Raft>>,
+    cluster_name: String,
 }
 
 impl GatewayState {
-    pub fn new(state: Arc<StateMachineStore>, raft: Arc<RwLock<Raft>>) -> Self {
-        Self { state, raft }
+    pub fn new(
+        state: Arc<StateMachineStore>,
+        raft: Arc<RwLock<Raft>>,
+        cluster_name: String,
+    ) -> Self {
+        Self {
+            state,
+            raft,
+            cluster_name,
+        }
     }
 
     pub async fn leader(&self) -> Option<u64> {
@@ -49,12 +59,12 @@ impl GatewayState {
     }
 
     pub async fn membership(&self) -> Vec<u64> {
-        self.raft
-            .read()
-            .await
-            .metrics()
-            .borrow()
-            .membership_config
+        let membership_config = {
+            let raft_guard = self.raft.read().await;
+            raft_guard.metrics().borrow().membership_config.clone()
+        };
+
+        membership_config
             .membership()
             .nodes()
             .map(|(&id, _)| id)
@@ -62,26 +72,40 @@ impl GatewayState {
     }
 
     pub async fn gateway(&self, n: u64) -> Result<GatewayInfo, GatewayStateError> {
-        let guard = self.state.state_machine.read().await;
         let key = n.to_string();
-        let json_str = guard
-            .data
-            .get(&key)
-            .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?;
-        serde_json::from_str::<GatewayInfo>(json_str).map_err(GatewayStateError::DeserializeError)
+        let json_str = {
+            let guard = self.state.state_machine.read().await;
+            guard
+                .data
+                .get(&key)
+                .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?
+                .clone()
+        };
+
+        serde_json::from_str::<GatewayInfo>(&json_str).map_err(GatewayStateError::DeserializeError)
     }
 
-    pub async fn gateways(&self, nodes: Vec<u64>) -> Result<Vec<GatewayInfo>, GatewayStateError> {
-        let guard = self.state.state_machine.read().await;
+    pub async fn gateways(&self) -> Result<Vec<GatewayInfo>, GatewayStateError> {
+        let (nodes, nodes_map) = {
+            let nodes = self.membership().await;
+
+            let nodes_map = {
+                let guard = self.state.state_machine.read().await;
+                nodes
+                    .iter()
+                    .filter_map(|&n| guard.data.get(&n.to_string()).map(|v| (n, v.clone())))
+                    .collect::<HashMap<u64, String>>()
+            };
+
+            (nodes, nodes_map)
+        };
 
         nodes
             .into_iter()
             .map(|n| {
-                let key = n.to_string();
-                let json_str = guard
-                    .data
-                    .get(&key)
-                    .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?;
+                let json_str = nodes_map
+                    .get(&n)
+                    .ok_or_else(|| GatewayStateError::NotFound(n.to_string()))?;
                 serde_json::from_str::<GatewayInfo>(json_str)
                     .map_err(GatewayStateError::DeserializeError)
             })
@@ -90,13 +114,22 @@ impl GatewayState {
 
     pub async fn set_gateway_info(&self, info: GatewayInfo) -> Result<()> {
         let gateway_info_str = serde_json::to_string(&info)?;
+        let key = info.node_id.to_string();
 
         let request = Request::Set {
-            key: info.node_id.to_string(),
+            key,
             value: gateway_info_str,
         };
 
-        self.raft.write().await.client_write(request).await?;
+        {
+            let raft_guard = self.raft.write().await;
+            raft_guard.client_write(request).await?;
+        }
+
         Ok(())
+    }
+
+    pub fn cluster_name(&self) -> &str {
+        &self.cluster_name
     }
 }

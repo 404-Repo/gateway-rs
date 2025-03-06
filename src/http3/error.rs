@@ -5,6 +5,7 @@ use salvo::{async_trait, writing::Text, Depot, Request, Response, Writer};
 pub enum ServerError {
     BadRequest(String),
     Internal(String),
+    Unauthorized(String),
 }
 
 impl ServerError {
@@ -12,6 +13,7 @@ impl ServerError {
         match self {
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
         }
     }
 }
@@ -31,6 +33,9 @@ impl Writer for ServerError {
                     message.push_str(&details);
                 }
                 res.render(Text::Plain(message));
+            }
+            ServerError::Unauthorized(msg) => {
+                res.render(Text::Plain(format!("Unauthorized request: {}", msg)));
             }
         }
     }

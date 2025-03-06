@@ -12,10 +12,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct RClient {
-    endpoint: Endpoint,
+    _endpoint: Endpoint,
     pub connection: Connection,
     protocol: Protocol,
-    max_message_size: usize,
 }
 
 impl RClient {
@@ -23,7 +22,6 @@ impl RClient {
         remote_addr: &str,
         server_name: &str,
         local_bind_addr: &str,
-        max_message_size: usize,
         dangerous_skip_verification: bool,
         protocol_cfg: ProtocolConfig,
     ) -> Result<Self> {
@@ -83,10 +81,9 @@ impl RClient {
         );
 
         Ok(Self {
-            endpoint,
+            _endpoint: endpoint,
             connection,
             protocol,
-            max_message_size,
         })
     }
 
@@ -108,7 +105,7 @@ impl RClient {
 mod tests {
     use super::*;
     use crate::config::ProtocolConfig;
-    use crate::protocol::{RaftMessageType, MAX_MESSAGE_SIZE};
+    use crate::protocol::RaftMessageType;
     use crate::raft::network::Network;
     use crate::raft::server::RServer;
     use crate::raft::{LogStore, StateMachineStore, TypeConfig};
@@ -154,15 +151,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client_addr = "127.0.0.1:8889";
-        let client = RClient::new(
-            server_addr,
-            "localhost",
-            client_addr,
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg,
-        )
-        .await?;
+        let client = RClient::new(server_addr, "localhost", client_addr, true, pcfg).await?;
 
         assert!(client.connection.stable_id() > 0);
 
@@ -183,15 +172,8 @@ mod tests {
 
         println!("Creating client");
         let client_addr = "127.0.0.1:7778";
-        let client = RClient::new(
-            server_addr,
-            "localhost",
-            client_addr,
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg.clone(),
-        )
-        .await?;
+        let client =
+            RClient::new(server_addr, "localhost", client_addr, true, pcfg.clone()).await?;
 
         println!("Testing initial connection");
         assert!(client.connection.stable_id() > 0);
@@ -232,15 +214,8 @@ mod tests {
     #[tokio::test]
     async fn test_connection_failure() -> Result<()> {
         let pcfg = ProtocolConfig::default();
-        let result = RClient::new(
-            "127.0.0.1:9999",
-            "localhost",
-            "127.0.0.1:9998",
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg,
-        )
-        .await;
+        let result =
+            RClient::new("127.0.0.1:9999", "localhost", "127.0.0.1:9998", true, pcfg).await;
         assert!(result.is_err());
         Ok(())
     }

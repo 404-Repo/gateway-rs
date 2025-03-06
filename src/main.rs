@@ -3,7 +3,7 @@ use common::log::{init_tracing, log_app_config, log_build_information};
 use std::{env, sync::Arc, time::Duration};
 
 use config::{read_config, NodeConfig};
-use raft::{start_gateway_single, start_gateway_vote};
+use raft::{start_gateway_bootstrap, start_gateway_single, start_gateway_vote};
 use tracing::info;
 
 mod api;
@@ -20,7 +20,11 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
 
-    /// Run in single-node test mode
+    // First node will be bootstrapped as the leader.
+    #[arg(short, long)]
+    bootstrap: bool,
+
+    // Run in single-node test mode.
     #[arg(short, long)]
     test: bool,
 }
@@ -49,6 +53,8 @@ async fn main() {
     loop {
         let result = if cli.test {
             start_gateway_single(node_config.clone()).await
+        } else if cli.bootstrap {
+            start_gateway_bootstrap(node_config.clone()).await
         } else {
             start_gateway_vote(node_config.clone()).await
         };
