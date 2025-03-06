@@ -91,20 +91,23 @@ impl SubnetState {
     pub fn validate_hotkey(&self, hotkey: &str) -> Result<()> {
         let account_id = ss58_decode(hotkey)?;
 
-        let state = self.receiver.borrow();
-        let hotkey_data = state
-            .get(&account_id.0)
-            .ok_or_else(|| anyhow!("Hotkey not found in the subnet"))?;
+        let total_stake = {
+            let state = self.receiver.borrow();
+            let hotkey_data = state
+                .get(&account_id.0)
+                .ok_or_else(|| anyhow!("Hotkey not found in the subnet"))?;
+            hotkey_data.total_stake
+        };
 
         // 10000 TAO
         let required_stake: u64 = 10000 * 1_000_000_000;
 
-        if hotkey_data.total_stake > required_stake {
+        if total_stake > required_stake {
             Ok(())
         } else {
             Err(anyhow!(
                 "Hotkey found but does not have enough total stake: {} < {}",
-                hotkey_data.total_stake,
+                total_stake,
                 required_stake
             ))
         }

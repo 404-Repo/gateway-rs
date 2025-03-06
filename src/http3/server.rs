@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,19 +12,17 @@ use salvo::rate_limiter::{
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::api::request::{AddTaskRequest, GetTasksRequest};
-use crate::api::response::{GatewayInfo, GetTasksResponse, LeaderResponse, LoadResponse};
+use crate::api::request::{AddTaskRequest, GatewayInfoExt, GetTasksRequest};
+use crate::api::response::{GetTasksResponse, LeaderResponse, LoadResponse};
 use crate::api::Task;
 use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
+use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
 
 use super::error::ServerError;
-
-const SUBNET_404GEN: u16 = 17;
-const SUBNET_POLL_INTERVAL_SEC: u64 = 3600;
 
 pub type H3RateLimiter = RateLimiter<
     FixedGuard,
@@ -121,9 +116,9 @@ async fn get_tasks_handler(
     })?;
 
     let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
-    let membership = gateway_state.membership().await;
+
     let gateways = gateway_state
-        .gateways(membership)
+        .gateways()
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
 
@@ -132,7 +127,7 @@ async fn get_tasks_handler(
     Ok(())
 }
 
-// curl --http3 -X GET -k https://gateway.404.xyz:4443/load
+// curl --http3 -X GET -k https://gateway.404.xyz:4443/get_load
 #[handler]
 async fn get_load_handler(
     depot: &mut Depot,
@@ -143,8 +138,14 @@ async fn get_load_handler(
         error!("Failed to obtain GatewayState: {:?}", e);
         ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
     })?;
-    let membership = gateway_state.membership().await;
-    let gateways = gateway_state.gateways(membership).await.unwrap_or_default();
+
+    let gateways = gateway_state.gateways().await.map_err(|e| {
+        error!("Failed to obtain the gateways for get_load: {:?}", e);
+        ServerError::Internal(format!(
+            "Failed to obtain the gateways for get_load: {:?}",
+            e
+        ))
+    })?;
 
     let load_response = LoadResponse { gateways };
     res.render(Json(load_response));
@@ -158,7 +159,7 @@ async fn write_handler(
     res: &mut Response,
 ) -> Result<(), ServerError> {
     let gi = req
-        .parse_json::<GatewayInfo>()
+        .parse_json::<GatewayInfoExt>()
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
@@ -167,8 +168,16 @@ async fn write_handler(
         ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
     })?;
 
+    if gi.cluster_name != gateway_state.cluster_name() {
+        error!(
+            "Unauthorized access to write handler from: {}",
+            req.remote_addr().to_string()
+        );
+        return Err(ServerError::Unauthorized("Unauthorized access".to_string()));
+    }
+
     gateway_state
-        .set_gateway_info(gi)
+        .set_gateway_info(gi.into())
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to set gateway info: {:?}", e)))?;
     res.status_code(StatusCode::OK);
@@ -208,6 +217,12 @@ async fn get_leader_handler(
     Ok(())
 }
 
+#[handler]
+async fn version_handler(_depot: &mut Depot, _req: &mut Request, res: &mut Response) {
+    let build_info = get_build_information(true);
+    res.render(Text::Html(build_info));
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: Arc<SubnetState>,
@@ -227,9 +242,9 @@ impl Http3Server {
 
         let subnet_state = Arc::new(SubnetState::new(
             http_config.bittensor_wss.clone(),
-            SUBNET_404GEN,
+            http_config.subnet_number,
             None,
-            Duration::from_secs(SUBNET_POLL_INTERVAL_SEC),
+            Duration::from_secs(http_config.subnet_poll_interval_sec),
         ));
 
         let router = Self::setup_router(
@@ -317,6 +332,7 @@ impl Http3Server {
                     .hoop(leader_limiter),
             )
             .push(Router::with_path("/write").post(write_handler))
+            .push(Router::with_path("/get_version").get(version_handler))
     }
 
     pub fn abort(&self) {

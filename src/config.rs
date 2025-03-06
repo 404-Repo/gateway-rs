@@ -73,6 +73,9 @@ pub struct HTTPConfig {
     pub request_size_limit: u64,
     pub bittensor_wss: String,
     pub signature_freshness_threshold: u64,
+    // Subnet state updater settings
+    pub subnet_number: u16,
+    pub subnet_poll_interval_sec: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +157,17 @@ impl FromStr for LogLevel {
             "error" => Ok(LogLevel::Error),
             _ => Err(format!("Invalid log level: {}", s)),
         }
+    }
+}
+
+fn mask_cluster_name(cluster_name: &str) -> String {
+    let char_count = cluster_name.chars().count();
+    if char_count < 3 {
+        "*".to_owned()
+    } else {
+        let visible: String = cluster_name.chars().take(3).collect();
+        let mask: String = "*".repeat(char_count - 3);
+        format!("{}{}", visible, mask)
     }
 }
 
@@ -251,7 +265,7 @@ impl fmt::Display for NodeConfig {
         writeln!(
             f,
             "    Cluster Name                 : {}",
-            self.raft.cluster_name
+            mask_cluster_name(&self.raft.cluster_name)
         )?;
         writeln!(
             f,

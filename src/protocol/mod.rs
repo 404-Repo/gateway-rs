@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
@@ -20,8 +17,6 @@ use tokio::sync::RwLock;
 use crate::raft::NodeId;
 use crate::raft::Raft;
 use crate::raft::TypeConfig;
-
-pub const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB default limit
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "msg_type", content = "data")]
@@ -102,7 +97,7 @@ impl TryFrom<RaftMessageType> for VoteResponse<u64> {
 
 #[derive(Debug, Clone)]
 pub struct Protocol {
-    connection: Connection,
+    _connection: Connection,
     max_message_size: usize,
     send_timeout_ms: Duration,
     receive_message_timeout_ms: Duration,
@@ -116,7 +111,7 @@ impl Protocol {
         receive_message_timeout_ms: Duration,
     ) -> Self {
         Self {
-            connection,
+            _connection: connection,
             max_message_size,
             send_timeout_ms,
             receive_message_timeout_ms,

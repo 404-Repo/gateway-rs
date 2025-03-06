@@ -3,7 +3,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
 use h3;
 use h3_quinn;
-use http;
+use http::{self, StatusCode};
 use quinn;
 use rustls;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub struct Http3Client {
 
 impl Http3Client {
     pub async fn new(
-        server_addr: &str,
+        server_ip: &str,
         server_host: &str,
         dangerous_skip_verification: bool,
     ) -> Result<Http3Client> {
@@ -41,14 +41,14 @@ impl Http3Client {
         let client_config = quinn::ClientConfig::new(Arc::new(quinn_client_config));
         endpoint.set_default_client_config(client_config);
 
-        let addr = server_addr.parse()?;
+        let addr = server_ip.parse()?;
         let conn = endpoint.connect(addr, server_host)?.await?;
         let quinn_conn = h3_quinn::Connection::new(conn);
 
         let (mut driver, send_request) = h3::client::new(quinn_conn).await?;
         tokio::spawn(async move {
             if let Err(e) = future::poll_fn(|cx| driver.poll_close(cx)).await {
-                error!("driver error: {:?}", e);
+                error!("Http3 client driver error: {:?}", e);
             }
         });
 
@@ -56,23 +56,25 @@ impl Http3Client {
     }
 
     #[allow(dead_code)]
-    pub async fn get(&mut self, url: &str) -> Result<Bytes> {
+    pub async fn get(&mut self, url: &str) -> Result<(StatusCode, Bytes)> {
         let uri = url.parse::<http::uri::Uri>()?;
 
         let request = http::Request::builder().method("GET").uri(&uri).body(())?;
 
         let mut stream = self.send_request.send_request(request).await?;
-        let _response = stream.recv_response().await?;
+        stream.finish().await?;
+        let response = stream.recv_response().await?;
 
         let mut buf = BytesMut::new();
         while let Some(mut chunk) = stream.recv_data().await? {
             let bytes = chunk.copy_to_bytes(chunk.remaining());
             buf.extend_from_slice(&bytes);
         }
-        Ok(buf.freeze())
+
+        Ok((response.status(), buf.freeze()))
     }
 
-    pub async fn post(&mut self, url: &str, data: Bytes) -> Result<Bytes> {
+    pub async fn post(&mut self, url: &str, data: Bytes) -> Result<(StatusCode, Bytes)> {
         let uri = url.parse::<http::uri::Uri>()?;
 
         let request = http::Request::builder()
@@ -85,12 +87,14 @@ impl Http3Client {
         stream.send_data(data).await?;
         stream.finish().await?;
 
-        let _response = stream.recv_response().await?;
+        let response = stream.recv_response().await?;
+
         let mut buf = BytesMut::new();
         while let Some(mut chunk) = stream.recv_data().await? {
             let bytes = chunk.copy_to_bytes(chunk.remaining());
             buf.extend_from_slice(&bytes);
         }
-        Ok(buf.freeze())
+
+        Ok((response.status(), buf.freeze()))
     }
 }

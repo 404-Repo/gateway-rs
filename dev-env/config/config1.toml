@@ -17,12 +17,14 @@ receive_message_timeout_ms = 2000
 compression = true
 compression_lvl = 3
 port = 4443
-load_rate_limit = 10
+load_rate_limit = 60
 leader_rate_limit = 10
 add_task_rate_limit = 100
 request_size_limit = 1572864
 bittensor_wss = "wss://entrypoint-finney.opentensor.ai:443"
 signature_freshness_threshold = 30
+subnet_number = 17
+subnet_poll_interval_sec = 3600
 
 [cert]
 dangerous_skip_verification = true

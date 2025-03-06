@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 pub mod client;
 pub mod gateway_state;
 pub mod memstore;
@@ -30,6 +27,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+use crate::api::request::GatewayInfoExt;
 use crate::api::response::GatewayInfo;
 use crate::api::Task;
 use crate::common::cert::generate_and_create_keycert;
@@ -66,15 +64,15 @@ pub mod typ {
 }
 
 pub struct Gateway {
-    pub id: NodeId,
-    pub config: Arc<NodeConfig>,
+    pub _id: NodeId,
+    pub _config: Arc<NodeConfig>,
     pub server: RServer,
-    pub gateway_state: GatewayState,
+    pub _gateway_state: GatewayState,
     pub gateway_info_updater: JoinHandle<()>,
     pub gateway_leader_change: JoinHandle<()>,
-    pub log_store: LogStore,
+    pub _log_store: LogStore,
     pub http_server: Http3Server,
-    pub task_queue: Arc<DupQueue<Task>>,
+    pub _task_queue: Arc<DupQueue<Task>>,
 }
 
 impl Gateway {
@@ -86,46 +84,90 @@ impl Gateway {
         loop {
             sleep(Duration::from_millis(config.basic.update_gateway_info_ms)).await;
 
-            if let Some(leader) = gateway_state.leader().await {
-                let info = GatewayInfo {
-                    node_id: config.network.node_id,
-                    domain: config.network.domain.clone(),
-                    ip: config.network.ip.clone(),
-                    name: config.network.name.clone(),
-                    http_port: config.http.port,
-                    available_tasks: task_queue.len(),
-                };
+            let leader = match gateway_state.leader().await {
+                Some(leader) => leader,
+                None => {
+                    warn!("No leader elected!");
+                    continue;
+                }
+            };
 
-                if leader == config.network.node_id {
-                    if let Err(e) = gateway_state.set_gateway_info(info).await {
-                        error!("set_gateway_info update error: {:?}", e);
-                    }
-                } else if let Ok(leader_info) = gateway_state.gateway(leader).await {
-                    let server_addr = format!("{}:{}", leader_info.ip, leader_info.http_port);
-                    match Http3Client::new(&server_addr, &leader_info.domain, true).await {
-                        Ok(mut client) => {
-                            let payload = match serde_json::to_vec(&info) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    error!("Serialization error: {:?}", e);
-                                    continue;
-                                }
-                            };
-                            let url = format!(
-                                "https://{}:{}/write",
-                                leader_info.domain, leader_info.http_port
-                            );
-                            if let Err(e) = client.post(&url, Bytes::from(payload)).await {
-                                error!("HTTP POST error: {:?}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to create HTTP3 client: {:?}", e);
-                        }
+            let info = GatewayInfo {
+                node_id: config.network.node_id,
+                domain: config.network.domain.clone(),
+                ip: config.network.ip.clone(),
+                name: config.network.name.clone(),
+                http_port: config.http.port,
+                available_tasks: task_queue.len(),
+            };
+
+            if leader == config.network.node_id {
+                if let Err(e) = gateway_state.set_gateway_info(info).await {
+                    error!("set_gateway_info update error: {:?}", e);
+                }
+                continue;
+            }
+
+            let leader_info = match gateway_state.gateway(leader).await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to get leader info: {:?}", e);
+                    continue;
+                }
+            };
+
+            let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
+            let mut client = match Http3Client::new(
+                &server_ip,
+                &leader_info.domain,
+                config.cert.dangerous_skip_verification,
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to create HTTP3 client: {:?}", e);
+                    continue;
+                }
+            };
+
+            let info = GatewayInfoExt {
+                node_id: info.node_id,
+                domain: info.domain,
+                ip: info.ip,
+                name: info.name,
+                http_port: info.http_port,
+                available_tasks: info.available_tasks,
+                cluster_name: config.raft.cluster_name.clone(),
+            };
+
+            let payload = match serde_json::to_vec(&info) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Serialization error: {:?}", e);
+                    continue;
+                }
+            };
+
+            // Send request to leader
+            let url = format!(
+                "https://{}:{}/write",
+                leader_info.domain, leader_info.http_port
+            );
+
+            match client.post(&url, Bytes::from(payload)).await {
+                Ok((status, response)) => {
+                    if !status.is_success() {
+                        error!(
+                            "Gateway info update failed with status: {}, response: {:?}",
+                            status,
+                            String::from_utf8_lossy(&response)
+                        );
                     }
                 }
-            } else {
-                warn!("No leader elected!");
+                Err(e) => {
+                    error!("Gateway info update failed: {:?}", e);
+                }
             }
         }
     }
@@ -199,9 +241,8 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         config.network.node_endpoints.len(),
         RandomState::default(),
     ));
-    let network = Network {
-        clients: clients_map.clone(),
-    };
+
+    let network = Network::new(clients_map.clone());
 
     let raft = Arc::new(RwLock::new(
         Raft::new(
@@ -236,7 +277,11 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     )
     .await?;
 
-    let gateway_state = GatewayState::new(state_machine_store, raft.clone());
+    let gateway_state = GatewayState::new(
+        state_machine_store,
+        raft.clone(),
+        config.raft.cluster_name.clone(),
+    );
 
     let key_cert = if use_cert_files {
         Ok(Keycert::new()
@@ -269,7 +314,6 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
                 endpoint,
                 dns_name,
                 &format!("{}:{}", config.network.ip, 0),
-                config.protocol.max_message_size,
                 config.cert.dangerous_skip_verification,
                 config.protocol.clone(),
             )
@@ -374,15 +418,15 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     });
 
     Ok(Gateway {
-        config: config.clone(),
-        id: node_id,
+        _config: config.clone(),
+        _id: node_id,
         server,
-        gateway_state,
+        _gateway_state: gateway_state,
         gateway_info_updater,
         gateway_leader_change,
-        log_store,
+        _log_store: log_store,
         http_server,
-        task_queue,
+        _task_queue: task_queue,
     })
 }
 
@@ -401,7 +445,7 @@ pub async fn start_gateway_single(config: Arc<NodeConfig>) -> Result<Gateway> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::ProtocolConfig, protocol::MAX_MESSAGE_SIZE, raft::server::RServer};
+    use crate::{config::ProtocolConfig, raft::server::RServer};
     use anyhow::{bail, Result};
     use core::panic;
     use openraft::{BasicNode, Config, LogId, Membership};
@@ -660,15 +704,8 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 22001 + i;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client = RClient::new(
-                server_addr,
-                "localhost",
-                &client_addr,
-                MAX_MESSAGE_SIZE,
-                true,
-                pcfg.clone(),
-            )
-            .await?;
+            let client =
+                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -756,15 +793,8 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 25001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client = RClient::new(
-                server_addr,
-                "localhost",
-                &client_addr,
-                MAX_MESSAGE_SIZE,
-                true,
-                pcfg.clone(),
-            )
-            .await?;
+            let client =
+                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -864,15 +894,8 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 26001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client = RClient::new(
-                server_addr,
-                "localhost",
-                &client_addr,
-                MAX_MESSAGE_SIZE,
-                true,
-                pcfg.clone(),
-            )
-            .await?;
+            let client =
+                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -983,15 +1006,8 @@ mod tests {
         for (i, &(_, server_addr)) in initial_configs.iter().enumerate() {
             let client_port = 28001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client = RClient::new(
-                server_addr,
-                "localhost",
-                &client_addr,
-                MAX_MESSAGE_SIZE,
-                true,
-                pcfg.clone(),
-            )
-            .await?;
+            let client =
+                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -1054,15 +1070,8 @@ mod tests {
 
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:28004".to_string();
-        let new_client = RClient::new(
-            new_node_addr,
-            "localhost",
-            &new_client_addr,
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg,
-        )
-        .await?;
+        let new_client =
+            RClient::new(new_node_addr, "localhost", &new_client_addr, true, pcfg).await?;
         node_clients
             .insert(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -1115,15 +1124,8 @@ mod tests {
         for (i, &(_, server_addr)) in initial_configs.iter().enumerate() {
             let client_port = 30001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client = RClient::new(
-                server_addr,
-                "localhost",
-                &client_addr,
-                MAX_MESSAGE_SIZE,
-                true,
-                pcfg.clone(),
-            )
-            .await?;
+            let client =
+                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -1168,15 +1170,8 @@ mod tests {
 
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:30004".to_string();
-        let new_client = RClient::new(
-            new_node_addr,
-            "localhost",
-            &new_client_addr,
-            MAX_MESSAGE_SIZE,
-            true,
-            pcfg,
-        )
-        .await?;
+        let new_client =
+            RClient::new(new_node_addr, "localhost", &new_client_addr, true, pcfg).await?;
         node_clients
             .insert(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
