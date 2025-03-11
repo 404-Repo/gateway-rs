@@ -18,8 +18,12 @@ use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -80,6 +84,7 @@ impl Gateway {
         config: Arc<NodeConfig>,
         gateway_state: GatewayState,
         task_queue: Arc<DupQueue<Task>>,
+        last_task_acquisition: Arc<AtomicU64>,
     ) {
         loop {
             sleep(Duration::from_millis(config.basic.update_gateway_info_ms)).await;
@@ -99,6 +104,7 @@ impl Gateway {
                 name: config.network.name.clone(),
                 http_port: config.http.port,
                 available_tasks: task_queue.len(),
+                last_task_acquisition: last_task_acquisition.load(Ordering::Relaxed),
             };
 
             if leader == config.network.node_id {
@@ -139,6 +145,7 @@ impl Gateway {
                 http_port: info.http_port,
                 available_tasks: info.available_tasks,
                 cluster_name: config.raft.cluster_name.clone(),
+                last_task_acquisition: info.last_task_acquisition,
             };
 
             let payload = match serde_json::to_vec(&info) {
@@ -277,10 +284,15 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     )
     .await?;
 
+    let last_task_acquisition = Arc::new(AtomicU64::from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    ));
+
     let gateway_state = GatewayState::new(
         state_machine_store,
         raft.clone(),
         config.raft.cluster_name.clone(),
+        last_task_acquisition.clone(),
     );
 
     let key_cert = if use_cert_files {
@@ -409,7 +421,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let gs = gateway_state.clone();
     let tq = task_queue.clone();
     let gateway_info_updater = tokio::spawn(async move {
-        Gateway::gateway_info_updater(c, gs, tq).await;
+        Gateway::gateway_info_updater(c, gs, tq, last_task_acquisition).await;
     });
 
     let gs = gateway_state.clone();

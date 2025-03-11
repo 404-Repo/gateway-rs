@@ -31,6 +31,12 @@ pub type H3RateLimiter = RateLimiter<
     BasicQuota,
 >;
 
+struct RateLimits {
+    task_limiter: H3RateLimiter,
+    load_limiter: H3RateLimiter,
+    leader_limiter: H3RateLimiter,
+}
+
 // curl --http3 -X POST -H "Content-Type: application/json" -d '{"api_key": "XXXX", "prompt": "mechanic robot"}' -k https://gateway.404.xyz:4443/add_task
 #[handler]
 async fn add_task_handler(
@@ -115,12 +121,19 @@ async fn get_tasks_handler(
         }
     })?;
 
-    let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
+    gateway_state.update_task_acquisition().map_err(|e| {
+        ServerError::Internal(format!(
+            "Failed to execute update_task_acquisition: {:?}",
+            e
+        ))
+    })?;
 
     let gateways = gateway_state
         .gateways()
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
+
+    let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
 
     let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));
@@ -240,6 +253,12 @@ impl Http3Server {
         let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
         let leader_limiter = Self::create_rate_limiter(http_config.leader_rate_limit);
 
+        let rate_limits = RateLimits {
+            load_limiter,
+            task_limiter,
+            leader_limiter,
+        };
+
         let subnet_state = Arc::new(SubnetState::new(
             http_config.bittensor_wss.clone(),
             http_config.subnet_number,
@@ -251,9 +270,7 @@ impl Http3Server {
             task_queue,
             subnet_state.clone(),
             gateway_state,
-            task_limiter,
-            load_limiter,
-            leader_limiter,
+            rate_limits,
             http_config.clone(),
         );
 
@@ -292,9 +309,7 @@ impl Http3Server {
         task_queue: Arc<DupQueue<Task>>,
         subnet_state: Arc<SubnetState>,
         gateway_state: GatewayState,
-        task_limiter: H3RateLimiter,
-        load_limiter: H3RateLimiter,
-        leader_limiter: H3RateLimiter,
+        rate_limits: RateLimits,
         config: HTTPConfig,
     ) -> Router {
         let size_limit_handler = SecureMaxSize(config.request_size_limit as usize);
@@ -318,18 +333,18 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_task")
                     .post(add_task_handler)
-                    .hoop(task_limiter),
+                    .hoop(rate_limits.task_limiter),
             )
             .push(Router::with_path("/get_tasks").post(get_tasks_handler))
             .push(
                 Router::with_path("/get_load")
                     .get(get_load_handler)
-                    .hoop(load_limiter),
+                    .hoop(rate_limits.load_limiter),
             )
             .push(
                 Router::with_path("/get_leader")
                     .get(get_leader_handler)
-                    .hoop(leader_limiter),
+                    .hoop(rate_limits.leader_limiter),
             )
             .push(Router::with_path("/write").post(write_handler))
             .push(Router::with_path("/get_version").get(version_handler))

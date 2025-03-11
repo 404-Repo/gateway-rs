@@ -171,20 +171,25 @@ impl Protocol {
         message: RaftMessageType,
         raft: Arc<RwLock<Raft>>,
     ) -> Result<RaftMessageType> {
-        let raft = raft.write().await;
         match message {
-            RaftMessageType::AppendEntriesRequest(req) => {
-                let resp = raft.append_entries(req).await?;
-                Ok(RaftMessageType::AppendEntriesResponse(resp))
-            }
-            RaftMessageType::InstallSnapshotRequest(req) => {
-                let resp = raft.install_snapshot(req).await?;
-                Ok(RaftMessageType::InstallSnapshotResponse(resp))
-            }
-            RaftMessageType::VoteRequest(req) => {
-                let resp = raft.vote(req).await?;
-                Ok(RaftMessageType::VoteResponse(resp))
-            }
+            RaftMessageType::AppendEntriesRequest(req) => Ok(raft
+                .write()
+                .await
+                .append_entries(req)
+                .await
+                .map(RaftMessageType::AppendEntriesResponse)?),
+            RaftMessageType::InstallSnapshotRequest(req) => Ok(raft
+                .write()
+                .await
+                .install_snapshot(req)
+                .await
+                .map(RaftMessageType::InstallSnapshotResponse)?),
+            RaftMessageType::VoteRequest(req) => Ok(raft
+                .write()
+                .await
+                .vote(req)
+                .await
+                .map(RaftMessageType::VoteResponse)?),
             _ => Err(anyhow::anyhow!("Unexpected message type")),
         }
     }
