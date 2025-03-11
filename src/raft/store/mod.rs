@@ -76,6 +76,18 @@ pub struct StateMachineStore {
     current_snapshot: RwLock<Option<StoredSnapshot>>,
 }
 
+impl StateMachineStore {
+    pub async fn get(&self, key: &str) -> Option<String> {
+        let sm = self.state_machine.read().await;
+        sm.data.get(key).cloned()
+    }
+
+    pub async fn clone_map(&self) -> BTreeMap<String, String> {
+        let sm = self.state_machine.read().await;
+        sm.data.clone()
+    }
+}
+
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {

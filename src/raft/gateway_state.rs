@@ -2,11 +2,12 @@ use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use anyhow::Result;
-use foldhash::HashMap;
 use openraft::{BasicNode, RaftMetrics};
 use serde_json;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, RwLock};
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub struct GatewayState {
     state: Arc<StateMachineStore>,
     raft: Arc<RwLock<Raft>>,
     cluster_name: String,
+    last_task_acquisition: Arc<AtomicU64>,
 }
 
 impl GatewayState {
@@ -42,12 +44,21 @@ impl GatewayState {
         state: Arc<StateMachineStore>,
         raft: Arc<RwLock<Raft>>,
         cluster_name: String,
+        last_task_acquisition: Arc<AtomicU64>,
     ) -> Self {
         Self {
             state,
             raft,
             cluster_name,
+            last_task_acquisition,
         }
+    }
+
+    pub fn update_task_acquisition(&self) -> Result<()> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        self.last_task_acquisition
+            .store(timestamp, Ordering::Relaxed);
+        Ok(())
     }
 
     pub async fn leader(&self) -> Option<u64> {
@@ -74,12 +85,10 @@ impl GatewayState {
     pub async fn gateway(&self, n: u64) -> Result<GatewayInfo, GatewayStateError> {
         let key = n.to_string();
         let json_str = {
-            let guard = self.state.state_machine.read().await;
-            guard
-                .data
+            self.state
                 .get(&key)
+                .await
                 .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?
-                .clone()
         };
 
         serde_json::from_str::<GatewayInfo>(&json_str).map_err(GatewayStateError::DeserializeError)
@@ -89,13 +98,7 @@ impl GatewayState {
         let (nodes, nodes_map) = {
             let nodes = self.membership().await;
 
-            let nodes_map = {
-                let guard = self.state.state_machine.read().await;
-                nodes
-                    .iter()
-                    .filter_map(|&n| guard.data.get(&n.to_string()).map(|v| (n, v.clone())))
-                    .collect::<HashMap<u64, String>>()
-            };
+            let nodes_map = { self.state.clone_map().await };
 
             (nodes, nodes_map)
         };
@@ -104,7 +107,7 @@ impl GatewayState {
             .into_iter()
             .map(|n| {
                 let json_str = nodes_map
-                    .get(&n)
+                    .get(&n.to_string())
                     .ok_or_else(|| GatewayStateError::NotFound(n.to_string()))?;
                 serde_json::from_str::<GatewayInfo>(json_str)
                     .map_err(GatewayStateError::DeserializeError)

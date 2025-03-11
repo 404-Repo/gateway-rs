@@ -30,6 +30,7 @@ pub struct GatewayInfoExt {
     pub available_tasks: usize,
     // Used to check if the request is valid
     pub cluster_name: String,
+    pub last_task_acquisition: u64,
 }
 
 impl From<GatewayInfoExt> for GatewayInfo {
@@ -41,6 +42,7 @@ impl From<GatewayInfoExt> for GatewayInfo {
             name: info.name,
             http_port: info.http_port,
             available_tasks: info.available_tasks,
+            last_task_acquisition: info.last_task_acquisition,
         }
     }
 }
