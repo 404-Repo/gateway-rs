@@ -71,11 +71,23 @@ pub struct HTTPConfig {
     pub leader_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
-    pub bittensor_wss: String,
+    pub wss_bittensor: String,
+    pub wss_max_message_size: usize,
     pub signature_freshness_threshold: u64,
     // Subnet state updater settings
     pub subnet_number: u16,
     pub subnet_poll_interval_sec: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DbConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub db: String,
+    pub ca_path: String,
+    pub api_keys_update_interval: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +103,7 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     pub protocol: ProtocolConfig,
     pub http: HTTPConfig,
+    pub db: DbConfig,
     pub cert: Certificate,
     pub log: LogConfig,
     pub raft: RaftConfig,

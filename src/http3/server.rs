@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,27 @@ async fn add_task_handler(
         id: Uuid::new_v4(),
         prompt: add_task.prompt,
     };
+
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain the state reader: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
+    let api_key = match Uuid::from_str(&add_task.api_key) {
+        Ok(uuid) => uuid,
+        Err(e) => {
+            error!("Failed to parse UUID: {:?}", e);
+            return Err(ServerError::Internal(format!(
+                "Failed to parse UUID: {:?}",
+                e
+            )));
+        }
+    };
+
+    if !gateway_state.is_valid_api_key(&api_key) {
+        error!("API key is not allowed");
+        return Err(ServerError::Internal("API key is not allowed".to_string()));
+    }
 
     let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
@@ -260,10 +282,11 @@ impl Http3Server {
         };
 
         let subnet_state = Arc::new(SubnetState::new(
-            http_config.bittensor_wss.clone(),
+            http_config.wss_bittensor.clone(),
             http_config.subnet_number,
             None,
             Duration::from_secs(http_config.subnet_poll_interval_sec),
+            http_config.wss_max_message_size,
         ));
 
         let router = Self::setup_router(

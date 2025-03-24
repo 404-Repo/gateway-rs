@@ -2,7 +2,8 @@
 
 use anyhow::anyhow;
 use anyhow::Result;
-use async_tungstenite::tokio::connect_async;
+use async_tungstenite::tokio::connect_async_with_config;
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
 use foldhash::HashMap;
 use foldhash::HashMapExt;
@@ -15,6 +16,7 @@ use std::fmt;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::error;
+use tracing::info;
 
 use super::crypto::ss58_decode;
 
@@ -59,16 +61,18 @@ pub struct SubnetState {
 
 impl SubnetState {
     pub fn new(
-        bittensor_wss: String,
+        wss_bittensor: String,
         netuid: u16,
         block: Option<u64>,
         poll_interval: Duration,
+        wss_max_message_size: usize,
     ) -> Self {
         let (tx, rx) = watch::channel(HashMap::with_capacity(256));
 
         let join_handle = tokio::spawn(async move {
             loop {
-                match get_subnet_state(&bittensor_wss, netuid, block).await {
+                info!("Updating subnet state {netuid} with wss: {wss_bittensor}");
+                match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size).await {
                     Ok(new_state) => {
                         if let Err(e) = tx.send(new_state) {
                             error!("Failed to send updated subnet state: {:?}", e);
@@ -148,19 +152,26 @@ impl fmt::Display for Balance {
     }
 }
 
-async fn get_text_message<S>(stream: &mut S) -> Result<String>
+async fn get_text_message<S>(stream: &mut S, expected_id: u64) -> Result<String>
 where
     S: StreamExt<Item = Result<Message, async_tungstenite::tungstenite::Error>> + Unpin,
 {
     while let Some(msg) = stream.next().await {
         let msg = msg?;
         if let Message::Text(text) = msg {
-            if !text.trim().is_empty() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let resp: Value = serde_json::from_str(&text)?;
+            if resp["id"].as_u64() == Some(expected_id) {
                 return Ok(text.to_string());
             }
         }
     }
-    Err(anyhow::anyhow!("No valid text message received"))
+    Err(anyhow!(
+        "No valid response with id {} received",
+        expected_id
+    ))
 }
 
 fn build_hotkeys_state(subnet_state: State) -> Result<HashMap<AccountId, HotkeyData>> {
@@ -218,8 +229,16 @@ async fn get_subnet_state(
     bittensor_wss: &str,
     netuid: u16,
     block: Option<u64>,
+    wss_max_message_size: usize,
 ) -> Result<HashMap<AccountId, HotkeyData>> {
-    let (mut socket, _) = connect_async(bittensor_wss).await?;
+    let ws_config = WebSocketConfig::default().max_message_size(Some(wss_max_message_size));
+
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async_with_config(bittensor_wss, Some(ws_config)),
+    )
+    .await??;
+
     let encoded_netuid = netuid.encode();
     let params_hex = format!("0x{}", hex::encode(encoded_netuid));
 
@@ -237,7 +256,7 @@ async fn get_subnet_state(
     });
 
     socket.send(Message::text(request.to_string())).await?;
-    let resp_text = get_text_message(&mut socket).await?;
+    let resp_text = get_text_message(&mut socket, 1).await?;
     let resp: Value = serde_json::from_str(&resp_text)?;
 
     if let Some(result_hex) = resp["result"].as_str() {
@@ -283,6 +302,7 @@ mod tests {
             netuid,
             block,
             poll_interval,
+            2097152,
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;

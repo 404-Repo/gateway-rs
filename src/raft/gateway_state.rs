@@ -1,6 +1,7 @@
 use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
+use crate::db::KeysUpdater;
 use anyhow::Result;
 use openraft::{BasicNode, RaftMetrics};
 use serde_json;
@@ -9,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, RwLock};
+use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum GatewayStateError {
@@ -37,6 +39,7 @@ pub struct GatewayState {
     raft: Arc<RwLock<Raft>>,
     cluster_name: String,
     last_task_acquisition: Arc<AtomicU64>,
+    keys_updater: Arc<KeysUpdater>,
 }
 
 impl GatewayState {
@@ -45,12 +48,14 @@ impl GatewayState {
         raft: Arc<RwLock<Raft>>,
         cluster_name: String,
         last_task_acquisition: Arc<AtomicU64>,
+        keys_updater: Arc<KeysUpdater>,
     ) -> Self {
         Self {
             state,
             raft,
             cluster_name,
             last_task_acquisition,
+            keys_updater,
         }
     }
 
@@ -130,6 +135,10 @@ impl GatewayState {
         }
 
         Ok(())
+    }
+
+    pub fn is_valid_api_key(&self, api_key: &Uuid) -> bool {
+        self.keys_updater.is_valid_api_key(api_key)
     }
 
     pub fn cluster_name(&self) -> &str {

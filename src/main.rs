@@ -10,6 +10,7 @@ mod api;
 mod bittensor;
 mod common;
 mod config;
+mod db;
 mod http3;
 mod protocol;
 mod raft;

@@ -62,42 +62,7 @@ services:
     expose:
       - "9090"
       - "9091"
-
-  node-2:
-    image: gateway:latest
-    container_name: node-2
-    environment:
-      - GATEWAY_CONFIG=/usr/local/bin/config.toml
-    volumes:
-      - ./config/config2.toml:/usr/local/bin/config.toml
-      - certs:/certs
-    networks:
-      my_network:
-        ipv4_address: 172.25.0.3
-    depends_on:
-      db:
-        condition: service_healthy
-    expose:
-      - "9090"
-      - "9091"
-
-  node-3:
-    image: gateway:latest
-    container_name: node-3
-    environment:
-      - GATEWAY_CONFIG=/usr/local/bin/config.toml
-    volumes:
-      - ./config/config3.toml:/usr/local/bin/config.toml
-      - certs:/certs
-    networks:
-      my_network:
-        ipv4_address: 172.25.0.4
-    depends_on:
-      db:
-        condition: service_healthy
-    expose:
-      - "9090"
-      - "9091"
+    command: ["/usr/local/bin/gateway", "-t", "-c", "/usr/local/bin/config.toml"]
 
 networks:
   my_network:
