@@ -39,6 +39,8 @@ use crate::common::cert::load_certificate;
 use crate::common::cert::load_private_key;
 use crate::common::queue::DupQueue;
 use crate::config::NodeConfig;
+use crate::db::DatabaseBuilder;
+use crate::db::KeysUpdater;
 use crate::http3::client::Http3Client;
 use crate::http3::server::Http3Server;
 use crate::raft::client::RClient;
@@ -74,6 +76,7 @@ pub struct Gateway {
     pub _gateway_state: GatewayState,
     pub gateway_info_updater: JoinHandle<()>,
     pub gateway_leader_change: JoinHandle<()>,
+    pub api_keys_updater: JoinHandle<()>,
     pub _log_store: LogStore,
     pub http_server: Http3Server,
     pub _task_queue: Arc<DupQueue<Task>>,
@@ -205,6 +208,7 @@ impl Drop for Gateway {
         self.http_server.abort();
         self.gateway_info_updater.abort();
         self.gateway_leader_change.abort();
+        self.api_keys_updater.abort();
         self.server.abort();
     }
 }
@@ -288,11 +292,32 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     ));
 
+    let db = DatabaseBuilder::new()
+        .host(&config.db.host)
+        .port(config.db.port)
+        .user(&config.db.user)
+        .password(&config.db.password)
+        .dbname(&config.db.db)
+        .ca_pem_path(&config.db.ca_path)
+        .build()
+        .await?;
+
+    let api_keys_updater = Arc::new(KeysUpdater::new(
+        Arc::new(db),
+        Duration::from_secs(config.db.api_keys_update_interval),
+    ));
+
+    let aku = Arc::clone(&api_keys_updater);
+    let api_keys_updater_handle = tokio::spawn(async move {
+        KeysUpdater::run(aku).await;
+    });
+
     let gateway_state = GatewayState::new(
         state_machine_store,
         raft.clone(),
         config.raft.cluster_name.clone(),
         last_task_acquisition.clone(),
+        api_keys_updater,
     );
 
     let key_cert = if use_cert_files {
@@ -436,6 +461,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         _gateway_state: gateway_state,
         gateway_info_updater,
         gateway_leader_change,
+        api_keys_updater: api_keys_updater_handle,
         _log_store: log_store,
         http_server,
         _task_queue: task_queue,

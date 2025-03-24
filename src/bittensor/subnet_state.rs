@@ -2,7 +2,8 @@
 
 use anyhow::anyhow;
 use anyhow::Result;
-use async_tungstenite::tokio::connect_async;
+use async_tungstenite::tokio::connect_async_with_config;
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
 use foldhash::HashMap;
 use foldhash::HashMapExt;
@@ -59,16 +60,17 @@ pub struct SubnetState {
 
 impl SubnetState {
     pub fn new(
-        bittensor_wss: String,
+        wss_bittensor: String,
         netuid: u16,
         block: Option<u64>,
         poll_interval: Duration,
+        wss_max_message_size: usize,
     ) -> Self {
         let (tx, rx) = watch::channel(HashMap::with_capacity(256));
 
         let join_handle = tokio::spawn(async move {
             loop {
-                match get_subnet_state(&bittensor_wss, netuid, block).await {
+                match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size).await {
                     Ok(new_state) => {
                         if let Err(e) = tx.send(new_state) {
                             error!("Failed to send updated subnet state: {:?}", e);
@@ -218,8 +220,16 @@ async fn get_subnet_state(
     bittensor_wss: &str,
     netuid: u16,
     block: Option<u64>,
+    wss_max_message_size: usize,
 ) -> Result<HashMap<AccountId, HotkeyData>> {
-    let (mut socket, _) = connect_async(bittensor_wss).await?;
+    let ws_config = WebSocketConfig::default().max_message_size(Some(wss_max_message_size));
+
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async_with_config(bittensor_wss, Some(ws_config)),
+    )
+    .await??;
+
     let encoded_netuid = netuid.encode();
     let params_hex = format!("0x{}", hex::encode(encoded_netuid));
 
@@ -283,6 +293,7 @@ mod tests {
             netuid,
             block,
             poll_interval,
+            2097152,
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;
