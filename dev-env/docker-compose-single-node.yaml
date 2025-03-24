@@ -1,0 +1,77 @@
+services:
+  cert-gen:
+    image: alpine/openssl
+    entrypoint: []
+    command: >
+      sh -c "if [ ! -f /certs/server.crt ]; then
+              echo 'Generating self-signed certificate...';
+              openssl req -new -nodes -text -out /certs/server.csr -keyout /certs/server.key -subj '/CN=db';
+              echo '[extensions]' > /tmp/openssl.cnf;
+              echo 'subjectAltName = DNS:db,DNS:localhost,IP:127.0.0.1,IP:172.25.0.5' >> /tmp/openssl.cnf;
+              openssl x509 -req -in /certs/server.csr -text -days 365 -signkey /certs/server.key -out /certs/server.crt -extfile /tmp/openssl.cnf -extensions extensions;
+              cp /certs/server.crt /certs/ca.crt;
+              chown 999:999 /certs/server.key /certs/server.crt /certs/ca.crt;
+              chmod 600 /certs/server.key;
+              chmod 644 /certs/server.crt /certs/ca.crt;
+            fi"
+    volumes:
+      - certs:/certs
+    restart: "no"
+
+  db:
+    image: postgres:17
+    depends_on:
+      cert-gen:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: api_keys_!54321
+      POSTGRES_DB: api_keys_db
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+      - certs:/certs
+      - ./custom-postgresql.conf:/etc/postgresql/postgresql.conf
+    command: ["-c", "config_file=/etc/postgresql/postgresql.conf"]
+    networks:
+      my_network:
+        ipv4_address: 172.25.0.5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $$POSTGRES_DB -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  node-1:
+    image: gateway:latest
+    container_name: node-1
+    environment:
+      - GATEWAY_CONFIG=/usr/local/bin/config.toml
+    volumes:
+      - ./config/config1.toml:/usr/local/bin/config.toml
+      - certs:/certs
+    networks:
+      my_network:
+        ipv4_address: 172.25.0.2
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "9090"
+      - "9091"
+    command: ["/usr/local/bin/gateway", "-t", "-c", "/usr/local/bin/config.toml"]
+
+networks:
+  my_network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: "172.25.0.0/16"
+
+volumes:
+  db_data:
+  certs:
