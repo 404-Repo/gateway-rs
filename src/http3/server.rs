@@ -86,6 +86,16 @@ async fn add_task_handler(
         }
     })?;
 
+    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
+        error!("Failed to obtain the HTTPConfig: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
+    })?;
+
+    if queue.len() >= http_cfg.max_task_queue_len {
+        error!("Task queue is full: {} tasks", queue.len());
+        return Err(ServerError::Internal("Task queue is full".to_string()));
+    }
+
     queue.push(task.clone());
     info!("A new task has been pushed with ID: {}", task.id);
     res.render(Json(task));
