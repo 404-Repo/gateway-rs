@@ -77,6 +77,7 @@ pub struct HTTPConfig {
     // Subnet state updater settings
     pub subnet_number: u16,
     pub subnet_poll_interval_sec: u64,
+    pub max_task_queue_len: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

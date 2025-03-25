@@ -27,6 +27,7 @@ wss_max_connect_time = 10
 signature_freshness_threshold = 30
 subnet_number = 17
 subnet_poll_interval_sec = 3600
+max_task_queue_len = 10000
 
 [db]
 host = ""
