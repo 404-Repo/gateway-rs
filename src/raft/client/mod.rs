@@ -109,7 +109,7 @@ mod tests {
     use crate::raft::network::Network;
     use crate::raft::server::RServer;
     use crate::raft::{LogStore, StateMachineStore, TypeConfig};
-    use foldhash::quality::RandomState;
+    use foldhash::fast::RandomState;
     use openraft::raft::AppendEntriesRequest;
     use openraft::{Config, LeaderId, Vote};
     use std::time::Duration;

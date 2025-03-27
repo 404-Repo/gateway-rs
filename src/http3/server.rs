@@ -268,6 +268,21 @@ async fn version_handler(_depot: &mut Depot, _req: &mut Request, res: &mut Respo
     res.render(Text::Html(build_info));
 }
 
+#[handler]
+async fn id_handler(
+    depot: &mut Depot,
+    _req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let node_id = depot.obtain::<usize>().map_err(|e| {
+        error!("Failed to obtain node_id: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain node_id: {:?}", e))
+    })?;
+
+    res.render(node_id.to_string());
+    Ok(())
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: Arc<SubnetState>,
@@ -275,6 +290,7 @@ pub struct Http3Server {
 
 impl Http3Server {
     pub async fn run(
+        node_id: usize,
         addr: SocketAddr,
         tls_config: RustlsConfig,
         http_config: &HTTPConfig,
@@ -300,6 +316,7 @@ impl Http3Server {
         ));
 
         let router = Self::setup_router(
+            node_id,
             task_queue,
             subnet_state.clone(),
             gateway_state,
@@ -339,6 +356,7 @@ impl Http3Server {
     }
 
     fn setup_router(
+        node_id: usize,
         task_queue: Arc<DupQueue<Task>>,
         subnet_state: Arc<SubnetState>,
         gateway_state: GatewayState,
@@ -363,6 +381,7 @@ impl Http3Server {
             .hoop(affix_state::inject(gateway_state))
             .hoop(affix_state::inject(subnet_state))
             .hoop(affix_state::inject(config))
+            .hoop(affix_state::inject(node_id))
             .push(
                 Router::with_path("/add_task")
                     .post(add_task_handler)
@@ -381,6 +400,7 @@ impl Http3Server {
             )
             .push(Router::with_path("/write").post(write_handler))
             .push(Router::with_path("/get_version").get(version_handler))
+            .push(Router::with_path("/id").get(id_handler))
     }
 
     pub fn abort(&self) {

@@ -5,10 +5,16 @@ pub mod network;
 pub mod server;
 pub mod store;
 
+use anyhow::Context as _;
 use anyhow::Result;
+use backon::BackoffBuilder;
+use backon::ConstantBuilder;
+use backon::Retryable;
 use bytes::Bytes;
-use foldhash::quality::RandomState;
+use foldhash::fast::RandomState;
+use futures_util::future::try_join_all;
 use gateway_state::GatewayState;
+use http::StatusCode;
 use network::Network;
 use openraft::BasicNode;
 use rustls::crypto::CryptoProvider;
@@ -27,6 +33,7 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -80,6 +87,65 @@ pub struct Gateway {
     pub _log_store: LogStore,
     pub http_server: Http3Server,
     pub _task_queue: Arc<DupQueue<Task>>,
+}
+
+async fn get_id_for_endpoint(
+    ep: &str,
+    dns_name: &str,
+    sleep_timeout: Duration,
+    retries: usize,
+) -> Result<u64> {
+    let ip = ep.split(':').next().unwrap_or(ep);
+    let url = format!("https://{}:4443/id", dns_name);
+    let connection_addr = format!("{}:4443", ip);
+
+    let backoff = ConstantBuilder::new()
+        .with_delay(sleep_timeout)
+        .with_max_times(retries)
+        .build();
+
+    let id = (|| async {
+        if let Ok(mut client) = Http3Client::new(&connection_addr, dns_name, true).await {
+            if let Ok(Ok((status, body))) = timeout(Duration::from_secs(2), client.get(&url)).await
+            {
+                if status == StatusCode::OK {
+                    let body_str = std::str::from_utf8(&body)
+                        .context("Failed to convert response body to UTF-8")?;
+                    let id = body_str
+                        .trim()
+                        .parse::<u64>()
+                        .context("Failed to parse ID as u64")?;
+                    return Ok(id);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("Failed to get ID"))
+    })
+    .retry(backoff)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn get_node_ids(
+    endpoints: &[impl AsRef<str>],
+    dns_names: &[impl AsRef<str>],
+    sleep_timeout: Duration,
+    retries: usize,
+) -> Result<Vec<u64>> {
+    if endpoints.len() != dns_names.len() {
+        return Err(anyhow::anyhow!(
+            "The number of endpoints and DNS names must be equal"
+        ));
+    }
+    let futures = endpoints
+        .iter()
+        .zip(dns_names.iter())
+        .map(|(ep, dns_name)| {
+            get_id_for_endpoint(ep.as_ref(), dns_name.as_ref(), sleep_timeout, retries)
+        });
+    let ids = try_join_all(futures).await?;
+    Ok(ids)
 }
 
 impl Gateway {
@@ -331,6 +397,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let http_addr: SocketAddr = format!("{}:{}", config.network.ip, config.http.port).parse()?;
     let tls_config = RustlsConfig::new(key_cert.ok());
     let http_server = Http3Server::run(
+        config.network.node_id as usize,
         http_addr,
         tls_config,
         &config.http,
@@ -338,6 +405,14 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         task_queue.clone(),
     )
     .await;
+
+    let node_ids = get_node_ids(
+        &config.network.node_endpoints,
+        &config.network.node_dns_names,
+        Duration::from_secs(config.network.node_id_discovery_sleep),
+        config.network.node_id_discovery_retries,
+    )
+    .await?;
 
     // If not in single-node mode, create remote client connections.
     if mode != GatewayMode::Single {
@@ -377,9 +452,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
                     },
                 );
                 raft.write().await.initialize(initial_nodes).await?;
-                for ((id, endpoint), _dns_name) in config
-                    .network
-                    .node_ids
+                for ((id, endpoint), _dns_name) in node_ids
                     .iter()
                     .zip(config.network.node_endpoints.iter())
                     .zip(config.network.node_dns_names.iter())
@@ -406,11 +479,8 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
                 },
             );
             if let GatewayMode::Vote = mode {
-                for (&peer_node_id, peer_endpoint) in config
-                    .network
-                    .node_ids
-                    .iter()
-                    .zip(config.network.node_endpoints.iter())
+                for (&peer_node_id, peer_endpoint) in
+                    node_ids.iter().zip(config.network.node_endpoints.iter())
                 {
                     membership_nodes.insert(
                         peer_node_id,

@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use foldhash::quality::RandomState;
+use foldhash::fast::RandomState;
 
 use openraft::anyerror;
 use openraft::error::InstallSnapshotError;
