@@ -18,7 +18,7 @@ pub struct Http3Client {
 impl Http3Client {
     pub async fn new(
         server_ip: &str,
-        server_host: &str,
+        server_domain: &str,
         dangerous_skip_verification: bool,
     ) -> Result<Http3Client> {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -42,7 +42,7 @@ impl Http3Client {
         endpoint.set_default_client_config(client_config);
 
         let addr = server_ip.parse()?;
-        let conn = endpoint.connect(addr, server_host)?.await?;
+        let conn = endpoint.connect(addr, server_domain)?.await?;
         let quinn_conn = h3_quinn::Connection::new(conn);
 
         let (mut driver, send_request) = h3::client::new(quinn_conn).await?;

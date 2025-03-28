@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
     use anyhow::Result;
-    use foldhash::quality::RandomState;
+    use foldhash::fast::RandomState;
     use openraft::Config;
     use std::net::UdpSocket;
     use std::sync::Arc;

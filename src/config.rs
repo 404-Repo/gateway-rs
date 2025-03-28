@@ -20,8 +20,9 @@ pub struct NetworkConfig {
     pub server_port: u16,
     pub node_id: u64,
     pub node_endpoints: Vec<String>,
-    pub node_ids: Vec<u64>,
     pub node_dns_names: Vec<String>,
+    pub node_id_discovery_sleep: u64,
+    pub node_id_discovery_retries: usize,
     pub name: String,
 }
 
@@ -204,10 +205,6 @@ impl fmt::Display for NodeConfig {
         writeln!(f, "    Node Endpoints  :")?;
         for endpoint in &self.network.node_endpoints {
             writeln!(f, "      - {}", endpoint)?;
-        }
-        writeln!(f, "    Node IDs        :")?;
-        for nid in &self.network.node_ids {
-            writeln!(f, "      - {}", nid)?;
         }
         writeln!(f, "    Node DNS Names  :")?;
         for dns in &self.network.node_dns_names {
