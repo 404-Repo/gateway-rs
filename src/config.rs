@@ -5,6 +5,7 @@ use serde::Deserializer;
 use std::str::FromStr;
 use std::{fmt, path::Path};
 use tracing::Level;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct BasicConfig {
@@ -67,6 +68,8 @@ pub struct HTTPConfig {
     pub compression_lvl: u32,
     pub port: u16,
     // Per minute rate limits
+    pub basic_rate_limit: usize,
+    pub write_rate_limit: usize,
     pub load_rate_limit: usize,
     pub add_task_rate_limit: usize,
     pub leader_rate_limit: usize,
@@ -79,6 +82,7 @@ pub struct HTTPConfig {
     pub subnet_number: u16,
     pub subnet_poll_interval_sec: u64,
     pub max_task_queue_len: usize,
+    pub admin_key: Uuid,
 }
 
 #[derive(Debug, Clone, Deserialize)]

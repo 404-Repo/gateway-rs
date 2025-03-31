@@ -7,7 +7,7 @@ use std::{io::BufReader, sync::Arc};
 use tokio::fs;
 use tokio_postgres::Config;
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 pub struct Database {
@@ -158,10 +158,10 @@ impl KeysUpdater {
     pub async fn run(self: Arc<Self>) {
         let mut interval = tokio::time::interval(self.update_interval);
         loop {
-            interval.tick().await;
             if let Err(e) = self.update_keys().await {
                 error!("Error updating keys: {:?}", e);
             }
+            interval.tick().await;
         }
     }
 
@@ -183,6 +183,11 @@ impl KeysUpdater {
                 (user_id, api_keys)
             })
             .collect();
+
+        info!(
+            "Retrieved {} new API keys from the database",
+            new_keys.len()
+        );
 
         let new_user_ids: foldhash::HashSet<&Uuid> = new_keys.keys().collect();
         self.users

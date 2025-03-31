@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +12,8 @@ use salvo::rate_limiter::{
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::api::request::{AddTaskRequest, GatewayInfoExt, GetTasksRequest};
-use crate::api::response::{GetTasksResponse, LeaderResponse, LoadResponse};
+use crate::api::request::{AddTaskRequest, GatewayInfoExt, GetTasksRequest, UpdateGenericKey};
+use crate::api::response::{GenericKeyResponse, GetTasksResponse, LeaderResponse, LoadResponse};
 use crate::api::Task;
 use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
@@ -33,12 +32,15 @@ pub type H3RateLimiter = RateLimiter<
 >;
 
 struct RateLimits {
+    basic_limiter: H3RateLimiter,
+    write_limiter: H3RateLimiter,
+    read_limiter: H3RateLimiter,
     task_limiter: H3RateLimiter,
     load_limiter: H3RateLimiter,
     leader_limiter: H3RateLimiter,
 }
 
-// curl --http3 -X POST -H "Content-Type: application/json" -d '{"api_key": "XXXX", "prompt": "mechanic robot"}' -k https://gateway.404.xyz:4443/add_task
+// curl --http3 -X POST "https://gateway.404.xyz:4443" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174000" -d '{"prompt": "mechanic robot"}'
 #[handler]
 async fn add_task_handler(
     depot: &mut Depot,
@@ -54,27 +56,6 @@ async fn add_task_handler(
         id: Uuid::new_v4(),
         prompt: add_task.prompt,
     };
-
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain the state reader: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
-
-    let api_key = match Uuid::from_str(&add_task.api_key) {
-        Ok(uuid) => uuid,
-        Err(e) => {
-            error!("Failed to parse UUID: {:?}", e);
-            return Err(ServerError::Internal(format!(
-                "Failed to parse UUID: {:?}",
-                e
-            )));
-        }
-    };
-
-    if !gateway_state.is_valid_api_key(&api_key) {
-        error!("API key is not allowed");
-        return Err(ServerError::Internal("API key is not allowed".to_string()));
-    }
 
     let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
@@ -283,6 +264,108 @@ async fn id_handler(
     Ok(())
 }
 
+#[handler]
+async fn api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
+    if let Some(value) = req.headers().get("X-API-Key") {
+        if let Ok(key_str) = value.to_str() {
+            if let Ok(api_key) = Uuid::parse_str(key_str) {
+                if let Ok(gateway_state) = depot.obtain::<GatewayState>() {
+                    if gateway_state.is_valid_api_key(&api_key) {
+                        return;
+                    }
+                } else {
+                    res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render("Internal error: Failed to obtain GatewayState");
+                    return;
+                }
+            }
+        }
+    }
+    res.status_code = Some(StatusCode::UNAUTHORIZED);
+    res.render("Unauthorized: Invalid or missing API key");
+}
+
+#[handler]
+async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
+    match depot.obtain::<HTTPConfig>() {
+        Ok(http_cfg) => {
+            if let Some(value) = req.headers().get("X-Admin-Key") {
+                if let Ok(key_str) = value.to_str() {
+                    if let Ok(key_uuid) = Uuid::parse_str(key_str) {
+                        if key_uuid == http_cfg.admin_key {
+                            return;
+                        }
+                    }
+                }
+            }
+            res.status_code = Some(StatusCode::UNAUTHORIZED);
+            res.render("Unauthorized: Invalid or missing admin key");
+        }
+        Err(_) => {
+            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render("Internal error: Failed to obtain configuration");
+        }
+    }
+}
+
+// curl --http3 -X GET "https://gateway.404.xyz:4443" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+#[handler]
+async fn generic_key_update_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    _res: &mut Response,
+) -> Result<(), ServerError> {
+    let ugk = req
+        .parse_json::<UpdateGenericKey>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
+        error!("Failed to obtain the HTTPConfig: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
+    })?;
+
+    if ugk.admin_key != http_cfg.admin_key {
+        return Err(ServerError::Unauthorized("Wrong admin key".to_string()));
+    }
+
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
+
+    gateway_state
+        .update_gateway_generic_key(Some(ugk.generic_key))
+        .await
+        .map_err(|e| {
+            error!("Failed to update gateway generic key: {:?}", e);
+            ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
+        })?;
+
+    Ok(())
+}
+
+#[handler]
+async fn generic_key_read_handler(
+    depot: &mut Depot,
+    _req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain GatewayState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
+    })?;
+
+    if let Some(uuid) = gateway_state.generic_key().await {
+        let response = GenericKeyResponse { generic_key: uuid };
+        res.render(Json(response));
+        Ok(())
+    } else {
+        error!("Generic key not found");
+        Err(ServerError::Internal("Generic key not found".to_string()))
+    }
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: Arc<SubnetState>,
@@ -297,11 +380,17 @@ impl Http3Server {
         gateway_state: GatewayState,
         task_queue: Arc<DupQueue<Task>>,
     ) -> Self {
+        let basic_limiter = Self::create_rate_limiter(http_config.basic_rate_limit);
+        let write_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
+        let read_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
         let load_limiter = Self::create_rate_limiter(http_config.load_rate_limit);
         let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
         let leader_limiter = Self::create_rate_limiter(http_config.leader_rate_limit);
 
         let rate_limits = RateLimits {
+            basic_limiter,
+            write_limiter,
+            read_limiter,
             load_limiter,
             task_limiter,
             leader_limiter,
@@ -384,23 +473,40 @@ impl Http3Server {
             .hoop(affix_state::inject(node_id))
             .push(
                 Router::with_path("/add_task")
-                    .post(add_task_handler)
-                    .hoop(rate_limits.task_limiter),
+                    .hoop(api_key_check)
+                    .hoop(rate_limits.task_limiter)
+                    .post(add_task_handler),
             )
             .push(Router::with_path("/get_tasks").post(get_tasks_handler))
             .push(
                 Router::with_path("/get_load")
-                    .get(get_load_handler)
-                    .hoop(rate_limits.load_limiter),
+                    .hoop(rate_limits.load_limiter)
+                    .get(get_load_handler),
             )
             .push(
                 Router::with_path("/get_leader")
-                    .get(get_leader_handler)
-                    .hoop(rate_limits.leader_limiter),
+                    .hoop(rate_limits.leader_limiter)
+                    .get(get_leader_handler),
             )
             .push(Router::with_path("/write").post(write_handler))
-            .push(Router::with_path("/get_version").get(version_handler))
+            .push(
+                Router::with_path("/get_version")
+                    .hoop(rate_limits.basic_limiter)
+                    .get(version_handler),
+            )
             .push(Router::with_path("/id").get(id_handler))
+            .push(
+                Router::with_path("/get_key")
+                    .hoop(admin_key_check)
+                    .hoop(rate_limits.read_limiter)
+                    .get(generic_key_read_handler),
+            )
+            .push(
+                Router::with_path("/update_key")
+                    .hoop(admin_key_check)
+                    .hoop(rate_limits.write_limiter)
+                    .post(generic_key_update_handler),
+            )
     }
 
     pub fn abort(&self) {
