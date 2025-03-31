@@ -248,7 +248,11 @@ impl Gateway {
         }
     }
 
-    pub async fn gateway_leader_change(gateway_state: GatewayState) {
+    pub async fn gateway_generic_key_update(gateway_state: &GatewayState) -> Result<()> {
+        gateway_state.update_gateway_generic_key(None).await
+    }
+
+    pub async fn gateway_leader_change(gateway_state: GatewayState, current_node_id: u64) {
         let mut metrics_rx = gateway_state.metrics().await;
         let mut last_leader = None;
         loop {
@@ -260,6 +264,9 @@ impl Gateway {
             if current_leader != last_leader {
                 if let Some(leader_id) = current_leader {
                     info!("Leader changed to node {}", leader_id);
+                    if leader_id == current_node_id {
+                        let _ = Gateway::gateway_generic_key_update(&gateway_state).await;
+                    }
                 } else {
                     info!("Leadership changed, but no leader is elected yet");
                 }
@@ -520,12 +527,13 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     });
 
     let gs = gateway_state.clone();
+    let current_node_id = config.network.node_id;
     let gateway_leader_change = tokio::spawn(async move {
-        Gateway::gateway_leader_change(gs).await;
+        Gateway::gateway_leader_change(gs, current_node_id).await;
     });
 
     Ok(Gateway {
-        _config: config.clone(),
+        _config: config,
         _id: node_id,
         server,
         _gateway_state: gateway_state,

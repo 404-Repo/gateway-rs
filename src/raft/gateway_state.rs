@@ -137,6 +137,38 @@ impl GatewayState {
         Ok(())
     }
 
+    pub async fn update_gateway_generic_key(&self, new_key: Option<Uuid>) -> Result<()> {
+        let raft_guard = self.raft.write().await;
+
+        let key_to_set = if self.state.get("generic_key").await.is_none() {
+            new_key.unwrap_or_else(Uuid::new_v4)
+        } else if let Some(key) = new_key {
+            key
+        } else {
+            return Ok(());
+        };
+
+        let serialized_key = serde_json::to_string(&key_to_set)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to JSON: {}", e))?;
+
+        raft_guard
+            .client_write(Request::Set {
+                key: "generic_key".to_string(),
+                value: serialized_key,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))?;
+
+        Ok(())
+    }
+
+    pub async fn generic_key(&self) -> Option<Uuid> {
+        self.state
+            .get("generic_key")
+            .await
+            .and_then(|s: String| serde_json::from_str::<Uuid>(&s).ok())
+    }
+
     pub fn is_valid_api_key(&self, api_key: &Uuid) -> bool {
         self.keys_updater.is_valid_api_key(api_key)
     }

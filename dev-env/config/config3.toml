@@ -18,6 +18,8 @@ receive_message_timeout_ms = 2000
 compression = true
 compression_lvl = 3
 port = 4443
+basic_rate_limit = 30
+write_rate_limit = 10
 load_rate_limit = 60
 leader_rate_limit = 10
 add_task_rate_limit = 100
@@ -28,7 +30,8 @@ wss_max_connect_time = 10
 signature_freshness_threshold = 30
 subnet_number = 17
 subnet_poll_interval_sec = 3600
-max_task_queue_len = 10000
+max_task_queue_len = 5000
+admin_key = "b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 
 [db]
 host = "db"

@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use uuid::Uuid;
 
 use super::response::GatewayInfo;
 
@@ -7,17 +8,26 @@ use super::response::GatewayInfo;
 // The Gateway will assign a unique ID, which will be included in the response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddTaskRequest {
-    pub api_key: String,
     pub prompt: String,
 }
 
-// Validator hotkey must be verified
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetTasksRequest {
     pub hotkey: String,
     pub signature: String,
     pub timestamp: String,
     pub requested_task_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateGenericKey {
+    pub admin_key: Uuid,
+    pub generic_key: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetGenericKey {
+    pub admin_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
