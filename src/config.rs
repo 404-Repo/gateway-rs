@@ -12,6 +12,9 @@ pub struct BasicConfig {
     pub max_restart_attempts: usize,
     pub update_gateway_info_ms: u64,
     pub unique_validators_per_task: usize,
+    pub taskmanager_initial_capacity: usize,
+    pub taskmanager_cleanup_interval: u64,
+    pub taskmanager_result_lifetime: u64,
 }
 
 #[derive(Debug, Deserialize)]

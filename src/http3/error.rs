@@ -6,6 +6,7 @@ pub enum ServerError {
     BadRequest(String),
     Internal(String),
     Unauthorized(String),
+    NotFound(String),
 }
 
 impl ServerError {
@@ -14,6 +15,7 @@ impl ServerError {
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ServerError::NotFound(_) => StatusCode::NOT_FOUND,
         }
     }
 }
@@ -36,6 +38,10 @@ impl Writer for ServerError {
             }
             ServerError::Unauthorized(msg) => {
                 res.render(Text::Plain(format!("Unauthorized request: {}", msg)));
+            }
+
+            ServerError::NotFound(msg) => {
+                res.render(Text::Plain(msg));
             }
         }
     }

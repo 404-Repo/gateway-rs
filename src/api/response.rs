@@ -2,6 +2,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::common::task::TaskStatus;
+
 use super::Task;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,11 @@ pub struct GenericKeyResponse {
 pub struct GetTasksResponse {
     pub tasks: Vec<Task>,
     pub gateways: Vec<GatewayInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetTaskStatusResponse {
+    pub status: TaskStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]

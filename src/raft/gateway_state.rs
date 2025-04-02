@@ -1,6 +1,7 @@
 use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
+use crate::common::task::TaskManager;
 use crate::db::KeysUpdater;
 use anyhow::Result;
 use openraft::{BasicNode, RaftMetrics};
@@ -40,6 +41,7 @@ pub struct GatewayState {
     cluster_name: String,
     last_task_acquisition: Arc<AtomicU64>,
     keys_updater: Arc<KeysUpdater>,
+    task_manager: Arc<TaskManager>,
 }
 
 impl GatewayState {
@@ -49,6 +51,7 @@ impl GatewayState {
         cluster_name: String,
         last_task_acquisition: Arc<AtomicU64>,
         keys_updater: Arc<KeysUpdater>,
+        task_manager: Arc<TaskManager>,
     ) -> Self {
         Self {
             state,
@@ -56,6 +59,7 @@ impl GatewayState {
             cluster_name,
             last_task_acquisition,
             keys_updater,
+            task_manager,
         }
     }
 
@@ -175,5 +179,9 @@ impl GatewayState {
 
     pub fn cluster_name(&self) -> &str {
         &self.cluster_name
+    }
+
+    pub fn task_manager(&self) -> Arc<TaskManager> {
+        self.task_manager.clone()
     }
 }

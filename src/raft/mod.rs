@@ -45,6 +45,7 @@ use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificate;
 use crate::common::cert::load_private_key;
 use crate::common::queue::DupQueue;
+use crate::common::task::TaskManager;
 use crate::config::NodeConfig;
 use crate::db::DatabaseBuilder;
 use crate::db::KeysUpdater;
@@ -84,6 +85,7 @@ pub struct Gateway {
     pub gateway_info_updater: JoinHandle<()>,
     pub gateway_leader_change: JoinHandle<()>,
     pub api_keys_updater: JoinHandle<()>,
+    pub task_manager: Arc<TaskManager>,
     pub _log_store: LogStore,
     pub http_server: Http3Server,
     pub _task_queue: Arc<DupQueue<Task>>,
@@ -283,6 +285,7 @@ impl Drop for Gateway {
         self.gateway_leader_change.abort();
         self.api_keys_updater.abort();
         self.server.abort();
+        self.task_manager.abort();
     }
 }
 
@@ -385,12 +388,21 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         KeysUpdater::run(aku).await;
     });
 
+    let task_manager = TaskManager::new(
+        config.basic.taskmanager_initial_capacity,
+        config.basic.unique_validators_per_task,
+        Duration::from_secs(config.basic.taskmanager_cleanup_interval),
+        Duration::from_secs(config.basic.taskmanager_result_lifetime),
+    )
+    .await;
+
     let gateway_state = GatewayState::new(
         state_machine_store,
         raft.clone(),
         config.raft.cluster_name.clone(),
         last_task_acquisition.clone(),
         api_keys_updater,
+        Arc::clone(&task_manager),
     );
 
     let key_cert = if use_cert_files {
@@ -540,6 +552,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         gateway_info_updater,
         gateway_leader_change,
         api_keys_updater: api_keys_updater_handle,
+        task_manager,
         _log_store: log_store,
         http_server,
         _task_queue: task_queue,

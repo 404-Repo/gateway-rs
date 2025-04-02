@@ -1,7 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use async_zip::base::write::ZipFileWriter;
+use async_zip::ZipEntryBuilder;
+use futures::io::Cursor;
+use http::HeaderValue;
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
@@ -12,13 +16,19 @@ use salvo::rate_limiter::{
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::api::request::{AddTaskRequest, GatewayInfoExt, GetTasksRequest, UpdateGenericKey};
-use crate::api::response::{GenericKeyResponse, GetTasksResponse, LeaderResponse, LoadResponse};
+use crate::api::request::{
+    AddTaskRequest, AddTaskResultRequest, GatewayInfoExt, GetTaskResultRequest, GetTaskStatus,
+    GetTasksRequest, UpdateGenericKeyRequest,
+};
+use crate::api::response::{
+    GenericKeyResponse, GetTaskStatusResponse, GetTasksResponse, LeaderResponse, LoadResponse,
+};
 use crate::api::Task;
 use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
+use crate::common::task::TaskResultScored;
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
 
@@ -84,6 +94,195 @@ async fn add_task_handler(
 }
 
 #[handler]
+async fn add_result_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let add_result = req
+        .parse_json::<AddTaskResultRequest>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let subnet_state = depot.obtain::<Arc<SubnetState>>().map_err(|e| {
+        error!("Failed to obtain the SubnetState: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e))
+    })?;
+
+    subnet_state
+        .validate_hotkey(&add_result.validator_hotkey)
+        .map_err(|e| {
+            error!(
+                "Hotkey {} is not registered in the subnet: {:?}",
+                add_result.validator_hotkey, e
+            );
+            ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
+        })?;
+
+    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
+        error!("Failed to obtain the HTTPConfig: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
+    })?;
+
+    verify_hotkey(
+        &add_result.timestamp,
+        &add_result.validator_hotkey,
+        &add_result.signature,
+        http_cfg.signature_freshness_threshold,
+    )
+    .map_err(|e| {
+        error!("Failed to verify AddTaskRequest: {:?}", e);
+        ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e))
+    })?;
+
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain the state reader: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
+    let id = add_result.id;
+    let result = TaskResultScored {
+        validator_hotkey: add_result.validator_hotkey,
+        miner_hotkey: add_result.miner_hotkey,
+        asset: add_result.asset,
+        score: add_result.score,
+        instant: Instant::now(),
+    };
+    info!(
+        "Received result for task {id} from validator {} and miner {}",
+        result.validator_hotkey, result.miner_hotkey
+    );
+
+    gateway_state.task_manager().add_result(id, result).await;
+    res.status_code(StatusCode::OK);
+    res.render(Text::Plain("Ok"));
+    Ok(())
+}
+
+#[handler]
+async fn get_result_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let get_task = req
+        .parse_json::<GetTaskResultRequest>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let task_id = get_task.id;
+    let all_results = get_task.all;
+
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain the state reader: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
+    let task_manager = gateway_state.task_manager();
+
+    let results = task_manager.get_result(task_id).await;
+    let results_vec =
+        results.ok_or_else(|| ServerError::NotFound("Task ID not found".to_string()))?;
+
+    if results_vec.is_empty() {
+        return Err(ServerError::NotFound(
+            "No results found for the task".to_string(),
+        ));
+    }
+
+    if all_results {
+        let mut buffer = Vec::new();
+        let mut cursor = Cursor::new(&mut buffer);
+        let mut zip_writer = ZipFileWriter::new(&mut cursor);
+
+        for (i, file) in results_vec.into_iter().enumerate() {
+            let filename = format!("{}.spz", i + 1);
+            let entry =
+                ZipEntryBuilder::new(filename.into(), async_zip::Compression::Stored).build();
+            zip_writer
+                .write_entry_whole(entry, &file.asset)
+                .await
+                .map_err(|e| {
+                    ServerError::Internal(format!("Failed to write zip entry: {:?}", e))
+                })?;
+        }
+
+        zip_writer
+            .close()
+            .await
+            .map_err(|e| ServerError::Internal(format!("Failed to close zip archive: {:?}", e)))?;
+
+        res.headers_mut()
+            .insert("Content-Type", HeaderValue::from_static("application/zip"));
+        res.headers_mut().insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment; filename=\"results.zip\""),
+        );
+        res.body(buffer);
+    } else {
+        let best_result = results_vec
+            .into_iter()
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .ok_or_else(|| ServerError::Internal("Failed to find the best result".to_string()))?;
+
+        res.headers_mut().insert(
+            "Content-Type",
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        res.headers_mut().insert(
+            "Content-Disposition",
+            HeaderValue::from_static("attachment; filename=\"result.spz\""),
+        );
+        res.body(best_result.asset);
+    }
+
+    Ok(())
+}
+
+#[handler]
+async fn get_status_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let get_status = req
+        .parse_json::<GetTaskStatus>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        error!("Failed to obtain the state reader: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
+    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+        if let Some(err) = err_opt {
+            error!("Failed to obtain the task queue: {:?}", err);
+            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
+        } else {
+            error!("Failed to obtain the task queue: unknown error");
+            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
+        }
+    })?;
+
+    let status = gateway_state
+        .task_manager()
+        .get_status(get_status.id, queue.dup())
+        .await;
+
+    res.render(Json(GetTaskStatusResponse { status }));
+
+    Ok(())
+}
+
+// curl --http3 -X POST https://gateway.404.xyz:4443/get_tasks \
+//   -H "Content-Type: application/json" \
+//   -d '{"validator_hotkey": "abc123", "signature": "somesignature", "timestamp": "2025-04-02T12:00:00Z", "requested_task_count": 10}'
+#[handler]
 async fn get_tasks_handler(
     depot: &mut Depot,
     req: &mut Request,
@@ -105,16 +304,22 @@ async fn get_tasks_handler(
     })?;
 
     subnet_state
-        .validate_hotkey(&get_tasks.hotkey)
+        .validate_hotkey(&get_tasks.validator_hotkey)
         .map_err(|e| {
             error!(
                 "Hotkey {} is not registered in the subnet: {:?}",
-                get_tasks.hotkey, e
+                get_tasks.validator_hotkey, e
             );
             ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
         })?;
 
-    verify_hotkey(&get_tasks, http_cfg.signature_freshness_threshold).map_err(|e| {
+    verify_hotkey(
+        &get_tasks.timestamp,
+        &get_tasks.validator_hotkey,
+        &get_tasks.signature,
+        http_cfg.signature_freshness_threshold,
+    )
+    .map_err(|e| {
         error!("Failed to verify GetTasksRequest: {:?}", e);
         ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e))
     })?;
@@ -146,7 +351,7 @@ async fn get_tasks_handler(
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
 
-    let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.hotkey);
+    let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.validator_hotkey);
 
     let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));
@@ -316,18 +521,9 @@ async fn generic_key_update_handler(
     _res: &mut Response,
 ) -> Result<(), ServerError> {
     let ugk = req
-        .parse_json::<UpdateGenericKey>()
+        .parse_json::<UpdateGenericKeyRequest>()
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
-        error!("Failed to obtain the HTTPConfig: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
-    })?;
-
-    if ugk.admin_key != http_cfg.admin_key {
-        return Err(ServerError::Unauthorized("Wrong admin key".to_string()));
-    }
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
         error!("Failed to obtain GatewayState: {:?}", e);
@@ -477,6 +673,7 @@ impl Http3Server {
                     .hoop(rate_limits.task_limiter)
                     .post(add_task_handler),
             )
+            .push(Router::with_path("/add_result").post(add_result_handler))
             .push(Router::with_path("/get_tasks").post(get_tasks_handler))
             .push(
                 Router::with_path("/get_load")
@@ -500,6 +697,16 @@ impl Http3Server {
                     .hoop(admin_key_check)
                     .hoop(rate_limits.read_limiter)
                     .get(generic_key_read_handler),
+            )
+            .push(
+                Router::with_path("/get_result")
+                    .hoop(api_key_check)
+                    .get(get_result_handler),
+            )
+            .push(
+                Router::with_path("/get_status")
+                    .hoop(api_key_check)
+                    .get(get_status_handler),
             )
             .push(
                 Router::with_path("/update_key")
