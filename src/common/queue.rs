@@ -1,4 +1,4 @@
-use foldhash::quality::RandomState;
+use foldhash::fast::RandomState;
 use scc::HashMap;
 use scc::Queue;
 use std::hash::Hash;
@@ -64,6 +64,10 @@ impl<T: Clone + Hash + HasUuid + 'static> DupQueue<T> {
             }
         }
         result
+    }
+
+    pub fn dup(&self) -> usize {
+        self.dup
     }
 
     pub fn len(&self) -> usize {

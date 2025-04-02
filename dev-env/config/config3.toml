@@ -51,6 +51,9 @@ key_file_path = "/etc/certs/key.pem"
 max_restart_attempts = 2
 update_gateway_info_ms = 1000
 unique_validators_per_task = 3
+taskmanager_initial_capacity = 1024
+taskmanager_cleanup_interval = 30
+taskmanager_result_lifetime = 300
 
 [log]
 path = "./logs/gateway.log"

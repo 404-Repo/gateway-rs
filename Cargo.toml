@@ -9,6 +9,7 @@ salvo = { version = "0.77.1", features = ["quinn", "rustls", "rate-limiter", "af
 tokio = { version = "1.44.1", features = ["full"] }
 tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"] }
 async-tungstenite = { version = "0.29.1", features = ["tokio-runtime", "tokio-rustls-native-certs"] }
+async_zip = { version = "0.0.17", features = ["deflate"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
 tokio-util = "0.7.14"

@@ -4,8 +4,6 @@ use blake2::{Blake2b512, Digest};
 use schnorrkel::{context::signing_context, PublicKey, Signature};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::request::GetTasksRequest;
-
 const GATEWAY: &str = "404_GATEWAY_";
 
 pub struct AccountId(pub [u8; 32]);
@@ -98,16 +96,21 @@ pub fn verify_signature(
         .map_err(|e| anyhow!("Signature verification failed: {:?}", e))
 }
 
-pub fn verify_hotkey(request: &GetTasksRequest, freshness_threshold_sec: u64) -> Result<()> {
+pub fn verify_hotkey(
+    timestamp: &str,
+    validator_hotkey: &str,
+    signature: &str,
+    freshness_threshold_sec: u64,
+) -> Result<()> {
     // The timestamp must be in the format "404_GATEWAY_<number>"
-    if !request.timestamp.starts_with(GATEWAY) {
+    if !timestamp.starts_with(GATEWAY) {
         return Err(anyhow!(
             "Timestamp does not start with required prefix '{}'",
             GATEWAY
         ));
     }
     // Remove the prefix and parse the numeric part.
-    let ts_str = &request.timestamp[GATEWAY.len()..];
+    let ts_str = &timestamp[GATEWAY.len()..];
     let ts: u64 = ts_str
         .parse()
         .map_err(|e| anyhow!("Failed to parse timestamp part '{}': {}", ts_str, e))?;
@@ -129,12 +132,12 @@ pub fn verify_hotkey(request: &GetTasksRequest, freshness_threshold_sec: u64) ->
 
     // Decode hotkey and signature.
     let hotkey =
-        ss58_decode(&request.hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
+        ss58_decode(validator_hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
 
-    let signature = general_purpose::STANDARD
-        .decode(&request.signature)
+    let signature_bytes = general_purpose::STANDARD
+        .decode(signature)
         .map_err(|e| anyhow!("Failed to decode signature: {}", e))?;
-    if signature.len() != 64 {
+    if signature_bytes.len() != 64 {
         return Err(anyhow!("Invalid signature length"));
     }
 
@@ -142,13 +145,13 @@ pub fn verify_hotkey(request: &GetTasksRequest, freshness_threshold_sec: u64) ->
     hotkey_arr.copy_from_slice(hotkey.as_ref());
 
     let mut sig_arr = [0u8; 64];
-    sig_arr.copy_from_slice(&signature);
+    sig_arr.copy_from_slice(&signature_bytes);
 
     // Use the entire timestamp string (including "404_GATEWAY_") as the message.
     verify_signature(
         &AccountId(hotkey_arr),
         &KeypairSignature(sig_arr),
-        request.timestamp.as_bytes(),
+        timestamp.as_bytes(),
     )
 }
 
@@ -175,13 +178,13 @@ mod tests {
         let timestamp_string = format!("{}{}", GATEWAY, ts);
         let ctx = signing_context(b"");
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
-        let request = GetTasksRequest {
-            hotkey: _ss58_encode(&keypair.public.to_bytes()),
-            signature: general_purpose::STANDARD.encode(signature.to_bytes()),
-            timestamp: timestamp_string,
-            requested_task_count: 5,
-        };
-        assert!(verify_hotkey(&request, 300).is_ok());
+        assert!(verify_hotkey(
+            &timestamp_string,
+            &_ss58_encode(&keypair.public.to_bytes()),
+            &general_purpose::STANDARD.encode(signature.to_bytes()),
+            300
+        )
+        .is_ok());
     }
 
     #[test]
@@ -195,13 +198,13 @@ mod tests {
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         let mut sig_bytes = signature.to_bytes();
         sig_bytes[0] ^= 0x01; // Tamper with the signature.
-        let request = GetTasksRequest {
-            hotkey: _ss58_encode(&keypair.public.to_bytes()),
-            signature: general_purpose::STANDARD.encode(sig_bytes),
-            timestamp: timestamp_string,
-            requested_task_count: 5,
-        };
-        assert!(verify_hotkey(&request, 300).is_err());
+        assert!(verify_hotkey(
+            &timestamp_string,
+            &_ss58_encode(&keypair.public.to_bytes()),
+            &general_purpose::STANDARD.encode(sig_bytes),
+            300
+        )
+        .is_err());
     }
 
     #[test]
@@ -214,26 +217,25 @@ mod tests {
         let timestamp_string = format!("{}{}", GATEWAY, ts);
         let ctx = signing_context(b"");
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
-        let request = GetTasksRequest {
-            hotkey: _ss58_encode(&keypair.public.to_bytes()),
-            signature: general_purpose::STANDARD.encode(signature.to_bytes()),
-            timestamp: timestamp_string,
-            requested_task_count: 5,
-        };
-        assert!(verify_hotkey(&request, 300).is_err());
+        assert!(verify_hotkey(
+            &timestamp_string,
+            &_ss58_encode(&keypair.public.to_bytes()),
+            &general_purpose::STANDARD.encode(signature.to_bytes()),
+            300
+        )
+        .is_err());
     }
 
     #[test]
     fn test_invalid_timestamp_format() {
         // Timestamp string without the required prefix.
         let bad_timestamp = "dead_code_123456".to_string();
-        let request = GetTasksRequest {
-            // Again, use a valid SS58 encoded hotkey.
-            hotkey: _ss58_encode(&[0u8; 32]),
-            signature: general_purpose::STANDARD.encode([0u8; 64]),
-            timestamp: bad_timestamp,
-            requested_task_count: 5,
-        };
-        assert!(verify_hotkey(&request, 300).is_err());
+        assert!(verify_hotkey(
+            &bad_timestamp,
+            &_ss58_encode(&[0u8; 32]),
+            &general_purpose::STANDARD.encode([0u8; 64]),
+            300
+        )
+        .is_err());
     }
 }

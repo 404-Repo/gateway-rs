@@ -4,30 +4,45 @@ use uuid::Uuid;
 
 use super::response::GatewayInfo;
 
-// It should be confirmed that the caller has permission to add the task before proceeding with its use.
-// The Gateway will assign a unique ID, which will be included in the response body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetTasksRequest {
-    pub hotkey: String,
+    pub validator_hotkey: String,
     pub signature: String,
     pub timestamp: String,
     pub requested_task_count: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateGenericKey {
-    pub admin_key: Uuid,
-    pub generic_key: Uuid,
+#[derive(Debug, Deserialize)]
+pub struct GetTaskResultRequest {
+    pub id: Uuid,
+    #[serde(default)]
+    pub all: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetGenericKey {
-    pub admin_key: String,
+#[derive(Debug, Deserialize)]
+pub struct GetTaskStatus {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddTaskResultRequest {
+    pub id: Uuid,
+    pub signature: String,
+    pub timestamp: String,
+    pub validator_hotkey: String,
+    pub miner_hotkey: String,
+    pub asset: Vec<u8>,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateGenericKeyRequest {
+    pub generic_key: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
