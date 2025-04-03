@@ -173,6 +173,18 @@ impl GatewayState {
             .and_then(|s: String| serde_json::from_str::<Uuid>(&s).ok())
     }
 
+    pub async fn is_generic_key(&self, api_key: &Uuid) -> bool {
+        match self
+            .state
+            .get("generic_key")
+            .await
+            .and_then(|s: String| serde_json::from_str::<Uuid>(&s).ok())
+        {
+            Some(generic_key) => &generic_key == api_key,
+            None => false,
+        }
+    }
+
     pub fn is_valid_api_key(&self, api_key: &Uuid) -> bool {
         self.keys_updater.is_valid_api_key(api_key)
     }
