@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ use salvo::prelude::*;
 use salvo::rate_limiter::{
     BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
 };
+
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -34,23 +36,54 @@ use crate::raft::gateway_state::GatewayState;
 
 use super::error::ServerError;
 
-pub type H3RateLimiter = RateLimiter<
+type H3RateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
     RemoteIpIssuer,
     BasicQuota,
 >;
 
+type H3GenericKeyPerIpRateLimiter = RateLimiter<
+    FixedGuard,
+    MokaStore<<GenericKeyPerIpIssuer as RateIssuer>::Key, FixedGuard>,
+    GenericKeyPerIpIssuer,
+    BasicQuota,
+>;
+struct GenericKeyPerIpIssuer;
+
+impl RateIssuer for GenericKeyPerIpIssuer {
+    type Key = String;
+
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        let key_header = req.headers().get("X-API-Key")?.to_str().ok()?;
+        let gs = depot.obtain::<GatewayState>().ok()?;
+        let uuid = Uuid::from_str(key_header).ok()?;
+
+        if gs.is_generic_key(&uuid).await {
+            let socket_addr = req.remote_addr();
+            let ip_str = match socket_addr {
+                salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
+                salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
+                _ => return None,
+            };
+            return Some(format!("g:{}", ip_str));
+        }
+        None
+    }
+}
+
 struct RateLimits {
     basic_limiter: H3RateLimiter,
     write_limiter: H3RateLimiter,
+    update_limiter: H3RateLimiter,
+    generic_limiter: H3GenericKeyPerIpRateLimiter,
     read_limiter: H3RateLimiter,
     task_limiter: H3RateLimiter,
     load_limiter: H3RateLimiter,
     leader_limiter: H3RateLimiter,
 }
 
-// curl --http3 -X POST "https://gateway.404.xyz:4443" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174000" -d '{"prompt": "mechanic robot"}'
+// curl --http3 -X POST "https://gateway.404.xyz:4443/add_task" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
 #[handler]
 async fn add_task_handler(
     depot: &mut Depot,
@@ -281,7 +314,7 @@ async fn get_status_handler(
 
 // curl --http3 -X POST https://gateway.404.xyz:4443/get_tasks \
 //   -H "Content-Type: application/json" \
-//   -d '{"validator_hotkey": "abc123", "signature": "somesignature", "timestamp": "2025-04-02T12:00:00Z", "requested_task_count": 10}'
+//   -d '{"validator_hotkey": "abc123", "signature": "signatureinbase64", "timestamp": "1743657200", "requested_task_count": 10}'
 #[handler]
 async fn get_tasks_handler(
     depot: &mut Depot,
@@ -491,6 +524,27 @@ async fn api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response)
 }
 
 #[handler]
+async fn generic_api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
+    if let Some(value) = req.headers().get("X-API-Key") {
+        if let Ok(key_str) = value.to_str() {
+            if let Ok(api_key) = Uuid::parse_str(key_str) {
+                if let Ok(gateway_state) = depot.obtain::<GatewayState>() {
+                    if gateway_state.is_generic_key(&api_key).await {
+                        return;
+                    }
+                } else {
+                    res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
+                    res.render("Internal error: Failed to obtain GatewayState");
+                    return;
+                }
+            }
+        }
+    }
+    res.status_code = Some(StatusCode::UNAUTHORIZED);
+    res.render("Unauthorized: Invalid or missing API key");
+}
+
+#[handler]
 async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
     match depot.obtain::<HTTPConfig>() {
         Ok(http_cfg) => {
@@ -513,12 +567,12 @@ async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Respons
     }
 }
 
-// curl --http3 -X GET "https://gateway.404.xyz:4443" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+// curl --http3 -X POST "https://gateway.404.xyz:4443/update_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "Content-Type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
 #[handler]
 async fn generic_key_update_handler(
     depot: &mut Depot,
     req: &mut Request,
-    _res: &mut Response,
+    res: &mut Response,
 ) -> Result<(), ServerError> {
     let ugk = req
         .parse_json::<UpdateGenericKeyRequest>()
@@ -538,9 +592,12 @@ async fn generic_key_update_handler(
             ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
         })?;
 
+    res.status_code(StatusCode::OK);
+    res.render(Text::Plain("Ok"));
     Ok(())
 }
 
+// curl --http3 -X GET "https://gateway.404.xyz:4443/get_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 #[handler]
 async fn generic_key_read_handler(
     depot: &mut Depot,
@@ -578,6 +635,13 @@ impl Http3Server {
     ) -> Self {
         let basic_limiter = Self::create_rate_limiter(http_config.basic_rate_limit);
         let write_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
+        let update_limiter = Self::create_rate_limiter(http_config.update_key_rate_limit);
+        let generic_limiter = H3GenericKeyPerIpRateLimiter::new(
+            FixedGuard::new(),
+            MokaStore::new(),
+            GenericKeyPerIpIssuer,
+            BasicQuota::per_minute(http_config.generic_key_rate_limit),
+        );
         let read_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
         let load_limiter = Self::create_rate_limiter(http_config.load_rate_limit);
         let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
@@ -586,6 +650,8 @@ impl Http3Server {
         let rate_limits = RateLimits {
             basic_limiter,
             write_limiter,
+            update_limiter,
+            generic_limiter,
             read_limiter,
             load_limiter,
             task_limiter,
@@ -673,6 +739,12 @@ impl Http3Server {
                     .hoop(rate_limits.task_limiter)
                     .post(add_task_handler),
             )
+            .push(
+                Router::with_path("/add_task_generic")
+                    .hoop(generic_api_key_check)
+                    .hoop(rate_limits.generic_limiter)
+                    .post(add_task_handler),
+            )
             .push(Router::with_path("/add_result").post(add_result_handler))
             .push(Router::with_path("/get_tasks").post(get_tasks_handler))
             .push(
@@ -685,7 +757,11 @@ impl Http3Server {
                     .hoop(rate_limits.leader_limiter)
                     .get(get_leader_handler),
             )
-            .push(Router::with_path("/write").post(write_handler))
+            .push(
+                Router::with_path("/write")
+                    .hoop(rate_limits.write_limiter)
+                    .post(write_handler),
+            )
             .push(
                 Router::with_path("/get_version")
                     .hoop(rate_limits.basic_limiter)
@@ -694,8 +770,8 @@ impl Http3Server {
             .push(Router::with_path("/id").get(id_handler))
             .push(
                 Router::with_path("/get_key")
-                    .hoop(admin_key_check)
                     .hoop(rate_limits.read_limiter)
+                    .hoop(admin_key_check)
                     .get(generic_key_read_handler),
             )
             .push(
@@ -710,8 +786,8 @@ impl Http3Server {
             )
             .push(
                 Router::with_path("/update_key")
+                    .hoop(rate_limits.update_limiter)
                     .hoop(admin_key_check)
-                    .hoop(rate_limits.write_limiter)
                     .post(generic_key_update_handler),
             )
     }

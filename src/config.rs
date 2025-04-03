@@ -73,6 +73,8 @@ pub struct HTTPConfig {
     // Per minute rate limits
     pub basic_rate_limit: usize,
     pub write_rate_limit: usize,
+    pub update_key_rate_limit: usize,
+    pub generic_key_rate_limit: usize,
     pub load_rate_limit: usize,
     pub add_task_rate_limit: usize,
     pub leader_rate_limit: usize,
