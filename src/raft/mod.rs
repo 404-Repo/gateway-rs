@@ -17,7 +17,6 @@ use gateway_state::GatewayState;
 use http::StatusCode;
 use network::Network;
 use openraft::BasicNode;
-use rustls::crypto::CryptoProvider;
 use salvo::conn::rustls::Keycert;
 use salvo::conn::rustls::RustlsConfig;
 use server::RServer;
@@ -42,8 +41,9 @@ use crate::api::request::GatewayInfoExt;
 use crate::api::response::GatewayInfo;
 use crate::api::Task;
 use crate::common::cert::generate_and_create_keycert;
-use crate::common::cert::load_certificate;
+use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
+use crate::common::crypto::init_crypto_provider;
 use crate::common::queue::DupQueue;
 use crate::common::task::TaskManager;
 use crate::config::NodeConfig;
@@ -121,7 +121,10 @@ async fn get_id_for_endpoint(
                 }
             }
         }
-        Err(anyhow::anyhow!("Failed to get ID"))
+        Err(anyhow::anyhow!(format!(
+            "Failed to get ID from {}, {}",
+            connection_addr, dns_name
+        )))
     })
     .retry(backoff)
     .await?;
@@ -171,7 +174,7 @@ impl Gateway {
             let info = GatewayInfo {
                 node_id: config.network.node_id,
                 domain: config.network.domain.clone(),
-                ip: config.network.ip.clone(),
+                ip: config.network.external_ip.clone(),
                 name: config.network.name.clone(),
                 http_port: config.http.port,
                 available_tasks: task_queue.len(),
@@ -297,13 +300,7 @@ pub enum GatewayMode {
 }
 
 pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result<Gateway> {
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .or_else(|_| {
-            CryptoProvider::get_default()
-                .map(|_| ())
-                .ok_or_else(|| anyhow::anyhow!("Failed to locate any crypto provider"))
-        })?;
+    init_crypto_provider()?;
 
     let task_queue = Arc::new(DupQueue::new(config.basic.unique_validators_per_task));
 
@@ -342,19 +339,28 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         .await?,
     ));
 
-    let server_addr = format!("{}:{}", config.network.ip, config.network.server_port);
+    let server_addr = format!("{}:{}", config.network.bind_ip, config.network.server_port);
 
     // Determine whether certificate files were supplied.
     let use_cert_files =
         !config.cert.cert_file_path.is_empty() && !config.cert.key_file_path.is_empty();
     let cert_tuple = if use_cert_files {
         Some((
-            vec![load_certificate(&config.cert.cert_file_path).await?],
+            load_certificates(&config.cert.cert_file_path).await?,
             load_private_key(&config.cert.key_file_path).await?,
         ))
     } else {
         None
     };
+
+    info!(
+        "Certificate files {}.",
+        if use_cert_files {
+            "have been provided and will be used"
+        } else {
+            "haven't been provided; self-signed certificates will be used instead"
+        }
+    );
 
     let server = RServer::new(
         &server_addr,
@@ -413,7 +419,8 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         generate_and_create_keycert(vec!["localhost".to_string()])
     };
 
-    let http_addr: SocketAddr = format!("{}:{}", config.network.ip, config.http.port).parse()?;
+    let http_addr: SocketAddr =
+        format!("{}:{}", config.network.bind_ip, config.http.port).parse()?;
     let tls_config = RustlsConfig::new(key_cert.ok());
     let http_server = Http3Server::run(
         config.network.node_id as usize,
@@ -444,7 +451,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
             let client = RClient::new(
                 endpoint,
                 dns_name,
-                &format!("{}:{}", config.network.ip, 0),
+                &format!("{}:{}", config.network.bind_ip, 0),
                 config.cert.dangerous_skip_verification,
                 config.protocol.clone(),
             )
@@ -534,6 +541,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let c = config.clone();
     let gs = gateway_state.clone();
     let tq = task_queue.clone();
+
     let gateway_info_updater = tokio::spawn(async move {
         Gateway::gateway_info_updater(c, gs, tq, last_task_acquisition).await;
     });
@@ -630,6 +638,8 @@ mod tests {
         Vec<Arc<StateMachineStore>>,
         Vec<RServer>,
     )> {
+        init_crypto_provider().unwrap();
+
         let pcfg = ProtocolConfig::default();
         let config = Arc::new(
             openraft::Config {

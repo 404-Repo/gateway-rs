@@ -6,6 +6,7 @@ use h3_quinn;
 use http::{self, StatusCode};
 use quinn;
 use rustls;
+use rustls_platform_verifier::BuilderVerifierExt;
 use std::sync::Arc;
 use tracing::error;
 
@@ -29,8 +30,10 @@ impl Http3Client {
                 .with_custom_certificate_verifier(SkipServerVerification::new())
                 .with_no_client_auth()
         } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
+            let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            rustls::ClientConfig::builder_with_provider(crypto_provider)
+                .with_safe_default_protocol_versions()?
+                .with_platform_verifier()
                 .with_no_client_auth()
         };
 

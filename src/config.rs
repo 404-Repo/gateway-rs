@@ -19,7 +19,9 @@ pub struct BasicConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct NetworkConfig {
-    pub ip: String,
+    pub bind_ip: String,
+    // This IP will be used in the internal state
+    pub external_ip: String,
     pub domain: String,
     pub server_port: u16,
     pub node_id: u64,
@@ -207,7 +209,8 @@ impl fmt::Display for NodeConfig {
 
         writeln!(f, "\n  [Network]")?;
         writeln!(f, "    Name            : {}", self.network.name)?;
-        writeln!(f, "    IP              : {}", self.network.ip)?;
+        writeln!(f, "    Bind to IP      : {}", self.network.bind_ip)?;
+        writeln!(f, "    External IP     : {}", self.network.external_ip)?;
         writeln!(f, "    Domain          : {}", self.network.domain)?;
         writeln!(f, "    Server Port     : {}", self.network.server_port)?;
         writeln!(f, "    Node ID         : {}", self.network.node_id)?;
