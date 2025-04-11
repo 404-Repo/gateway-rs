@@ -1,6 +1,7 @@
 [network]
 node_id = 2
-ip = "172.25.0.3"
+bind_ip = "172.25.0.3"
+external_ip = "172.25.0.3"
 domain = "node-2"
 server_port = 9090
 name = "node-2"

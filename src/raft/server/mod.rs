@@ -2,9 +2,11 @@ use crate::{
     common::cert::generate_self_signed_config, config::ProtocolConfig, protocol::Protocol,
 };
 use anyhow::Result;
-use quinn::{Endpoint, Incoming, RecvStream, SendStream, ServerConfig};
+use quinn::{
+    crypto::rustls::QuicServerConfig, Endpoint, Incoming, RecvStream, SendStream, ServerConfig,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -20,18 +22,25 @@ pub struct RServer {
 
 impl RServer {
     pub async fn new(
-        addr: &str,
+        bind_addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
         raft: Arc<RwLock<Raft>>,
         protocol_cfg: ProtocolConfig,
     ) -> Result<Self> {
         let server_config = match cert {
-            Some((cert_chain, key)) => ServerConfig::with_single_cert(cert_chain, key)?,
+            Some((cert_chain, key)) => {
+                let mut rustls_config = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(cert_chain, key)?;
+
+                rustls_config.alpn_protocols = vec![b"h3".to_vec()];
+                let quic_server_config = QuicServerConfig::try_from(rustls_config)?;
+                ServerConfig::with_crypto(Arc::new(quic_server_config))
+            }
             None => generate_self_signed_config()?,
         };
 
-        let bind_addr: SocketAddr = addr.parse()?;
-        let endpoint = Endpoint::server(server_config.clone(), bind_addr)?;
+        let endpoint = Endpoint::server(server_config.clone(), bind_addr.parse()?)?;
         info!("QUIC server listening on {}", bind_addr);
 
         let cancel_token = CancellationToken::new();

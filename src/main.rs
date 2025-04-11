@@ -4,7 +4,7 @@ use std::{env, sync::Arc, time::Duration};
 
 use config::{read_config, NodeConfig};
 use raft::{start_gateway_bootstrap, start_gateway_single, start_gateway_vote};
-use tracing::info;
+use tracing::{error, info, warn};
 
 mod api;
 mod bittensor;
@@ -68,19 +68,19 @@ async fn main() {
             }
             Err(e) => {
                 attempts += 1;
-                info!(
+                error!(
                     "Failed to start gateway: {e}, attempt {}/{}",
                     attempts, max_attempts
                 );
 
                 if attempts >= max_attempts {
-                    info!(
+                    error!(
                         "Reached maximum restart attempts ({}). Stopping.",
                         max_attempts
                     );
                     break;
                 } else {
-                    info!("Retrying...");
+                    warn!("Retrying...");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }

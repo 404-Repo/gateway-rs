@@ -126,6 +126,7 @@ async fn add_task_handler(
     Ok(())
 }
 
+// curl --http3 https://gateway.404.xyz:4443/add_result -X POST -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174001", "signature": "some_signature", "timestamp": "1743657200", "validator_hotkey": "validator_key", "miner_hotkey": "miner_key", "asset": "aGVsbG8gd29ybGQ=", "score": 0.95}'
 #[handler]
 async fn add_result_handler(
     depot: &mut Depot,
@@ -192,6 +193,8 @@ async fn add_result_handler(
     Ok(())
 }
 
+// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" -o result.spz
+// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" -o results.zip
 #[handler]
 async fn get_result_handler(
     depot: &mut Depot,
@@ -203,35 +206,40 @@ async fn get_result_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let task_id = get_task.id;
-    let all_results = get_task.all;
+    let task_manager = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| {
+            error!("Failed to obtain the state reader: {:?}", e);
+            ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+        })?
+        .task_manager();
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain the state reader: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
-
-    let task_manager = gateway_state.task_manager();
-
-    let results = task_manager.get_result(task_id).await;
-    let results_vec =
-        results.ok_or_else(|| ServerError::NotFound("Task ID not found".to_string()))?;
-
+    let results_vec = task_manager
+        .get_result(get_task.id)
+        .await
+        .ok_or_else(|| ServerError::NotFound("Task ID not found".to_string()))?;
     if results_vec.is_empty() {
         return Err(ServerError::NotFound(
             "No results found for the task".to_string(),
         ));
     }
 
-    if all_results {
+    let (content_type, content_disposition, body) = if get_task.all {
+        let mut results_vec = results_vec;
+        results_vec.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut buffer = Vec::new();
-        let mut cursor = Cursor::new(&mut buffer);
-        let mut zip_writer = ZipFileWriter::new(&mut cursor);
+        let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
 
         for (i, file) in results_vec.into_iter().enumerate() {
-            let filename = format!("{}.spz", i + 1);
-            let entry =
-                ZipEntryBuilder::new(filename.into(), async_zip::Compression::Stored).build();
+            let entry = ZipEntryBuilder::new(
+                format!("{}.spz", i + 1).into(),
+                async_zip::Compression::Stored,
+            )
+            .build();
             zip_writer
                 .write_entry_whole(entry, &file.asset)
                 .await
@@ -239,19 +247,16 @@ async fn get_result_handler(
                     ServerError::Internal(format!("Failed to write zip entry: {:?}", e))
                 })?;
         }
-
         zip_writer
             .close()
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to close zip archive: {:?}", e)))?;
 
-        res.headers_mut()
-            .insert("Content-Type", HeaderValue::from_static("application/zip"));
-        res.headers_mut().insert(
-            "Content-Disposition",
-            HeaderValue::from_static("attachment; filename=\"results.zip\""),
-        );
-        res.body(buffer);
+        (
+            "application/zip",
+            "attachment; filename=\"results.zip\"",
+            buffer,
+        )
     } else {
         let best_result = results_vec
             .into_iter()
@@ -261,21 +266,24 @@ async fn get_result_handler(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| ServerError::Internal("Failed to find the best result".to_string()))?;
+        (
+            "application/octet-stream",
+            "attachment; filename=\"result.spz\"",
+            best_result.asset,
+        )
+    };
 
-        res.headers_mut().insert(
-            "Content-Type",
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res.headers_mut().insert(
-            "Content-Disposition",
-            HeaderValue::from_static("attachment; filename=\"result.spz\""),
-        );
-        res.body(best_result.asset);
-    }
-
+    res.headers_mut()
+        .insert("Content-Type", HeaderValue::from_static(content_type));
+    res.headers_mut().insert(
+        "Content-Disposition",
+        HeaderValue::from_static(content_disposition),
+    );
+    res.body(body);
     Ok(())
 }
 
+// curl --http3 https://gateway.404.xyz:4443/get_status -X POST -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
 #[handler]
 async fn get_status_handler(
     depot: &mut Depot,

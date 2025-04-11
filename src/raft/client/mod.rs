@@ -1,6 +1,6 @@
 use anyhow::Result;
 use quinn::{Connection, Endpoint};
-use rustls::crypto::CryptoProvider;
+use rustls_platform_verifier::BuilderVerifierExt;
 use std::{sync::Arc, time::Duration};
 use tracing::info;
 
@@ -28,24 +28,20 @@ impl RClient {
         let remote_addr: std::net::SocketAddr = remote_addr.parse()?;
         let local_bind_addr: std::net::SocketAddr = local_bind_addr.parse()?;
 
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .or_else(|_| {
-                CryptoProvider::get_default()
-                    .map(|_| ())
-                    .ok_or_else(|| anyhow::anyhow!("Failed to locate any crypto provider"))
-            })?;
-
-        let crypto = if dangerous_skip_verification {
+        let mut crypto = if dangerous_skip_verification {
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(SkipServerVerification::new())
                 .with_no_client_auth()
         } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
+            let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            rustls::ClientConfig::builder_with_provider(crypto_provider)
+                .with_safe_default_protocol_versions()?
+                .with_platform_verifier()
                 .with_no_client_auth()
         };
+
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
 
         let mut client_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
@@ -104,6 +100,7 @@ impl RClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::crypto::init_crypto_provider;
     use crate::config::ProtocolConfig;
     use crate::protocol::RaftMessageType;
     use crate::raft::network::Network;
@@ -118,6 +115,8 @@ mod tests {
     async fn create_test_raft_node(
         node_id: u64,
     ) -> Result<Arc<RwLock<openraft::Raft<TypeConfig>>>> {
+        init_crypto_provider().unwrap();
+
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
@@ -142,6 +141,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_connection() -> Result<()> {
+        init_crypto_provider().unwrap();
+
         let raft = create_test_raft_node(1).await?;
         let pcfg = ProtocolConfig::default();
         let server_addr = "127.0.0.1:8888";
@@ -160,6 +161,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_data() -> Result<()> {
+        init_crypto_provider().unwrap();
+
         let raft = create_test_raft_node(1).await?;
         let pcfg = ProtocolConfig::default();
         let server_addr = "127.0.0.1:7777";
@@ -213,6 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connection_failure() -> Result<()> {
+        init_crypto_provider().unwrap();
+
         let pcfg = ProtocolConfig::default();
         let result =
             RClient::new("127.0.0.1:9999", "localhost", "127.0.0.1:9998", true, pcfg).await;

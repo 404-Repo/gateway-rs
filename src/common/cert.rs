@@ -1,5 +1,5 @@
 use anyhow::Result;
-use quinn::ServerConfig;
+use quinn::{crypto::rustls::QuicServerConfig, ServerConfig};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use salvo::conn::rustls::Keycert;
 use std::{path::Path, sync::Arc};
@@ -60,13 +60,20 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-pub async fn load_certificate<P>(path: P) -> Result<CertificateDer<'static>>
+pub async fn load_certificates<P>(path: P) -> Result<Vec<CertificateDer<'static>>>
 where
     P: AsRef<Path>,
 {
     let pem_bytes = tokio::fs::read(path).await?;
-    let cert = CertificateDer::from_pem_slice(&pem_bytes)?;
-    Ok(cert.into_owned())
+    let mut reader = pem_bytes.as_slice();
+
+    let cert_der_list = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+
+    if cert_der_list.is_empty() {
+        return Err(anyhow::anyhow!("no certificates found in PEM file"));
+    }
+
+    Ok(cert_der_list.into_iter().collect())
 }
 
 pub async fn load_private_key<P>(path: P) -> Result<PrivateKeyDer<'static>>
@@ -84,10 +91,16 @@ pub fn generate_self_signed_config() -> Result<ServerConfig> {
     let key = rcgen_cert.key_pair.serialize_der();
     let cert_der: CertificateDer<'static> = rcgen_cert.cert.der().to_vec().into();
 
-    Ok(ServerConfig::with_single_cert(
-        vec![cert_der],
-        PrivateKeyDer::Pkcs8(key.into()),
-    )?)
+    let mut rustls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key.into()))?;
+
+    rustls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_server_config = QuicServerConfig::try_from(rustls_config)?;
+    Ok(ServerConfig::with_crypto(std::sync::Arc::new(
+        quic_server_config,
+    )))
 }
 
 pub fn generate_and_create_keycert(

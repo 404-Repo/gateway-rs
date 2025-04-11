@@ -30,7 +30,7 @@ pub struct TaskManager {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum TaskStatus {
-    NoResults,
+    NoResult,
     PartialResult,
     Completed,
 }
@@ -93,7 +93,7 @@ impl TaskManager {
                     TaskStatus::Completed
                 }
             }
-            _ => TaskStatus::NoResults,
+            _ => TaskStatus::NoResult,
         }
     }
 
