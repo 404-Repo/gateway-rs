@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use async_zip::base::write::ZipFileWriter;
 use async_zip::ZipEntryBuilder;
 use futures::io::Cursor;
+use futures::TryStreamExt;
 use http::HeaderValue;
+use multer::{Constraints, Multipart};
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
@@ -15,6 +17,8 @@ use salvo::rate_limiter::{
     BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
 };
 
+use tokio_util::codec::{BytesCodec, FramedRead};
+use tokio_util::io::StreamReader;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -33,6 +37,7 @@ use crate::common::queue::DupQueue;
 use crate::common::task::TaskResultScored;
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
+use multer::SizeLimit;
 
 use super::error::ServerError;
 
@@ -126,17 +131,163 @@ async fn add_task_handler(
     Ok(())
 }
 
-// curl --http3 https://gateway.404.xyz:4443/add_result -X POST -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174001", "signature": "some_signature", "timestamp": "1743657200", "validator_hotkey": "validator_key", "miner_hotkey": "miner_key", "asset": "aGVsbG8gd29ybGQ=", "score": 0.95}'
+// curl -X POST https://gateway.404.xyz:4443/add_result \
+//   -H "Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW" \
+//   --form 'id="123e4567-e89b-12d3-a456-426614174001"' \
+//   --form 'signature="signature"' \
+//   --form 'timestamp="404_GATEWAY_1713096000"' \
+//   --form 'validator_hotkey="validator_key_123"' \
+//   --form 'miner_hotkey="miner_key_456"' \
+//   --form 'asset=@/path/to/asset.spz' \
+//   --form 'score="0.95"'
 #[handler]
 async fn add_result_handler(
     depot: &mut Depot,
     req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let add_result = req
-        .parse_json::<AddTaskResultRequest>()
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .and_then(|ct| ct.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or(ServerError::BadRequest("Missing Content-Type".into()))?;
+
+    if !content_type
+        .to_lowercase()
+        .starts_with("multipart/form-data")
+    {
+        return Err(ServerError::BadRequest(
+            "Invalid Content-Type, expected multipart/form-data".into(),
+        ));
+    }
+
+    let parts: Vec<&str> = content_type.split(';').map(|s| s.trim()).collect();
+    let boundary = parts
+        .iter()
+        .find(|&&part| part.to_lowercase().starts_with("boundary="))
+        .and_then(|part| part.split('=').nth(1))
+        .ok_or(ServerError::BadRequest(
+            "Missing boundary in Content-Type".into(),
+        ))?;
+
+    let raw_stream = req
+        .take_body()
+        .into_stream()
+        .map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("Stream error: {}", err))
+        })
+        .and_then(|frame| async move {
+            frame.into_data().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Frame data error".to_string())
+            })
+        });
+
+    let stream_reader = StreamReader::new(raw_stream);
+    let byte_stream = FramedRead::new(stream_reader, BytesCodec::new()).map_ok(|b| b.freeze());
+
+    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
+        error!("Failed to obtain the HTTPConfig: {:?}", e);
+        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
+    })?;
+
+    let constraints = Constraints::new()
+        .allowed_fields(vec![
+            "id",
+            "signature",
+            "timestamp",
+            "validator_hotkey",
+            "miner_hotkey",
+            "asset",
+            "score",
+        ])
+        .size_limit(SizeLimit::new().whole_stream(http_cfg.request_file_size_limit));
+
+    let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
+
+    let mut id = None;
+    let mut signature = None;
+    let mut timestamp = None;
+    let mut validator_hotkey = None;
+    let mut miner_hotkey = None;
+    let mut asset = None;
+    let mut score = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
         .await
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        .map_err(|e| ServerError::BadRequest(format!("Failed to read field: {}", e)))?
+    {
+        let name = field
+            .name()
+            .ok_or(ServerError::BadRequest("Field missing name".into()))?
+            .to_string();
+
+        match name.as_str() {
+            "id" => {
+                let id_str = field
+                    .text()
+                    .await
+                    .map_err(|e| ServerError::BadRequest(format!("Failed to read id: {}", e)))?;
+                id =
+                    Some(Uuid::parse_str(&id_str).map_err(|e| {
+                        ServerError::BadRequest(format!("Invalid id format: {}", e))
+                    })?);
+            }
+            "signature" => {
+                signature = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read signature: {}", e))
+                })?);
+            }
+            "timestamp" => {
+                timestamp = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read timestamp: {}", e))
+                })?);
+            }
+            "validator_hotkey" => {
+                validator_hotkey = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read validator_hotkey: {}", e))
+                })?);
+            }
+            "miner_hotkey" => {
+                miner_hotkey = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read miner_hotkey: {}", e))
+                })?);
+            }
+            "asset" => {
+                let mut content = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read asset chunk: {}", e))
+                })? {
+                    content.extend_from_slice(&chunk);
+                }
+                asset = Some(content);
+            }
+            "score" => {
+                let score_text = field
+                    .text()
+                    .await
+                    .map_err(|e| ServerError::BadRequest(format!("Failed to read score: {}", e)))?;
+                score = Some(score_text.parse::<f32>().map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid score format: {}", e))
+                })?);
+            }
+            _ => continue,
+        }
+    }
+
+    let add_result = AddTaskResultRequest {
+        id: id.ok_or(ServerError::BadRequest("Missing id field".into()))?,
+        signature: signature.ok_or(ServerError::BadRequest("Missing signature field".into()))?,
+        timestamp: timestamp.ok_or(ServerError::BadRequest("Missing timestamp field".into()))?,
+        validator_hotkey: validator_hotkey.ok_or(ServerError::BadRequest(
+            "Missing validator_hotkey field".into(),
+        ))?,
+        miner_hotkey: miner_hotkey
+            .ok_or(ServerError::BadRequest("Missing miner_hotkey field".into()))?,
+        asset: asset.ok_or(ServerError::BadRequest("Missing asset field".into()))?,
+        score: score.ok_or(ServerError::BadRequest("Missing score field".into()))?,
+    };
 
     let subnet_state = depot.obtain::<Arc<SubnetState>>().map_err(|e| {
         error!("Failed to obtain the SubnetState: {:?}", e);
@@ -152,11 +303,6 @@ async fn add_result_handler(
             );
             ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
         })?;
-
-    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
-        error!("Failed to obtain the HTTPConfig: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
-    })?;
 
     verify_hotkey(
         &add_result.timestamp,
@@ -182,9 +328,10 @@ async fn add_result_handler(
         score: add_result.score,
         instant: Instant::now(),
     };
+
     info!(
-        "Received result for task {id} from validator {} and miner {}",
-        result.validator_hotkey, result.miner_hotkey
+        "Received result for task {} from validator {} and miner {}",
+        id, result.validator_hotkey, result.miner_hotkey
     );
 
     gateway_state.task_manager().add_result(id, result).await;
@@ -193,8 +340,13 @@ async fn add_result_handler(
     Ok(())
 }
 
-// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" -o result.spz
-// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" -o results.zip
+// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
+//   -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" \
+//   -o result.spz
+
+// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
+//   -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" \
+//   -o results.zip
 #[handler]
 async fn get_result_handler(
     depot: &mut Depot,
@@ -202,8 +354,7 @@ async fn get_result_handler(
     res: &mut Response,
 ) -> Result<(), ServerError> {
     let get_task = req
-        .parse_json::<GetTaskResultRequest>()
-        .await
+        .parse_queries::<GetTaskResultRequest>()
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let task_manager = depot
@@ -283,7 +434,7 @@ async fn get_result_handler(
     Ok(())
 }
 
-// curl --http3 https://gateway.404.xyz:4443/get_status -X POST -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
+// curl --http3 https://gateway.404.xyz:4443/get_status -X GET -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
 #[handler]
 async fn get_status_handler(
     depot: &mut Depot,
@@ -322,7 +473,7 @@ async fn get_status_handler(
 
 // curl --http3 -X POST https://gateway.404.xyz:4443/get_tasks \
 //   -H "Content-Type: application/json" \
-//   -d '{"validator_hotkey": "abc123", "signature": "signatureinbase64", "timestamp": "1743657200", "requested_task_count": 10}'
+//   -d '{"validator_hotkey": "abc123", "signature": "signatureinbase64", "timestamp": "404_GATEWAY_1743657200", "requested_task_count": 10}'
 #[handler]
 async fn get_tasks_handler(
     depot: &mut Depot,
@@ -512,67 +663,82 @@ async fn id_handler(
 
 #[handler]
 async fn api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if let Some(value) = req.headers().get("X-API-Key") {
-        if let Ok(key_str) = value.to_str() {
-            if let Ok(api_key) = Uuid::parse_str(key_str) {
-                if let Ok(gateway_state) = depot.obtain::<GatewayState>() {
-                    if gateway_state.is_valid_api_key(&api_key) {
-                        return;
-                    }
-                } else {
-                    res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-                    res.render("Internal error: Failed to obtain GatewayState");
-                    return;
-                }
-            }
+    let gateway_state = match depot.obtain::<GatewayState>() {
+        Ok(s) => s,
+        Err(_) => {
+            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render("Internal error: Failed to obtain GatewayState");
+            return;
+        }
+    };
+
+    let api_key = req
+        .headers()
+        .get("X-API-Key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    if let Some(key) = api_key {
+        if gateway_state.is_valid_api_key(&key) {
+            return;
         }
     }
+
     res.status_code = Some(StatusCode::UNAUTHORIZED);
     res.render("Unauthorized: Invalid or missing API key");
 }
 
 #[handler]
 async fn generic_api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    if let Some(value) = req.headers().get("X-API-Key") {
-        if let Ok(key_str) = value.to_str() {
-            if let Ok(api_key) = Uuid::parse_str(key_str) {
-                if let Ok(gateway_state) = depot.obtain::<GatewayState>() {
-                    if gateway_state.is_generic_key(&api_key).await {
-                        return;
-                    }
-                } else {
-                    res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-                    res.render("Internal error: Failed to obtain GatewayState");
-                    return;
-                }
-            }
+    let gateway_state = match depot.obtain::<GatewayState>() {
+        Ok(s) => s,
+        Err(_) => {
+            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render("Internal error: Failed to obtain GatewayState");
+            return;
+        }
+    };
+
+    let api_key = req
+        .headers()
+        .get("X-API-Key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    if let Some(key) = api_key {
+        if gateway_state.is_generic_key(&key).await {
+            return;
         }
     }
+
     res.status_code = Some(StatusCode::UNAUTHORIZED);
     res.render("Unauthorized: Invalid or missing API key");
 }
 
 #[handler]
 async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    match depot.obtain::<HTTPConfig>() {
-        Ok(http_cfg) => {
-            if let Some(value) = req.headers().get("X-Admin-Key") {
-                if let Ok(key_str) = value.to_str() {
-                    if let Ok(key_uuid) = Uuid::parse_str(key_str) {
-                        if key_uuid == http_cfg.admin_key {
-                            return;
-                        }
-                    }
-                }
-            }
-            res.status_code = Some(StatusCode::UNAUTHORIZED);
-            res.render("Unauthorized: Invalid or missing admin key");
-        }
+    let http_cfg = match depot.obtain::<HTTPConfig>() {
+        Ok(cfg) => cfg,
         Err(_) => {
             res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render("Internal error: Failed to obtain configuration");
+            res.render("Internal error: Failed to obtain HTTPConfig");
+            return;
         }
+    };
+
+    let is_admin = req
+        .headers()
+        .get("X-Admin-Key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        == Some(http_cfg.admin_key);
+
+    if is_admin {
+        return;
     }
+
+    res.status_code = Some(StatusCode::UNAUTHORIZED);
+    res.render("Unauthorized: Invalid or missing admin key");
 }
 
 // curl --http3 -X POST "https://gateway.404.xyz:4443/update_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "Content-Type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
@@ -722,7 +888,9 @@ impl Http3Server {
         rate_limits: RateLimits,
         config: HTTPConfig,
     ) -> Router {
-        let size_limit_handler = SecureMaxSize(config.request_size_limit as usize);
+        let request_size_limit = config.request_size_limit;
+        let size_limit_handler = || SecureMaxSize(request_size_limit as usize);
+        let file_size_limit_handler = SecureMaxSize(config.request_file_size_limit as usize);
 
         let router = if config.compression {
             Router::new().hoop(
@@ -735,7 +903,6 @@ impl Http3Server {
         };
 
         router
-            .hoop(size_limit_handler)
             .hoop(affix_state::inject(task_queue))
             .hoop(affix_state::inject(gateway_state))
             .hoop(affix_state::inject(subnet_state))
@@ -743,57 +910,79 @@ impl Http3Server {
             .hoop(affix_state::inject(node_id))
             .push(
                 Router::with_path("/add_task")
+                    .hoop(size_limit_handler())
                     .hoop(api_key_check)
                     .hoop(rate_limits.task_limiter)
                     .post(add_task_handler),
             )
             .push(
                 Router::with_path("/add_task_generic")
+                    .hoop(size_limit_handler())
                     .hoop(generic_api_key_check)
                     .hoop(rate_limits.generic_limiter)
                     .post(add_task_handler),
             )
-            .push(Router::with_path("/add_result").post(add_result_handler))
-            .push(Router::with_path("/get_tasks").post(get_tasks_handler))
+            .push(
+                Router::with_path("/add_result")
+                    .hoop(file_size_limit_handler)
+                    .post(add_result_handler),
+            )
+            .push(
+                Router::with_path("/get_tasks")
+                    .hoop(size_limit_handler())
+                    .post(get_tasks_handler),
+            )
             .push(
                 Router::with_path("/get_load")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.load_limiter)
                     .get(get_load_handler),
             )
             .push(
                 Router::with_path("/get_leader")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.leader_limiter)
                     .get(get_leader_handler),
             )
             .push(
                 Router::with_path("/write")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.write_limiter)
                     .post(write_handler),
             )
             .push(
                 Router::with_path("/get_version")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.basic_limiter)
                     .get(version_handler),
             )
-            .push(Router::with_path("/id").get(id_handler))
+            .push(
+                Router::with_path("/id")
+                    .hoop(size_limit_handler())
+                    .get(id_handler),
+            )
             .push(
                 Router::with_path("/get_key")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.read_limiter)
                     .hoop(admin_key_check)
                     .get(generic_key_read_handler),
             )
             .push(
                 Router::with_path("/get_result")
+                    .hoop(size_limit_handler())
                     .hoop(api_key_check)
                     .get(get_result_handler),
             )
             .push(
                 Router::with_path("/get_status")
+                    .hoop(size_limit_handler())
                     .hoop(api_key_check)
                     .get(get_status_handler),
             )
             .push(
                 Router::with_path("/update_key")
+                    .hoop(size_limit_handler())
                     .hoop(rate_limits.update_limiter)
                     .hoop(admin_key_check)
                     .post(generic_key_update_handler),

@@ -26,14 +26,15 @@ generic_key_rate_limit = 2
 load_rate_limit = 60
 leader_rate_limit = 10
 add_task_rate_limit = 100
-request_size_limit = 1572864
+request_size_limit = 102400
+request_file_size_limit = 31457280
 wss_bittensor = "wss://entrypoint-finney.opentensor.ai:443"
 wss_max_message_size = 2097152
 wss_max_connect_time = 10
 signature_freshness_threshold = 30
 subnet_number = 17
 subnet_poll_interval_sec = 3600
-max_task_queue_len = 5000
+max_task_queue_len = 500
 
 [db]
 host = ""

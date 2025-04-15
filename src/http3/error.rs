@@ -1,5 +1,8 @@
-use http::StatusCode;
-use salvo::{async_trait, writing::Text, Depot, Request, Response, Writer};
+use bytes::Bytes;
+use futures::stream;
+use http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
+use salvo::{async_trait, Depot, Request, Response, Writer};
+use std::convert::Infallible;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -24,25 +27,25 @@ impl ServerError {
 impl Writer for ServerError {
     async fn write(self, _req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         res.status_code(self.status_code());
-        match self {
-            ServerError::BadRequest(msg) => {
-                res.render(Text::Plain(format!("Bad request: {}", msg)));
-            }
+        res.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        let msg = match self {
+            ServerError::BadRequest(msg) => format!("Bad request: {}", msg),
             ServerError::Internal(details) => {
-                let mut message = "Internal Server Error".to_string();
+                let mut m = "Internal Server Error".to_string();
                 if !details.is_empty() {
-                    message.push_str(": ");
-                    message.push_str(&details);
+                    m.push_str(": ");
+                    m.push_str(&details);
                 }
-                res.render(Text::Plain(message));
+                m
             }
-            ServerError::Unauthorized(msg) => {
-                res.render(Text::Plain(format!("Unauthorized request: {}", msg)));
-            }
-
-            ServerError::NotFound(msg) => {
-                res.render(Text::Plain(msg));
-            }
-        }
+            ServerError::Unauthorized(msg) => format!("Unauthorized request: {}", msg),
+            ServerError::NotFound(msg) => msg,
+        };
+        let bytes = Bytes::from(msg);
+        let single = stream::once(async move { Ok::<_, Infallible>(bytes) });
+        res.stream(single);
     }
 }
