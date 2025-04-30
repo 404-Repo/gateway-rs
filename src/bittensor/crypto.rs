@@ -5,6 +5,7 @@ use schnorrkel::{context::signing_context, PublicKey, Signature};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GATEWAY: &str = "404_GATEWAY_";
+const SIGNING_CTX: &[u8] = b"substrate";
 
 pub struct AccountId(pub [u8; 32]);
 
@@ -91,7 +92,7 @@ pub fn verify_signature(
     let sig =
         Signature::from_bytes(&signature.0).map_err(|e| anyhow!("Invalid signature: {:?}", e))?;
 
-    let ctx = signing_context(b"");
+    let ctx = signing_context(SIGNING_CTX);
     pk.verify(ctx.bytes(message.as_ref()), &sig)
         .map_err(|e| anyhow!("Signature verification failed: {:?}", e))
 }
@@ -176,7 +177,7 @@ mod tests {
         let ts = current_timestamp();
         // Build timestamp string with required prefix.
         let timestamp_string = format!("{}{}", GATEWAY, ts);
-        let ctx = signing_context(b"");
+        let ctx = signing_context(SIGNING_CTX);
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         assert!(verify_hotkey(
             &timestamp_string,
@@ -194,7 +195,7 @@ mod tests {
         let keypair = mini.expand_to_keypair(ExpansionMode::Uniform);
         let ts = current_timestamp();
         let timestamp_string = format!("{}{}", GATEWAY, ts);
-        let ctx = signing_context(b"");
+        let ctx = signing_context(SIGNING_CTX);
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         let mut sig_bytes = signature.to_bytes();
         sig_bytes[0] ^= 0x01; // Tamper with the signature.
@@ -215,7 +216,7 @@ mod tests {
         // Subtract a value greater than the allowed threshold.
         let ts = current_timestamp().saturating_sub(301);
         let timestamp_string = format!("{}{}", GATEWAY, ts);
-        let ctx = signing_context(b"");
+        let ctx = signing_context(SIGNING_CTX);
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         assert!(verify_hotkey(
             &timestamp_string,

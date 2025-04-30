@@ -82,6 +82,7 @@ pub struct HTTPConfig {
     pub leader_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
+    pub request_file_size_limit: u64,
     pub wss_bittensor: String,
     pub wss_max_message_size: usize,
     pub signature_freshness_threshold: u64,

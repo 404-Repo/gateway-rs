@@ -28,10 +28,10 @@ pub struct TaskManager {
     cancel_token: CancellationToken,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum TaskStatus {
     NoResult,
-    PartialResult,
+    PartialResult(usize),
     Completed,
 }
 
@@ -87,8 +87,9 @@ impl TaskManager {
     pub async fn get_status(&self, task_id: Uuid, expected_results: usize) -> TaskStatus {
         match self.inner.completed.get(&task_id) {
             Some(guard) if !guard.is_empty() => {
-                if guard.len() < expected_results {
-                    TaskStatus::PartialResult
+                let count = guard.len();
+                if count < expected_results {
+                    TaskStatus::PartialResult(count)
                 } else {
                     TaskStatus::Completed
                 }
@@ -112,4 +113,93 @@ impl Clone for TaskManager {
             cancel_token: self.cancel_token.clone(),
         }
     }
+}
+
+#[tokio::test]
+async fn test_cleanup() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(200);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(400);
+    const EXPECTED_RESULTS: usize = 2;
+    const WAIT_DURATION: Duration = Duration::from_millis(600);
+
+    fn make_result(validator: &str, miner: &str, score: f32, instant: Instant) -> TaskResultScored {
+        TaskResultScored {
+            validator_hotkey: validator.to_string(),
+            miner_hotkey: miner.to_string(),
+            asset: vec![],
+            score,
+            instant,
+        }
+    }
+
+    let task_manager =
+        TaskManager::new(10, EXPECTED_RESULTS, CLEANUP_INTERVAL, RESULT_LIFETIME).await;
+    let now = Instant::now();
+
+    // Task 1: Incomplete, old result
+    let task_id1 = Uuid::new_v4();
+    task_manager
+        .add_result(
+            task_id1,
+            make_result("val1", "miner1", 0.5, now - Duration::from_millis(600)),
+        )
+        .await;
+
+    // Task 2: Complete, last result will expire
+    let task_id2 = Uuid::new_v4();
+    task_manager
+        .add_result(
+            task_id2,
+            make_result("val2a", "miner2a", 0.6, now - Duration::from_millis(600)),
+        )
+        .await;
+    task_manager
+        .add_result(
+            task_id2,
+            make_result("val2b", "miner2b", 0.7, now - Duration::from_millis(200)),
+        )
+        .await;
+
+    // Task 3: Complete, last result recent but will expire
+    let task_id3 = Uuid::new_v4();
+    task_manager
+        .add_result(
+            task_id3,
+            make_result("val3a", "miner3a", 0.8, now - Duration::from_millis(100)),
+        )
+        .await;
+    task_manager
+        .add_result(
+            task_id3,
+            make_result("val3b", "miner3b", 0.9, now - Duration::from_millis(100)),
+        )
+        .await;
+
+    assert_eq!(
+        task_manager.get_status(task_id1, EXPECTED_RESULTS).await,
+        TaskStatus::PartialResult(1)
+    );
+    assert_eq!(
+        task_manager.get_status(task_id2, EXPECTED_RESULTS).await,
+        TaskStatus::Completed
+    );
+    assert_eq!(
+        task_manager.get_status(task_id3, EXPECTED_RESULTS).await,
+        TaskStatus::Completed
+    );
+
+    tokio::time::sleep(WAIT_DURATION).await;
+
+    assert_eq!(
+        task_manager.get_status(task_id1, EXPECTED_RESULTS).await,
+        TaskStatus::PartialResult(1)
+    );
+    assert_eq!(
+        task_manager.get_status(task_id2, EXPECTED_RESULTS).await,
+        TaskStatus::NoResult
+    );
+    assert_eq!(
+        task_manager.get_status(task_id3, EXPECTED_RESULTS).await,
+        TaskStatus::NoResult
+    );
 }
