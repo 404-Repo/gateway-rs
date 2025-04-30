@@ -171,6 +171,14 @@ impl Gateway {
                 }
             };
 
+            let last_update = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs(),
+                Err(e) => {
+                    error!("SystemTime before UNIX EPOCH: {:?}", e);
+                    0
+                }
+            };
+
             let info = GatewayInfo {
                 node_id: config.network.node_id,
                 domain: config.network.domain.clone(),
@@ -179,6 +187,7 @@ impl Gateway {
                 http_port: config.http.port,
                 available_tasks: task_queue.len(),
                 last_task_acquisition: last_task_acquisition.load(Ordering::Relaxed),
+                last_update,
             };
 
             if leader == config.network.node_id {
@@ -220,6 +229,7 @@ impl Gateway {
                 available_tasks: info.available_tasks,
                 cluster_name: config.raft.cluster_name.clone(),
                 last_task_acquisition: info.last_task_acquisition,
+                last_update: info.last_update,
             };
 
             let payload = match serde_json::to_vec(&info) {
