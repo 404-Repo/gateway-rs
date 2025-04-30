@@ -15,6 +15,7 @@ pub struct GatewayInfo {
     pub http_port: u16,
     pub available_tasks: usize,
     pub last_task_acquisition: u64,
+    pub last_update: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

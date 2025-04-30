@@ -19,7 +19,7 @@ use salvo::rate_limiter::{
 
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
-use tracing::{error, info};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::api::request::{
@@ -107,21 +107,17 @@ async fn add_task_handler(
 
     let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
-            error!("Failed to obtain the task queue: {:?}", err);
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
-            error!("Failed to obtain the task queue: unknown error");
             ServerError::Internal("Failed to obtain the task queue: unknown error".into())
         }
     })?;
 
-    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
-        error!("Failed to obtain the HTTPConfig: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
-    })?;
+    let http_cfg = depot
+        .obtain::<HTTPConfig>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
 
     if queue.len() >= http_cfg.max_task_queue_len {
-        error!("Task queue is full: {} tasks", queue.len());
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
 
@@ -186,10 +182,9 @@ async fn add_result_handler(
     let stream_reader = StreamReader::new(raw_stream);
     let byte_stream = FramedRead::new(stream_reader, BytesCodec::new()).map_ok(|b| b.freeze());
 
-    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
-        error!("Failed to obtain the HTTPConfig: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
-    })?;
+    let http_cfg = depot
+        .obtain::<HTTPConfig>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
 
     let constraints = Constraints::new()
         .allowed_fields(vec![
@@ -289,18 +284,13 @@ async fn add_result_handler(
         score: score.ok_or(ServerError::BadRequest("Missing score field".into()))?,
     };
 
-    let subnet_state = depot.obtain::<Arc<SubnetState>>().map_err(|e| {
-        error!("Failed to obtain the SubnetState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e))
-    })?;
+    let subnet_state = depot
+        .obtain::<Arc<SubnetState>>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
 
     subnet_state
         .validate_hotkey(&add_result.validator_hotkey)
         .map_err(|e| {
-            error!(
-                "Hotkey {} is not registered in the subnet: {:?}",
-                add_result.validator_hotkey, e
-            );
             ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
         })?;
 
@@ -310,13 +300,9 @@ async fn add_result_handler(
         &add_result.signature,
         http_cfg.signature_freshness_threshold,
     )
-    .map_err(|e| {
-        error!("Failed to verify AddTaskRequest: {:?}", e);
-        ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e))
-    })?;
+    .map_err(|e| ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e)))?;
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain the state reader: {:?}", e);
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
@@ -359,10 +345,7 @@ async fn get_result_handler(
 
     let task_manager = depot
         .obtain::<GatewayState>()
-        .map_err(|e| {
-            error!("Failed to obtain the state reader: {:?}", e);
-            ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-        })?
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e)))?
         .task_manager();
 
     let results_vec = task_manager
@@ -447,16 +430,13 @@ async fn get_status_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain the state reader: {:?}", e);
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
     let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
-            error!("Failed to obtain the task queue: {:?}", err);
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
-            error!("Failed to obtain the task queue: unknown error");
             ServerError::Internal("Failed to obtain the task queue: unknown error".into())
         }
     })?;
@@ -485,23 +465,17 @@ async fn get_tasks_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let http_cfg = depot.obtain::<HTTPConfig>().map_err(|e| {
-        error!("Failed to obtain the HTTPConfig: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e))
-    })?;
+    let http_cfg = depot
+        .obtain::<HTTPConfig>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
 
-    let subnet_state = depot.obtain::<Arc<SubnetState>>().map_err(|e| {
-        error!("Failed to obtain the SubnetState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e))
-    })?;
+    let subnet_state = depot
+        .obtain::<Arc<SubnetState>>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
 
     subnet_state
         .validate_hotkey(&get_tasks.validator_hotkey)
         .map_err(|e| {
-            error!(
-                "Hotkey {} is not registered in the subnet: {:?}",
-                get_tasks.validator_hotkey, e
-            );
             ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
         })?;
 
@@ -511,22 +485,16 @@ async fn get_tasks_handler(
         &get_tasks.signature,
         http_cfg.signature_freshness_threshold,
     )
-    .map_err(|e| {
-        error!("Failed to verify GetTasksRequest: {:?}", e);
-        ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e))
-    })?;
+    .map_err(|e| ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e)))?;
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain the state reader: {:?}", e);
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
     let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
-            error!("Failed to obtain the task queue: {:?}", err);
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
-            error!("Failed to obtain the task queue: unknown error");
             ServerError::Internal("Failed to obtain the task queue: unknown error".into())
         }
     })?;
@@ -557,13 +525,11 @@ async fn get_load_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
     let gateways = gateway_state.gateways().await.map_err(|e| {
-        error!("Failed to obtain the gateways for get_load: {:?}", e);
         ServerError::Internal(format!(
             "Failed to obtain the gateways for get_load: {:?}",
             e
@@ -586,16 +552,11 @@ async fn write_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
     if gi.cluster_name != gateway_state.cluster_name() {
-        error!(
-            "Unauthorized access to write handler from: {}",
-            req.remote_addr().to_string()
-        );
         return Err(ServerError::Unauthorized("Unauthorized access".to_string()));
     }
 
@@ -614,21 +575,19 @@ async fn get_leader_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
     let leader_id = match gateway_state.leader().await {
         Some(id) => id,
         None => {
-            error!("The leader is not elected");
             return Err(ServerError::Internal("The leader is not elected".into()));
         }
     };
-    let gateway_info = gateway_state.gateway(leader_id).await.map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_info = gateway_state
+        .gateway(leader_id)
+        .await
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
     let response = LeaderResponse {
         leader_id,
@@ -652,25 +611,19 @@ async fn id_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let node_id = depot.obtain::<usize>().map_err(|e| {
-        error!("Failed to obtain node_id: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain node_id: {:?}", e))
-    })?;
+    let node_id = depot
+        .obtain::<usize>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain node_id: {:?}", e)))?;
 
     res.render(node_id.to_string());
     Ok(())
 }
 
 #[handler]
-async fn api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    let gateway_state = match depot.obtain::<GatewayState>() {
-        Ok(s) => s,
-        Err(_) => {
-            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render("Internal error: Failed to obtain GatewayState");
-            return;
-        }
-    };
+async fn api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|_| ServerError::Internal("Failed to obtain GatewayState".to_string()))?;
 
     let api_key = req
         .headers()
@@ -678,26 +631,19 @@ async fn api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    if let Some(key) = api_key {
-        if gateway_state.is_valid_api_key(&key) {
-            return;
-        }
+    match api_key {
+        Some(key) if gateway_state.is_valid_api_key(&key) => Ok(()),
+        _ => Err(ServerError::Unauthorized(
+            "Invalid or missing API key".to_string(),
+        )),
     }
-
-    res.status_code = Some(StatusCode::UNAUTHORIZED);
-    res.render("Unauthorized: Invalid or missing API key");
 }
 
 #[handler]
-async fn generic_api_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    let gateway_state = match depot.obtain::<GatewayState>() {
-        Ok(s) => s,
-        Err(_) => {
-            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render("Internal error: Failed to obtain GatewayState");
-            return;
-        }
-    };
+async fn generic_api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|_| ServerError::Internal("Failed to obtain GatewayState".to_string()))?;
 
     let api_key = req
         .headers()
@@ -705,26 +651,19 @@ async fn generic_api_key_check(depot: &mut Depot, req: &mut Request, res: &mut R
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    if let Some(key) = api_key {
-        if gateway_state.is_generic_key(&key).await {
-            return;
-        }
+    match api_key {
+        Some(key) if gateway_state.is_generic_key(&key).await => Ok(()),
+        _ => Err(ServerError::Unauthorized(
+            "Invalid or missing API key".to_string(),
+        )),
     }
-
-    res.status_code = Some(StatusCode::UNAUTHORIZED);
-    res.render("Unauthorized: Invalid or missing API key");
 }
 
 #[handler]
-async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Response) {
-    let http_cfg = match depot.obtain::<HTTPConfig>() {
-        Ok(cfg) => cfg,
-        Err(_) => {
-            res.status_code = Some(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render("Internal error: Failed to obtain HTTPConfig");
-            return;
-        }
-    };
+async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+    let http_cfg = depot
+        .obtain::<HTTPConfig>()
+        .map_err(|_| ServerError::Internal("Failed to obtain HTTPConfig".to_string()))?;
 
     let is_admin = req
         .headers()
@@ -734,11 +673,12 @@ async fn admin_key_check(depot: &mut Depot, req: &mut Request, res: &mut Respons
         == Some(http_cfg.admin_key);
 
     if is_admin {
-        return;
+        Ok(())
+    } else {
+        Err(ServerError::Unauthorized(
+            "Invalid or missing admin key".to_string(),
+        ))
     }
-
-    res.status_code = Some(StatusCode::UNAUTHORIZED);
-    res.render("Unauthorized: Invalid or missing admin key");
 }
 
 // curl --http3 -X POST "https://gateway.404.xyz:4443/update_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "Content-Type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
@@ -753,16 +693,14 @@ async fn generic_key_update_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
     gateway_state
         .update_gateway_generic_key(Some(ugk.generic_key))
         .await
         .map_err(|e| {
-            error!("Failed to update gateway generic key: {:?}", e);
             ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
         })?;
 
@@ -778,17 +716,15 @@ async fn generic_key_read_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        error!("Failed to obtain GatewayState: {:?}", e);
-        ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e))
-    })?;
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
     if let Some(uuid) = gateway_state.generic_key().await {
         let response = GenericKeyResponse { generic_key: uuid };
         res.render(Json(response));
         Ok(())
     } else {
-        error!("Generic key not found");
         Err(ServerError::Internal("Generic key not found".to_string()))
     }
 }
