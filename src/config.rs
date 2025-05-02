@@ -15,6 +15,8 @@ pub struct BasicConfig {
     pub taskmanager_initial_capacity: usize,
     pub taskmanager_cleanup_interval: u64,
     pub taskmanager_result_lifetime: u64,
+    pub taskqueue_cleanup_interval: u64,
+    pub taskqueue_task_ttl: u64,
 }
 
 #[derive(Debug, Deserialize)]

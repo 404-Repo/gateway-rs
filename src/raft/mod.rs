@@ -88,7 +88,7 @@ pub struct Gateway {
     pub task_manager: Arc<TaskManager>,
     pub _log_store: LogStore,
     pub http_server: Http3Server,
-    pub _task_queue: Arc<DupQueue<Task>>,
+    pub _task_queue: DupQueue<Task>,
 }
 
 async fn get_id_for_endpoint(
@@ -157,7 +157,7 @@ impl Gateway {
     pub async fn gateway_info_updater(
         config: Arc<NodeConfig>,
         gateway_state: GatewayState,
-        task_queue: Arc<DupQueue<Task>>,
+        task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
     ) {
         loop {
@@ -312,7 +312,11 @@ pub enum GatewayMode {
 pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result<Gateway> {
     init_crypto_provider()?;
 
-    let task_queue = Arc::new(DupQueue::new(config.basic.unique_validators_per_task));
+    let task_queue = DupQueue::<Task>::builder()
+        .dup(config.basic.unique_validators_per_task)
+        .ttl(config.basic.taskqueue_task_ttl)
+        .cleanup_interval(config.basic.taskqueue_cleanup_interval)
+        .build();
 
     let raft_config = Arc::new(
         openraft::Config {
