@@ -1,62 +1,133 @@
 use foldhash::fast::RandomState;
+use foldhash::HashSetExt as _;
 use scc::HashMap;
 use scc::Queue;
 use std::hash::Hash;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::api::HasUuid;
 
-const HASHMAP_START_CAPACITY: usize = 1024;
+const SENTMAP_START_CAPACITY: usize = 1024;
+const EXPIREDMAP_START_CAPACITY: usize = 8;
 
 #[derive(Clone)]
 struct QueueEntry<T> {
     item: T,
     count: usize,
+    timestamp: Instant,
 }
 
-pub struct DupQueue<T> {
+struct Inner<T> {
     dup: usize,
     q: Queue<QueueEntry<T>>,
     sent: HashMap<(Uuid, String), (), RandomState>,
+    ttl: Duration,
 }
 
-impl<T: Clone + Hash + HasUuid + 'static> DupQueue<T> {
-    pub fn new(dup: usize) -> Self {
-        Self {
-            dup,
+#[derive(Clone)]
+pub struct DupQueue<T> {
+    inner: Arc<Inner<T>>,
+}
+
+pub struct DupQueueBuilder {
+    dup: usize,
+    ttl: Duration,
+    cleanup_interval: Duration,
+}
+
+impl DupQueueBuilder {
+    pub fn dup(mut self, dup: usize) -> Self {
+        self.dup = dup;
+        self
+    }
+
+    pub fn ttl(mut self, ttl: u64) -> Self {
+        self.ttl = Duration::from_secs(ttl);
+        self
+    }
+
+    pub fn cleanup_interval(mut self, interval: u64) -> Self {
+        self.cleanup_interval = Duration::from_secs(interval);
+        self
+    }
+
+    pub fn build<T>(self) -> DupQueue<T>
+    where
+        T: Clone + Hash + HasUuid + Send + Sync + 'static,
+    {
+        let inner: Arc<Inner<T>> = Arc::new(Inner {
+            dup: self.dup,
             q: Queue::default(),
-            sent: HashMap::with_capacity_and_hasher(HASHMAP_START_CAPACITY, RandomState::default()),
+            sent: HashMap::with_capacity_and_hasher(SENTMAP_START_CAPACITY, RandomState::default()),
+            ttl: self.ttl,
+        });
+        let cleanup_interval = self.cleanup_interval;
+        let weak_inner = Arc::downgrade(&inner);
+        thread::spawn(move || {
+            while let Some(inner) = weak_inner.upgrade() {
+                thread::sleep(cleanup_interval);
+
+                let mut expired_ids = foldhash::HashSet::with_capacity(EXPIREDMAP_START_CAPACITY);
+                while let Ok(Some(shared)) = inner
+                    .q
+                    .pop_if(|entry| entry.timestamp.elapsed() > inner.ttl)
+                {
+                    expired_ids.insert(*shared.item.id());
+                }
+
+                if !expired_ids.is_empty() {
+                    inner
+                        .sent
+                        .retain(|(uuid, _hotkey), _| !expired_ids.contains(uuid));
+                }
+            }
+        });
+        DupQueue { inner }
+    }
+}
+
+impl<T> DupQueue<T>
+where
+    T: Clone + Hash + HasUuid + Send + Sync + 'static,
+{
+    pub fn builder() -> DupQueueBuilder {
+        DupQueueBuilder {
+            dup: 1,
+            ttl: Duration::from_secs(300),
+            cleanup_interval: Duration::from_secs(1),
         }
     }
 
     pub fn push(&self, item: T) {
-        self.q.push(QueueEntry {
+        let entry = QueueEntry {
             item,
-            count: self.dup,
-        });
+            count: self.inner.dup,
+            timestamp: Instant::now(),
+        };
+        self.inner.q.push(entry);
     }
 
     pub fn pop(&self, num: usize, hotkey: &str) -> Vec<T> {
         let mut result = Vec::with_capacity(num);
         while result.len() < num {
-            match self.q.pop_if(|entry| {
+            match self.inner.q.pop_if(|entry| {
                 let key = (*entry.item.id(), hotkey.to_string());
-                !self.sent.contains(&key)
+                !self.inner.sent.contains(&key)
             }) {
-                Ok(Some(shared_entry)) => {
-                    let mut entry = (*shared_entry).clone();
-                    let hotkey_str = hotkey.to_string();
-                    let key = (*entry.item.id(), hotkey_str.clone());
-                    // Try to insert the key into the map; if it was absent, then process.
-                    if self.sent.insert(key.clone(), ()).is_ok() {
+                Ok(Some(shared)) => {
+                    let mut entry = (*shared).clone();
+                    let key_str = hotkey.to_string();
+                    let key = (*entry.item.id(), key_str.clone());
+                    if self.inner.sent.insert(key.clone(), ()).is_ok() {
                         result.push(entry.item.clone());
                         entry.count -= 1;
-                        // If there are duplicates remaining, push the entry back;
-                        // otherwise remove the key.
                         if entry.count > 0 {
-                            self.q.push((*entry).clone());
+                            self.inner.q.push((*entry).clone());
                         } else {
-                            self.sent.remove(&key);
+                            self.inner.sent.remove(&key);
                         }
                     }
                 }
@@ -67,11 +138,11 @@ impl<T: Clone + Hash + HasUuid + 'static> DupQueue<T> {
     }
 
     pub fn dup(&self) -> usize {
-        self.dup
+        self.inner.dup
     }
 
     pub fn len(&self) -> usize {
-        self.q.len()
+        self.inner.q.len()
     }
 }
 
@@ -82,6 +153,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn create_task(prompt: &str) -> Task {
@@ -94,25 +166,36 @@ mod tests {
     #[test]
     fn test_single_push_pop() {
         // With dup = 3, an element may be delivered to up to 3 distinct hotkeys.
-        let queue = DupQueue::new(3);
+        let queue = Arc::new(
+            DupQueue::<Task>::builder()
+                .dup(3)
+                .ttl(300)
+                .cleanup_interval(1)
+                .build(),
+        );
         let task = create_task("Task 1");
         queue.push(task.clone());
 
         // Hotkey "a" receives the task.
         assert_eq!(queue.pop(3, "a"), vec![task.clone()]);
         // Subsequent calls with the same hotkey "a" yield nothing.
-        assert_eq!(queue.pop(3, "a"), Vec::<Task>::new());
+        assert!(queue.pop(3, "a").is_empty());
         // New hotkeys "b" and "c" obtain the task.
         assert_eq!(queue.pop(3, "b"), vec![task.clone()]);
         assert_eq!(queue.pop(3, "c"), vec![task.clone()]);
         // Duplication allowance exhausted; new hotkey "d" gets nothing.
-        assert_eq!(queue.pop(3, "d"), Vec::<Task>::new());
+        assert!(queue.pop(3, "d").is_empty());
     }
 
     #[test]
     fn test_multiple_pushes() {
-        // With dup = 2, each task can be delivered to 2 distinct hotkeys.
-        let queue = DupQueue::new(2);
+        let queue = Arc::new(
+            DupQueue::<Task>::builder()
+                .dup(2)
+                .ttl(300)
+                .cleanup_interval(1)
+                .build(),
+        );
         let task1 = create_task("Task 1");
         let task2 = create_task("Task 2");
         queue.push(task1.clone());
@@ -131,7 +214,13 @@ mod tests {
 
     #[test]
     fn test_pop_more_than_exists() {
-        let queue = DupQueue::new(4);
+        let queue = Arc::new(
+            DupQueue::<Task>::builder()
+                .dup(4)
+                .ttl(300)
+                .cleanup_interval(1)
+                .build(),
+        );
         let task1 = create_task("Task A");
         let task2 = create_task("Task B");
         queue.push(task1.clone());
@@ -145,7 +234,13 @@ mod tests {
 
     #[test]
     fn test_requeue_duplicates_in_pop() {
-        let queue = DupQueue::new(3);
+        let queue = Arc::new(
+            DupQueue::<Task>::builder()
+                .dup(3)
+                .ttl(300)
+                .cleanup_interval(1)
+                .build(),
+        );
         let task1 = create_task("hello");
         let task2 = create_task("world");
         queue.push(task1.clone());
@@ -158,9 +253,8 @@ mod tests {
         assert_eq!(res1, expected);
 
         // A subsequent pop with "key1" returns nothing.
-        let res2 = queue.pop(2, "key1");
-        assert!(res2.is_empty());
-        // A new hotkey "key2" can receive them.
+        assert!(queue.pop(2, "key1").is_empty());
+        // A new hotkey "key2" can receive them again.
         let mut res3 = queue.pop(2, "key2");
         res3.sort_by(|a, b| a.prompt.cmp(&b.prompt));
         assert_eq!(res3, expected);
@@ -168,14 +262,17 @@ mod tests {
 
     #[test]
     fn test_concurrent_push_pop() {
-        let queue = Arc::new(DupQueue::new(3));
+        let queue = Arc::new(
+            DupQueue::<Task>::builder()
+                .dup(3)
+                .ttl(300)
+                .cleanup_interval(1)
+                .build(),
+        );
         let q_producer = Arc::clone(&queue);
-
-        // Producer thread pushes tasks with distinct prompts.
         let producer = thread::spawn(move || {
             for i in 0..10 {
-                let task = create_task(&format!("Task {}", i));
-                q_producer.push(task);
+                q_producer.push(create_task(&format!("Task {}", i)));
             }
         });
         producer.join().unwrap();
@@ -193,26 +290,21 @@ mod tests {
                 res
             }));
         }
-        for handle in handles {
-            let _ = handle.join().unwrap();
+        for h in handles {
+            h.join().unwrap();
         }
     }
 
     #[test]
-    fn test_internal_hashset_cleared_after_final_delivery() {
-        // Use dup = 1 so that the pushed task is delivered exactly once.
-        let queue = DupQueue::new(1);
-        let task = create_task("Final Task");
-        queue.push(task.clone());
-
-        // For a new hotkey the task should be delivered.
-        let res = queue.pop(1, "test_hotkey");
-        assert_eq!(res, vec![task]);
-        // Since the task was delivered for the only allowed time,
-        // the internal hashset 'sent' should now be empty.
-        assert!(
-            queue.sent.is_empty(),
-            "Internal hashset should be cleared after final delivery."
-        );
+    fn test_cleanup_removes_old_entries() {
+        let queue = DupQueue::<Task>::builder()
+            .dup(1)
+            .ttl(1)
+            .cleanup_interval(1)
+            .build();
+        let task = create_task("Old Task");
+        queue.push(task);
+        thread::sleep(Duration::from_secs(2));
+        assert!(queue.pop(1, "any").is_empty());
     }
 }

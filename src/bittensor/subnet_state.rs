@@ -1,35 +1,30 @@
-#![allow(dead_code)]
-
-use anyhow::anyhow;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_tungstenite::tokio::connect_async_with_config;
 use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
-use foldhash::HashMap;
-use foldhash::HashMapExt;
 use futures_util::StreamExt;
 use hex;
 use itertools::izip;
 use parity_scale_codec::{Compact, Decode, Encode};
+use scc::HashMap;
 use serde_json::{json, Value};
-use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
-use tracing::error;
-use tracing::info;
+use std::{collections::hash_map::RandomState, fmt};
+use tokio::task::JoinHandle;
+use tracing::{error, info};
 
 use super::crypto::ss58_decode;
 
 pub type AccountId = [u8; 32];
 
-// Other fields will be used later
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HotkeyData {
-    emission: u64,
-    alpha_stake: u64,
-    total_stake: u64,
-    tao_stake: u64,
-    coldkey: AccountId,
+    pub emission: u64,
+    pub alpha_stake: u64,
+    pub total_stake: u64,
+    pub tao_stake: u64,
+    pub coldkey: AccountId,
 }
 
 #[derive(Decode, Encode, PartialEq, Eq, Clone, Debug)]
@@ -54,9 +49,14 @@ pub struct State {
     pub emission_history: Vec<Vec<Compact<u64>>>,
 }
 
+struct Inner {
+    map: HashMap<AccountId, HotkeyData, RandomState>,
+    join_handle: JoinHandle<()>,
+}
+
+#[derive(Clone)]
 pub struct SubnetState {
-    receiver: watch::Receiver<HashMap<AccountId, HotkeyData>>,
-    join_handle: tokio::task::JoinHandle<()>,
+    inner: Arc<Inner>,
 }
 
 impl SubnetState {
@@ -67,88 +67,68 @@ impl SubnetState {
         poll_interval: Duration,
         wss_max_message_size: usize,
     ) -> Self {
-        let (tx, rx) = watch::channel(HashMap::with_capacity(256));
-
-        let join_handle = tokio::spawn(async move {
-            loop {
-                info!("Updating subnet state {netuid} with wss: {wss_bittensor}");
-                match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size).await {
-                    Ok(new_state) => {
-                        if let Err(e) = tx.send(new_state) {
-                            error!("Failed to send updated subnet state: {:?}", e);
+        let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
+            let map = HashMap::with_capacity_and_hasher(256, RandomState::default());
+            let join_handle = tokio::spawn({
+                let weak = weak.clone();
+                let wss_bittensor = wss_bittensor.clone();
+                async move {
+                    while let Some(inner) = weak.upgrade() {
+                        info!("Updating subnet state {} via WSS {}", netuid, wss_bittensor);
+                        match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size)
+                            .await
+                        {
+                            Ok(new_state) => {
+                                let map = &inner.map;
+                                map.retain_async(|k, _| new_state.contains_key(k)).await;
+                                for (hotkey, data) in new_state {
+                                    map.entry(hotkey)
+                                        .and_modify(|v| {
+                                            if *v != data {
+                                                *v = data.clone()
+                                            }
+                                        })
+                                        .or_insert(data);
+                                }
+                            }
+                            Err(e) => error!("Error updating subnet state: {:?}", e),
                         }
-                    }
-                    Err(e) => {
-                        error!("Error updating subnet state: {:?}", e);
+                        tokio::time::sleep(poll_interval).await;
                     }
                 }
-                tokio::time::sleep(poll_interval).await;
-            }
+            });
+            Inner { map, join_handle }
         });
-
-        SubnetState {
-            receiver: rx,
-            join_handle,
-        }
+        SubnetState { inner }
     }
 
+    // Check that the hotkey exists and has at least 10k TAO
     pub fn validate_hotkey(&self, hotkey: &str) -> Result<()> {
         let account_id = ss58_decode(hotkey)?;
-
-        let total_stake = {
-            let state = self.receiver.borrow();
-            let hotkey_data = state
-                .get(&account_id.0)
-                .ok_or_else(|| anyhow!("Hotkey not found in the subnet"))?;
-            hotkey_data.total_stake
-        };
-
-        // 10000 TAO
-        let required_stake: u64 = 10000 * 1_000_000_000;
-
-        if total_stake > required_stake {
-            Ok(())
+        if let Some(hk) = self.inner.map.get(&account_id.0) {
+            let total_stake = hk.total_stake;
+            let required = 10_000 * 1_000_000_000;
+            if total_stake > required {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Hotkey found but insufficient stake: {} < {}",
+                    total_stake,
+                    required
+                ))
+            }
         } else {
-            Err(anyhow!(
-                "Hotkey found but does not have enough total stake: {} < {}",
-                total_stake,
-                required_stake
-            ))
+            Err(anyhow!("Hotkey not found in the subnet"))
         }
     }
 
-    pub fn current_state(&self) -> tokio::sync::watch::Ref<'_, HashMap<AccountId, HotkeyData>> {
-        self.receiver.borrow()
+    #[allow(dead_code)]
+    pub fn get(&self, hotkey: &AccountId) -> Option<HotkeyData> {
+        self.inner.map.get(hotkey).map(|entry| entry.get().clone())
     }
 
     pub fn abort(&self) {
-        self.join_handle.abort();
-    }
-}
-
-// Useful for debugging
-pub struct Balance {
-    pub rao: u64,
-}
-
-impl Balance {
-    pub fn new(rao: u64) -> Self {
-        Self { rao }
-    }
-}
-
-impl fmt::Display for Balance {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const RAO_PER_TAO: u64 = 1_000_000_000;
-        let whole_tao = self.rao / RAO_PER_TAO;
-        let frac_rao = self.rao % RAO_PER_TAO;
-        if frac_rao == 0 {
-            write!(f, "{} TAO ({} RAO)", whole_tao, self.rao)
-        } else {
-            let mut frac_str = format!("{:09}", frac_rao);
-            frac_str = frac_str.trim_end_matches('0').to_string();
-            write!(f, "{}.{} TAO ({} RAO)", whole_tao, frac_str, self.rao)
-        }
+        self.inner.join_handle.abort();
     }
 }
 
@@ -174,7 +154,7 @@ where
     ))
 }
 
-fn build_hotkeys_state(subnet_state: State) -> Result<HashMap<AccountId, HotkeyData>> {
+fn build_hotkeys_state(subnet_state: State) -> Result<foldhash::HashMap<AccountId, HotkeyData>> {
     let State {
         hotkeys,
         coldkeys,
@@ -200,7 +180,7 @@ fn build_hotkeys_state(subnet_state: State) -> Result<HashMap<AccountId, HotkeyD
         return Err(anyhow!("Mismatched vector lengths in SubnetState"));
     }
 
-    let hashmap: HashMap<_, _> = izip!(
+    let hashmap: foldhash::HashMap<_, _> = izip!(
         hotkeys,
         coldkeys,
         emission,
@@ -230,48 +210,57 @@ async fn get_subnet_state(
     netuid: u16,
     block: Option<u64>,
     wss_max_message_size: usize,
-) -> Result<HashMap<AccountId, HotkeyData>> {
+) -> Result<foldhash::HashMap<AccountId, HotkeyData>> {
     let ws_config = WebSocketConfig::default().max_message_size(Some(wss_max_message_size));
-
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
         connect_async_with_config(bittensor_wss, Some(ws_config)),
     )
     .await??;
-
     let encoded_netuid = netuid.encode();
     let params_hex = format!("0x{}", hex::encode(encoded_netuid));
-
-    let block_param = if let Some(b) = block {
-        json!(b)
-    } else {
-        json!(null)
-    };
-
+    let block_param = block.map_or(json!(null), |b| json!(b));
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "state_call",
         "params": ["SubnetInfoRuntimeApi_get_subnet_state", params_hex, block_param]
     });
-
     socket.send(Message::text(request.to_string())).await?;
     let resp_text = get_text_message(&mut socket, 1).await?;
     let resp: Value = serde_json::from_str(&resp_text)?;
-
     if let Some(result_hex) = resp["result"].as_str() {
         let result_bytes = hex::decode(result_hex.trim_start_matches("0x"))?;
         let subnet_state = State::decode(&mut &result_bytes[..])
-            .map_err(|e| anyhow::anyhow!("SCALE decoding failed: {:?}", e))?;
-
-        build_hotkeys_state(subnet_state)
+            .map_err(|e| anyhow!("SCALE decoding failed: {:?}", e))?;
+        Ok(build_hotkeys_state(subnet_state)?)
     } else if let Some(error) = resp.get("error") {
-        Err(anyhow::anyhow!("Error in response: {:?}", error))
+        Err(anyhow!("Error in response: {:?}", error))
     } else {
-        Err(anyhow::anyhow!(
+        Err(anyhow!(
             "No 'result' field in response; raw response: {}",
             resp_text
         ))
+    }
+}
+
+// Useful for debugging
+pub struct Balance {
+    pub rao: u64,
+}
+
+impl fmt::Display for Balance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const RAO_PER_TAO: u64 = 1_000_000_000;
+        let whole_tao = self.rao / RAO_PER_TAO;
+        let frac_rao = self.rao % RAO_PER_TAO;
+        if frac_rao == 0 {
+            write!(f, "{} TAO ({} RAO)", whole_tao, self.rao)
+        } else {
+            let mut frac_str = format!("{:09}", frac_rao);
+            frac_str = frac_str.trim_end_matches('0').to_string();
+            write!(f, "{}.{} TAO ({} RAO)", whole_tao, frac_str, self.rao)
+        }
     }
 }
 
@@ -307,7 +296,6 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let current_state = subnet_state.current_state();
         let otf_hotkey = "5F4tQyWrhfGVcNhoqeiNsR6KjD4wMZ2kfhLj4oHYuyHbZAc3";
         let decoded_hotkey = ss58_decode(otf_hotkey).expect("Failed to decode SS58 hotkey");
 
@@ -318,7 +306,7 @@ mod tests {
             .expect("Hotkey slice was not 32 bytes");
 
         assert!(
-            current_state.get(hotkey_arr).is_some(),
+            subnet_state.get(hotkey_arr).is_some(),
             "Expected hotkey not found in state."
         );
     }

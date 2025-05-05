@@ -57,7 +57,9 @@ update_gateway_info_ms = 1000
 unique_validators_per_task = 3
 taskmanager_initial_capacity = 1024
 taskmanager_cleanup_interval = 30
-taskmanager_result_lifetime = 300
+taskmanager_result_lifetime = 2000
+taskqueue_cleanup_interval = 1
+taskqueue_task_ttl = 1800
 
 [log]
 path = "./logs/gateway.log"

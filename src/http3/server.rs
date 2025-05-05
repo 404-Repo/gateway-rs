@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_zip::base::write::ZipFileWriter;
@@ -105,7 +104,7 @@ async fn add_task_handler(
         prompt: add_task.prompt,
     };
 
-    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
@@ -285,7 +284,7 @@ async fn add_result_handler(
     };
 
     let subnet_state = depot
-        .obtain::<Arc<SubnetState>>()
+        .obtain::<SubnetState>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
 
     subnet_state
@@ -433,7 +432,7 @@ async fn get_status_handler(
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
-    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
@@ -470,7 +469,7 @@ async fn get_tasks_handler(
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
 
     let subnet_state = depot
-        .obtain::<Arc<SubnetState>>()
+        .obtain::<SubnetState>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
 
     subnet_state
@@ -491,7 +490,7 @@ async fn get_tasks_handler(
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
-    let queue = depot.obtain::<Arc<DupQueue<Task>>>().map_err(|err_opt| {
+    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
         if let Some(err) = err_opt {
             ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
         } else {
@@ -731,7 +730,7 @@ async fn generic_key_read_handler(
 
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
-    subnet_state: Arc<SubnetState>,
+    subnet_state: SubnetState,
 }
 
 impl Http3Server {
@@ -741,7 +740,7 @@ impl Http3Server {
         tls_config: RustlsConfig,
         http_config: &HTTPConfig,
         gateway_state: GatewayState,
-        task_queue: Arc<DupQueue<Task>>,
+        task_queue: DupQueue<Task>,
     ) -> Self {
         let basic_limiter = Self::create_rate_limiter(http_config.basic_rate_limit);
         let write_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
@@ -768,13 +767,13 @@ impl Http3Server {
             leader_limiter,
         };
 
-        let subnet_state = Arc::new(SubnetState::new(
+        let subnet_state = SubnetState::new(
             http_config.wss_bittensor.clone(),
             http_config.subnet_number,
             None,
             Duration::from_secs(http_config.subnet_poll_interval_sec),
             http_config.wss_max_message_size,
-        ));
+        );
 
         let router = Self::setup_router(
             node_id,
@@ -818,8 +817,8 @@ impl Http3Server {
 
     fn setup_router(
         node_id: usize,
-        task_queue: Arc<DupQueue<Task>>,
-        subnet_state: Arc<SubnetState>,
+        task_queue: DupQueue<Task>,
+        subnet_state: SubnetState,
         gateway_state: GatewayState,
         rate_limits: RateLimits,
         config: HTTPConfig,
