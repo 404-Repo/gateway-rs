@@ -2,12 +2,15 @@ use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
 use h3;
+use h3::error::ConnectionError;
 use h3_quinn;
 use http::{self, StatusCode};
 use quinn;
 use rustls;
 use rustls_platform_verifier::BuilderVerifierExt;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::error;
 
 use crate::common::cert::SkipServerVerification;
@@ -18,8 +21,8 @@ pub struct Http3Client {
 
 impl Http3Client {
     pub async fn new(
-        server_ip: &str,
         server_domain: &str,
+        server_ip: &str,
         dangerous_skip_verification: bool,
     ) -> Result<Http3Client> {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -50,54 +53,78 @@ impl Http3Client {
 
         let (mut driver, send_request) = h3::client::new(quinn_conn).await?;
         tokio::spawn(async move {
-            if let Err(e) = future::poll_fn(|cx| driver.poll_close(cx)).await {
-                error!("Http3 client driver error: {:?}", e);
+            let err: ConnectionError = future::poll_fn(|cx| driver.poll_close(cx)).await;
+            if !err.is_h3_no_error() {
+                error!("Http3 client driver error: {:?}", err);
             }
         });
 
         Ok(Self { send_request })
     }
 
-    #[allow(dead_code)]
-    pub async fn get(&mut self, url: &str) -> Result<(StatusCode, Bytes)> {
+    pub async fn get(
+        &mut self,
+        url: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<(StatusCode, Bytes)> {
         let uri = url.parse::<http::uri::Uri>()?;
-
         let request = http::Request::builder().method("GET").uri(&uri).body(())?;
 
-        let mut stream = self.send_request.send_request(request).await?;
-        stream.finish().await?;
-        let response = stream.recv_response().await?;
+        let fut = async {
+            let mut stream = self.send_request.send_request(request).await?;
+            stream.finish().await?;
+            let response = stream.recv_response().await?;
 
-        let mut buf = BytesMut::new();
-        while let Some(mut chunk) = stream.recv_data().await? {
-            let bytes = chunk.copy_to_bytes(chunk.remaining());
-            buf.extend_from_slice(&bytes);
+            let mut buf = BytesMut::new();
+            while let Some(mut chunk) = stream.recv_data().await? {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                buf.extend_from_slice(&bytes);
+            }
+
+            Ok((response.status(), buf.freeze()))
+        };
+
+        match timeout_duration {
+            Some(duration) => timeout(duration, fut)
+                .await
+                .map_err(|_| anyhow::anyhow!("GET request timed out"))?,
+            None => fut.await,
         }
-
-        Ok((response.status(), buf.freeze()))
     }
 
-    pub async fn post(&mut self, url: &str, data: Bytes) -> Result<(StatusCode, Bytes)> {
+    pub async fn post(
+        &mut self,
+        url: &str,
+        data: Bytes,
+        timeout_duration: Option<Duration>,
+    ) -> Result<(StatusCode, Bytes)> {
         let uri = url.parse::<http::uri::Uri>()?;
-
         let request = http::Request::builder()
             .method("POST")
             .uri(&uri)
             .header("Content-Type", "application/json")
             .body(())?;
 
-        let mut stream = self.send_request.send_request(request).await?;
-        stream.send_data(data).await?;
-        stream.finish().await?;
+        let fut = async {
+            let mut stream = self.send_request.send_request(request).await?;
+            stream.send_data(data).await?;
+            stream.finish().await?;
+            let response = stream.recv_response().await?;
 
-        let response = stream.recv_response().await?;
+            let mut buf = BytesMut::new();
+            while let Some(mut chunk) = stream.recv_data().await? {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                buf.extend_from_slice(&bytes);
+            }
 
-        let mut buf = BytesMut::new();
-        while let Some(mut chunk) = stream.recv_data().await? {
-            let bytes = chunk.copy_to_bytes(chunk.remaining());
-            buf.extend_from_slice(&bytes);
+            Ok((response.status(), buf.freeze()))
+        };
+
+        match timeout_duration {
+            Some(duration) => timeout(duration, fut)
+                .await
+                .map_err(|_| anyhow::anyhow!("POST request timed out"))?,
+            None => fut.await,
         }
-
-        Ok((response.status(), buf.freeze()))
     }
 }

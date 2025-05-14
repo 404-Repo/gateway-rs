@@ -12,6 +12,7 @@ mod common;
 mod config;
 mod db;
 mod http3;
+mod metrics;
 mod protocol;
 mod raft;
 

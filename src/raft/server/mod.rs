@@ -107,7 +107,6 @@ impl RServer {
                     let protocol = Protocol::new(
                         connection.clone(),
                         protocol_cfg.max_message_size,
-                        Duration::from_millis(protocol_cfg.send_timeout_ms),
                         Duration::from_millis(protocol_cfg.receive_message_timeout_ms),
                     );
                     if let Err(e) = Self::handle_request(protocol, send, recv, raft.clone()).await {
@@ -229,7 +228,7 @@ mod tests {
 
         let client =
             crate::raft::client::RClient::new(addr, "localhost", "127.0.0.1:0", true, pcfg).await?;
-        assert!(client.connection.stable_id() > 0);
+        assert!(client.stable_id() > 0);
 
         Ok(())
     }

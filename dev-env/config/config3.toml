@@ -12,8 +12,7 @@ node_id_discovery_retries = 5
 
 [protocol]
 max_message_size = 65536
-send_timeout_ms = 300
-receive_message_timeout_ms = 2000
+receive_message_timeout_ms = 5000
 
 [http]
 compression = true

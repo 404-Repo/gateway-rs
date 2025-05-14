@@ -37,7 +37,6 @@ pub struct NetworkConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProtocolConfig {
     pub max_message_size: usize,
-    pub send_timeout_ms: u64,
     pub receive_message_timeout_ms: u64,
 }
 
@@ -45,7 +44,6 @@ impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
             max_message_size: 64 * 1024,
-            send_timeout_ms: 300,
             receive_message_timeout_ms: 2000,
         }
     }
