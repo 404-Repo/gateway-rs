@@ -99,7 +99,6 @@ impl TryFrom<RaftMessageType> for VoteResponse<u64> {
 pub struct Protocol {
     _connection: Connection,
     max_message_size: usize,
-    send_timeout_ms: Duration,
     receive_message_timeout_ms: Duration,
 }
 
@@ -107,13 +106,11 @@ impl Protocol {
     pub fn new(
         connection: Connection,
         max_message_size: usize,
-        send_timeout_ms: Duration,
         receive_message_timeout_ms: Duration,
     ) -> Self {
         Self {
             _connection: connection,
             max_message_size,
-            send_timeout_ms,
             receive_message_timeout_ms,
         }
     }
@@ -132,8 +129,8 @@ impl Protocol {
         send.write_all(&serialized).await?;
         send.flush().await?;
         send.finish()?;
+        let _ = send.stopped().await;
 
-        let _ = tokio::time::timeout(self.send_timeout_ms, send.stopped()).await;
         Ok(())
     }
 

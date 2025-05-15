@@ -32,7 +32,6 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio::time::timeout;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -107,9 +106,8 @@ async fn get_id_for_endpoint(
         .build();
 
     let id = (|| async {
-        if let Ok(mut client) = Http3Client::new(&connection_addr, dns_name, true).await {
-            if let Ok(Ok((status, body))) = timeout(Duration::from_secs(2), client.get(&url)).await
-            {
+        if let Ok(mut client) = Http3Client::new(dns_name, &connection_addr, true).await {
+            if let Ok((status, body)) = client.get(&url, Some(Duration::from_secs(2))).await {
                 if status == StatusCode::OK {
                     let body_str = std::str::from_utf8(&body)
                         .context("Failed to convert response body to UTF-8")?;
@@ -207,15 +205,18 @@ impl Gateway {
 
             let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
             let mut client = match Http3Client::new(
-                &server_ip,
                 &leader_info.domain,
+                &server_ip,
                 config.cert.dangerous_skip_verification,
             )
             .await
             {
                 Ok(client) => client,
                 Err(e) => {
-                    error!("Failed to create HTTP3 client: {:?}", e);
+                    error!(
+                        "Failed to create HTTP3 client: {:?} with params: {} {}",
+                        e, &leader_info.domain, server_ip,
+                    );
                     continue;
                 }
             };
@@ -246,7 +247,10 @@ impl Gateway {
                 leader_info.domain, leader_info.http_port
             );
 
-            match client.post(&url, Bytes::from(payload)).await {
+            match client
+                .post(&url, Bytes::from(payload), Some(Duration::from_secs(2)))
+                .await
+            {
                 Ok((status, response)) => {
                     if !status.is_success() {
                         error!(

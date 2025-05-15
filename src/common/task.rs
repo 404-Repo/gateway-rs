@@ -13,7 +13,6 @@ pub struct TaskResultScored {
     pub miner_hotkey: String,
     pub asset: Vec<u8>,
     pub score: f32,
-
     #[serde(skip_deserializing, default = "Instant::now")]
     pub instant: Instant,
 }
@@ -21,6 +20,7 @@ pub struct TaskResultScored {
 struct TaskManagerInner {
     completed: HashMap<Uuid, Vec<TaskResultScored>, RandomState>,
     expected_results: usize,
+    execution_time: HashMap<Uuid, Instant, RandomState>,
 }
 
 pub struct TaskManager {
@@ -35,6 +35,12 @@ pub enum TaskStatus {
     Completed,
 }
 
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::NoResult
+    }
+}
+
 impl TaskManager {
     pub async fn new(
         initial_capacity: usize,
@@ -45,6 +51,10 @@ impl TaskManager {
         let inner = Arc::new(TaskManagerInner {
             completed: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
             expected_results,
+            execution_time: HashMap::with_capacity_and_hasher(
+                initial_capacity,
+                RandomState::default(),
+            ),
         });
 
         let cancel_token = CancellationToken::new();
@@ -103,6 +113,22 @@ impl TaskManager {
             .completed
             .remove(&task_id)
             .map(|(_, value)| value)
+    }
+
+    pub fn add_time(&self, task_id: Uuid) {
+        let _ = self.inner.execution_time.insert(task_id, Instant::now());
+    }
+
+    pub fn get_time(&self, task_id: Uuid) -> f64 {
+        if let Some(start) = self.inner.execution_time.get(&task_id) {
+            start.elapsed().as_secs_f64()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn remove_time(&self, task_id: Uuid) {
+        self.inner.execution_time.remove(&task_id);
     }
 }
 

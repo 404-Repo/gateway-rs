@@ -35,6 +35,7 @@ use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
 use crate::common::task::TaskResultScored;
 use crate::config::HTTPConfig;
+use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use multer::SizeLimit;
 
@@ -120,8 +121,14 @@ async fn add_task_handler(
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
 
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
     queue.push(task.clone());
     info!("A new task has been pushed with ID: {}", task.id);
+    gateway_state.task_manager().add_time(task.id);
+
     res.render(Json(task));
     Ok(())
 }
@@ -316,10 +323,20 @@ async fn add_result_handler(
 
     info!(
         "Received result for task {} from validator {} and miner {}",
-        id, result.validator_hotkey, result.miner_hotkey
+        id, &result.validator_hotkey, &result.miner_hotkey
     );
 
-    gateway_state.task_manager().add_result(id, result).await;
+    let metrics = depot
+        .obtain::<Metrics>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+
+    metrics.inc_task_completed(&result.validator_hotkey);
+
+    let manager = gateway_state.task_manager();
+    metrics.record_completion_time(&result.validator_hotkey, manager.get_time(id));
+    manager.add_result(id, result).await;
+    manager.remove_time(id);
+
     res.status_code(StatusCode::OK);
     res.render(Text::Plain("Ok"));
     Ok(())
@@ -333,7 +350,7 @@ async fn add_result_handler(
 //   -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o results.zip
 #[handler]
-async fn get_result_handler(
+pub async fn get_result_handler(
     depot: &mut Depot,
     req: &mut Request,
     res: &mut Response,
@@ -347,26 +364,34 @@ async fn get_result_handler(
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e)))?
         .task_manager();
 
-    let results_vec = task_manager
+    let mut results_vec = task_manager
         .get_result(get_task.id)
         .await
         .ok_or_else(|| ServerError::NotFound("Task ID not found".to_string()))?;
+
     if results_vec.is_empty() {
         return Err(ServerError::NotFound(
             "No results found for the task".to_string(),
         ));
     }
 
-    let (content_type, content_disposition, body) = if get_task.all {
-        let mut results_vec = results_vec;
+    let metrics = depot
+        .obtain::<Metrics>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+
+    let (content_type, content_disposition, body, best_validator) = if get_task.all {
         results_vec.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        let best_validator = results_vec
+            .first()
+            .map(|r| r.validator_hotkey.clone())
+            .ok_or_else(|| ServerError::Internal("Failed to find best result".to_string()))?;
+
         let mut buffer = Vec::new();
         let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
-
         for (i, file) in results_vec.into_iter().enumerate() {
             let entry = ZipEntryBuilder::new(
                 format!("{}.spz", i + 1).into(),
@@ -389,9 +414,10 @@ async fn get_result_handler(
             "application/zip",
             "attachment; filename=\"results.zip\"",
             buffer,
+            best_validator,
         )
     } else {
-        let best_result = results_vec
+        let best = results_vec
             .into_iter()
             .max_by(|a, b| {
                 a.score
@@ -399,12 +425,16 @@ async fn get_result_handler(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| ServerError::Internal("Failed to find the best result".to_string()))?;
+        let best_validator = best.validator_hotkey.clone();
         (
             "application/octet-stream",
             "attachment; filename=\"result.spz\"",
-            best_result.asset,
+            best.asset,
+            best_validator,
         )
     };
+
+    metrics.inc_best_task(&best_validator);
 
     res.headers_mut()
         .insert("Content-Type", HeaderValue::from_static(content_type));
@@ -413,6 +443,7 @@ async fn get_result_handler(
         HeaderValue::from_static(content_disposition),
     );
     res.body(body);
+
     Ok(())
 }
 
@@ -468,6 +499,27 @@ async fn get_tasks_handler(
         .obtain::<HTTPConfig>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
 
+    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
+        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
+    })?;
+
+    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
+        if let Some(err) = err_opt {
+            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
+        } else {
+            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
+        }
+    })?;
+
+    let metrics = depot
+        .obtain::<Metrics>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+
+    let gateways = gateway_state
+        .gateways()
+        .await
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
+
     let subnet_state = depot
         .obtain::<SubnetState>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
@@ -486,17 +538,18 @@ async fn get_tasks_handler(
     )
     .map_err(|e| ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e)))?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
+    info!(
+        "Validator {} has requested {} tasks.",
+        get_tasks.validator_hotkey, get_tasks.requested_task_count
+    );
 
-    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
-        if let Some(err) = err_opt {
-            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
-        } else {
-            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
+    let mut tasks = Vec::new();
+    for (t, d) in queue.pop(get_tasks.requested_task_count, &get_tasks.validator_hotkey) {
+        tasks.push(t);
+        if let Some(dur) = d {
+            metrics.record_queue_time(dur.as_secs_f64());
         }
-    })?;
+    }
 
     gateway_state.update_task_acquisition().map_err(|e| {
         ServerError::Internal(format!(
@@ -505,12 +558,13 @@ async fn get_tasks_handler(
         ))
     })?;
 
-    let gateways = gateway_state
-        .gateways()
-        .await
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
+    metrics.inc_tasks_received(&get_tasks.validator_hotkey);
 
-    let tasks = queue.pop(get_tasks.requested_task_count, &get_tasks.validator_hotkey);
+    info!(
+        "Validator {} received {} tasks",
+        get_tasks.validator_hotkey,
+        tasks.len()
+    );
 
     let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));
@@ -827,6 +881,8 @@ impl Http3Server {
         let size_limit_handler = || SecureMaxSize(request_size_limit as usize);
         let file_size_limit_handler = SecureMaxSize(config.request_file_size_limit as usize);
 
+        let metrics = Metrics::new(0.05).expect("Failed to create Metrics");
+
         let router = if config.compression {
             Router::new().hoop(
                 Compression::new()
@@ -843,6 +899,7 @@ impl Http3Server {
             .hoop(affix_state::inject(subnet_state))
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(node_id))
+            .hoop(affix_state::inject(metrics))
             .push(
                 Router::with_path("/add_task")
                     .hoop(size_limit_handler())
