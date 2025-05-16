@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use foldhash::fast::RandomState;
+use foldhash::{HashMapExt as _, HashSetExt as _};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
 use std::time::Duration;
@@ -167,33 +168,34 @@ impl KeysUpdater {
 
     async fn update_keys(&self) -> Result<()> {
         let query = r#"
-            SELECT
-                u.id,
-                COALESCE(array_agg(a.api_key) FILTER (WHERE a.api_key IS NOT NULL), '{}') AS api_keys
-            FROM users u
-            LEFT JOIN api_keys a ON u.id = a.user_id
-            GROUP BY u.id;
-        "#;
+    SELECT
+        u.id,
+        COALESCE(array_agg(a.api_key) FILTER (WHERE a.api_key IS NOT NULL), '{}') AS api_keys
+    FROM users u
+    LEFT JOIN api_keys a ON u.id = a.user_id
+    GROUP BY u.id;
+"#;
         let rows = self.db.client.query(query, &[]).await?;
-        let new_keys: foldhash::HashMap<Uuid, Vec<Uuid>> = rows
-            .into_iter()
-            .map(|row| {
-                let user_id: Uuid = row.get("id");
-                let api_keys: Vec<Uuid> = row.get("api_keys");
-                (user_id, api_keys)
-            })
-            .collect();
 
-        info!(
-            "Retrieved {} new API keys from the database",
-            new_keys.len()
-        );
+        let mut new_keys: foldhash::HashMap<Uuid, Vec<Uuid>> =
+            foldhash::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let user_id: Uuid = row.get("id");
+            let api_keys: Vec<Uuid> = row.get("api_keys");
+            new_keys.insert(user_id, api_keys);
+        }
 
-        let new_user_ids: foldhash::HashSet<&Uuid> = new_keys.keys().collect();
+        info!("Retrieved {} API keys from the database", new_keys.len());
+
+        let mut new_user_ids: foldhash::HashSet<&Uuid> =
+            foldhash::HashSet::with_capacity(new_keys.len());
+        for user_id in new_keys.keys() {
+            new_user_ids.insert(user_id);
+        }
         self.users
             .retain_async(|k, _| new_user_ids.contains(k))
             .await;
-        for (user_id, new_api_keys) in new_keys.iter() {
+        for (user_id, new_api_keys) in &new_keys {
             self.users
                 .entry(*user_id)
                 .and_modify(|v| {
@@ -204,14 +206,16 @@ impl KeysUpdater {
                 .or_insert(new_api_keys.clone());
         }
 
-        let new_api_key_set: foldhash::HashSet<Uuid> =
-            new_keys.values().flat_map(|v| v.iter()).cloned().collect();
+        let total_api_keys: usize = new_keys.values().map(|v| v.len()).sum();
+        let mut new_api_key_set: foldhash::HashSet<Uuid> =
+            foldhash::HashSet::with_capacity(total_api_keys);
+        new_api_key_set.extend(new_keys.values().flatten().cloned());
 
         self.api_keys
             .retain_async(|k, _| new_api_key_set.contains(k))
             .await;
 
-        for (user_id, api_keys_vec) in new_keys.iter() {
+        for (user_id, api_keys_vec) in &new_keys {
             for api_key in api_keys_vec {
                 self.api_keys
                     .entry(*api_key)

@@ -68,8 +68,9 @@ impl TaskManager {
                     _ = tokio::time::sleep(cleanup_interval) => {
                         let now = Instant::now();
                         inner_clone.completed.retain(|_, results| {
-                            results.len() < inner_clone.expected_results ||
-                            results.last().is_some_and(|last| now.duration_since(last.instant) < result_lifetime)
+                            results
+                                .last()
+                                .is_some_and(|last| now.duration_since(last.instant) < result_lifetime)
                         });
                     }
                 }
@@ -94,11 +95,11 @@ impl TaskManager {
             .push(result);
     }
 
-    pub async fn get_status(&self, task_id: Uuid, expected_results: usize) -> TaskStatus {
+    pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
         match self.inner.completed.get(&task_id) {
             Some(guard) if !guard.is_empty() => {
                 let count = guard.len();
-                if count < expected_results {
+                if count < self.inner.expected_results {
                     TaskStatus::PartialResult(count)
                 } else {
                     TaskStatus::Completed
@@ -202,30 +203,30 @@ async fn test_cleanup() {
         .await;
 
     assert_eq!(
-        task_manager.get_status(task_id1, EXPECTED_RESULTS).await,
+        task_manager.get_status(task_id1).await,
         TaskStatus::PartialResult(1)
     );
     assert_eq!(
-        task_manager.get_status(task_id2, EXPECTED_RESULTS).await,
+        task_manager.get_status(task_id2).await,
         TaskStatus::Completed
     );
     assert_eq!(
-        task_manager.get_status(task_id3, EXPECTED_RESULTS).await,
+        task_manager.get_status(task_id3).await,
         TaskStatus::Completed
     );
 
     tokio::time::sleep(WAIT_DURATION).await;
 
     assert_eq!(
-        task_manager.get_status(task_id1, EXPECTED_RESULTS).await,
-        TaskStatus::PartialResult(1)
-    );
-    assert_eq!(
-        task_manager.get_status(task_id2, EXPECTED_RESULTS).await,
+        task_manager.get_status(task_id1).await,
         TaskStatus::NoResult
     );
     assert_eq!(
-        task_manager.get_status(task_id3, EXPECTED_RESULTS).await,
+        task_manager.get_status(task_id2).await,
+        TaskStatus::NoResult
+    );
+    assert_eq!(
+        task_manager.get_status(task_id3).await,
         TaskStatus::NoResult
     );
 }

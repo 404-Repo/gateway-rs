@@ -80,6 +80,7 @@ pub struct HTTPConfig {
     pub load_rate_limit: usize,
     pub add_task_rate_limit: usize,
     pub leader_rate_limit: usize,
+    pub metric_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,

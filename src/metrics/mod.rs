@@ -22,7 +22,7 @@ pub struct Metrics {
 struct MetricsInner {
     alpha: f64,
 
-    _registry: Registry,
+    registry: Registry,
 
     queue_time_avg: Gauge,
     queue_time_max: Gauge,
@@ -85,7 +85,7 @@ impl Metrics {
 
         let inner = MetricsInner {
             alpha,
-            _registry: registry,
+            registry,
             queue_time_avg,
             queue_time_max,
             completion_time_avg,
@@ -100,6 +100,10 @@ impl Metrics {
         Ok(Metrics {
             inner: Arc::new(inner),
         })
+    }
+
+    pub fn registry(&self) -> &Registry {
+        &self.inner.registry
     }
 
     fn get_entry(&self, key: &str) -> Arc<MetricsEntry> {
@@ -138,8 +142,8 @@ impl Metrics {
         entry.completion_time_max.set(m);
     }
 
-    pub fn inc_tasks_received(&self, key: &str) {
-        self.get_entry(key).tasks_received.inc();
+    pub fn inc_tasks_received(&self, key: &str, tasks: usize) {
+        self.get_entry(key).tasks_received.inc_by(tasks as f64);
     }
 
     pub fn inc_task_completed(&self, key: &str) {
