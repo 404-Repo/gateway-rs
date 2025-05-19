@@ -146,6 +146,7 @@ where
         result
     }
 
+    #[allow(dead_code)]
     pub fn dup(&self) -> usize {
         self.inner.dup
     }

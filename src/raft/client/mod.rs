@@ -149,7 +149,7 @@ impl RClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::crypto::init_crypto_provider;
+    use crate::common::crypto_provider::init_crypto_provider;
     use crate::config::ProtocolConfig;
     use crate::protocol::RaftMessageType;
     use crate::raft::network::Network;

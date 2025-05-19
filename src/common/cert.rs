@@ -103,11 +103,8 @@ pub fn generate_self_signed_config() -> Result<ServerConfig> {
     )))
 }
 
-pub fn generate_and_create_keycert(
-    domain_names: Vec<String>,
-) -> Result<Keycert, Box<dyn std::error::Error>> {
-    let certified_key = rcgen::generate_simple_self_signed(domain_names)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+pub fn generate_and_create_keycert(domain_names: Vec<String>) -> Result<Keycert> {
+    let certified_key = rcgen::generate_simple_self_signed(domain_names)?;
 
     let cert_pem = certified_key.cert.pem();
     let cert_bytes: Vec<u8> = cert_pem.as_bytes().to_vec();

@@ -8,6 +8,7 @@ use futures::io::Cursor;
 use futures::TryStreamExt;
 use http::HeaderValue;
 use multer::{Constraints, Multipart};
+use prometheus::{Encoder as _, TextEncoder, TEXT_FORMAT};
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
@@ -86,6 +87,7 @@ struct RateLimits {
     task_limiter: H3RateLimiter,
     load_limiter: H3RateLimiter,
     leader_limiter: H3RateLimiter,
+    metric_limiter: H3RateLimiter,
 }
 
 // curl --http3 -X POST "https://gateway.404.xyz:4443/add_task" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
@@ -367,12 +369,13 @@ pub async fn get_result_handler(
     let mut results_vec = task_manager
         .get_result(get_task.id)
         .await
-        .ok_or_else(|| ServerError::NotFound("Task ID not found".to_string()))?;
+        .ok_or_else(|| ServerError::NotFound(format!("Task ID {} not found", get_task.id)))?;
 
     if results_vec.is_empty() {
-        return Err(ServerError::NotFound(
-            "No results found for the task".to_string(),
-        ));
+        return Err(ServerError::NotFound(format!(
+            "No results found for task ID {}",
+            get_task.id
+        )));
     }
 
     let metrics = depot
@@ -388,7 +391,12 @@ pub async fn get_result_handler(
         let best_validator = results_vec
             .first()
             .map(|r| r.validator_hotkey.clone())
-            .ok_or_else(|| ServerError::Internal("Failed to find best result".to_string()))?;
+            .ok_or_else(|| {
+                ServerError::Internal(format!(
+                    "Failed to find best result for task ID {}",
+                    get_task.id
+                ))
+            })?;
 
         let mut buffer = Vec::new();
         let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
@@ -402,13 +410,20 @@ pub async fn get_result_handler(
                 .write_entry_whole(entry, &file.asset)
                 .await
                 .map_err(|e| {
-                    ServerError::Internal(format!("Failed to write zip entry: {:?}", e))
+                    ServerError::Internal(format!(
+                        "Failed to write zip entry {} for task ID {}: {:?}",
+                        i + 1,
+                        get_task.id,
+                        e
+                    ))
                 })?;
         }
-        zip_writer
-            .close()
-            .await
-            .map_err(|e| ServerError::Internal(format!("Failed to close zip archive: {:?}", e)))?;
+        zip_writer.close().await.map_err(|e| {
+            ServerError::Internal(format!(
+                "Failed to close zip archive for task ID {}: {:?}",
+                get_task.id, e
+            ))
+        })?;
 
         (
             "application/zip",
@@ -424,7 +439,12 @@ pub async fn get_result_handler(
                     .partial_cmp(&b.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .ok_or_else(|| ServerError::Internal("Failed to find the best result".to_string()))?;
+            .ok_or_else(|| {
+                ServerError::Internal(format!(
+                    "Failed to find the best result for task ID {}",
+                    get_task.id
+                ))
+            })?;
         let best_validator = best.validator_hotkey.clone();
         (
             "application/octet-stream",
@@ -463,18 +483,7 @@ async fn get_status_handler(
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
 
-    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
-        if let Some(err) = err_opt {
-            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
-        } else {
-            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
-        }
-    })?;
-
-    let status = gateway_state
-        .task_manager()
-        .get_status(get_status.id, queue.dup())
-        .await;
+    let status = gateway_state.task_manager().get_status(get_status.id).await;
 
     res.render(Json(GetTaskStatusResponse { status }));
 
@@ -558,7 +567,7 @@ async fn get_tasks_handler(
         ))
     })?;
 
-    metrics.inc_tasks_received(&get_tasks.validator_hotkey);
+    metrics.inc_tasks_received(&get_tasks.validator_hotkey, tasks.len());
 
     info!(
         "Validator {} received {} tasks",
@@ -782,6 +791,28 @@ async fn generic_key_read_handler(
     }
 }
 
+#[handler]
+async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), ServerError> {
+    let metrics = depot
+        .obtain::<Metrics>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+
+    let metric_families = metrics.registry().gather();
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| ServerError::Internal(format!("Failed to encode metrics: {}", e)))?;
+
+    res.headers_mut()
+        .insert("Content-Type", HeaderValue::from_static(TEXT_FORMAT));
+    res.status_code(StatusCode::OK);
+    res.body(buffer);
+
+    Ok(())
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: SubnetState,
@@ -809,6 +840,7 @@ impl Http3Server {
         let load_limiter = Self::create_rate_limiter(http_config.load_rate_limit);
         let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
         let leader_limiter = Self::create_rate_limiter(http_config.leader_rate_limit);
+        let metric_limiter = Self::create_rate_limiter(http_config.metric_rate_limit);
 
         let rate_limits = RateLimits {
             basic_limiter,
@@ -819,6 +851,7 @@ impl Http3Server {
             load_limiter,
             task_limiter,
             leader_limiter,
+            metric_limiter,
         };
 
         let subnet_state = SubnetState::new(
@@ -978,6 +1011,12 @@ impl Http3Server {
                     .hoop(rate_limits.update_limiter)
                     .hoop(admin_key_check)
                     .post(generic_key_update_handler),
+            )
+            .push(
+                Router::with_path("/metrics")
+                    .hoop(size_limit_handler())
+                    .hoop(rate_limits.metric_limiter)
+                    .get(metrics_handler),
             )
     }
 
