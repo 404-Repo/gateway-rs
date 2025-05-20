@@ -1,18 +1,29 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use foldhash::fast::RandomState;
 use foldhash::{HashMapExt as _, HashSetExt as _};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
+use sdd::{AtomicOwned, Guard, Owned, Tag};
+use std::error::Error as _;
+use std::io;
+use std::io::BufReader;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{io::BufReader, sync::Arc};
 use tokio::fs;
-use tokio_postgres::Config;
+use tokio_postgres::{Client, Config, Error, Row};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
 use uuid::Uuid;
 
 pub struct Database {
-    client: tokio_postgres::Client,
+    client: AtomicOwned<Arc<Client>>,
+    ca_pem_path: String,
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    dbname: String,
 }
 
 pub struct DatabaseBuilder {
@@ -67,44 +78,34 @@ impl DatabaseBuilder {
     }
 
     pub async fn build(self) -> Result<Database> {
-        let ca_pem_path = match self.ca_pem_path {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "CA PEM path is required and cannot be empty"
-                ))
-            }
-        };
-        let host = match self.host {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return Err(anyhow::anyhow!("Host is required and cannot be empty")),
-        };
-        let port = self
-            .port
-            .ok_or_else(|| anyhow::anyhow!("Port is required"))?;
-        let user = match self.user {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return Err(anyhow::anyhow!("User is required and cannot be empty")),
-        };
-        let password = match self.password {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return Err(anyhow::anyhow!("Password is required and cannot be empty")),
-        };
-        let dbname = match self.dbname {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Database name is required and cannot be empty"
-                ))
-            }
-        };
+        let ca_pem_path = self
+            .ca_pem_path
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("CA PEM path is required and cannot be empty"))?;
+        let host = self
+            .host
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("Host is required and cannot be empty"))?;
+        let port = self.port.ok_or_else(|| anyhow!("Port is required"))?;
+        let user = self
+            .user
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("User is required and cannot be empty"))?;
+        let password = self
+            .password
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("Password is required and cannot be empty"))?;
+        let dbname = self
+            .dbname
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("Database name is required and cannot be empty"))?;
 
         let ca_cert_bytes = fs::read(&ca_pem_path)
             .await
             .with_context(|| format!("Failed to read CA certificate at {}", ca_pem_path))?;
         let mut reader = BufReader::new(&ca_cert_bytes[..]);
         let certs = certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
+            .collect::<std::io::Result<Vec<_>>>()
             .with_context(|| "Failed to parse CA certificate as PEM")?;
         let mut root_store = RootCertStore::empty();
         for cert in certs {
@@ -113,27 +114,138 @@ impl DatabaseBuilder {
                 .with_context(|| "Failed to add CA certificate to root store")?;
         }
 
-        let config = ClientConfig::builder()
+        let tls_config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+        let tls_connector = MakeRustlsConnect::new(tls_config);
 
-        let tls_connector = MakeRustlsConnect::new(config);
         let mut pg_config = Config::new();
         pg_config.host(&host);
         pg_config.port(port);
         pg_config.user(&user);
         pg_config.password(&password);
         pg_config.dbname(&dbname);
+
         let (client, connection) = pg_config
             .connect(tls_connector)
             .await
             .with_context(|| "Failed to connect to PostgreSQL using rustls")?;
+        let client = Arc::new(client);
+
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 error!("Database connection error: {}", e);
             }
         });
-        Ok(Database { client })
+
+        Ok(Database {
+            client: AtomicOwned::new(client),
+            ca_pem_path,
+            host,
+            port,
+            user,
+            password,
+            dbname,
+        })
+    }
+}
+
+impl Database {
+    fn should_reconnect(&self, e: &Error) -> bool {
+        if e.is_closed() {
+            return true;
+        }
+
+        if let Some(src) = e.source() {
+            if let Some(io_err) = src.downcast_ref::<io::Error>() {
+                return matches!(
+                    io_err.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                );
+            }
+        }
+
+        false
+    }
+
+    pub async fn reconnect(&self) -> Result<()> {
+        let ca_cert_bytes = fs::read(&self.ca_pem_path)
+            .await
+            .with_context(|| format!("Failed to read CA certificate at {}", self.ca_pem_path))?;
+        let mut reader = BufReader::new(&ca_cert_bytes[..]);
+        let certs = certs(&mut reader)
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| "Failed to parse CA certificate as PEM")?;
+        let mut root_store = RootCertStore::empty();
+        for cert in certs {
+            root_store
+                .add(cert)
+                .with_context(|| "Failed to add CA certificate to root store")?;
+        }
+        let tls_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let tls_connector = MakeRustlsConnect::new(tls_config);
+
+        let mut pg_config = Config::new();
+        pg_config.host(&self.host);
+        pg_config.port(self.port);
+        pg_config.user(&self.user);
+        pg_config.password(&self.password);
+        pg_config.dbname(&self.dbname);
+
+        let (new_client, connection) = pg_config.connect(tls_connector).await?;
+        let new_client = Arc::new(new_client);
+
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("Database connection error: {}", e);
+            }
+        });
+
+        let _old = self
+            .client
+            .swap((Some(Owned::new(new_client)), Tag::None), Ordering::AcqRel);
+
+        Ok(())
+    }
+
+    pub async fn query(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<Row>> {
+        let client_handle: Arc<Client> = {
+            let guard = Guard::new();
+            let shared = self.client.load(Ordering::Acquire, &guard);
+            shared
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("Database client is not initialized"))?
+        };
+
+        match client_handle.query(sql, params).await {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                info!("Database query failed: {}. Trying to reconnect...", e);
+                if self.should_reconnect(&e) {
+                    self.reconnect().await?;
+                }
+
+                let retry_handle: Arc<Client> = {
+                    let guard = Guard::new();
+                    let shared = self.client.load(Ordering::Acquire, &guard);
+                    shared.as_ref().cloned().ok_or_else(|| {
+                        anyhow!("Database client is not initialized after reconnect")
+                    })?
+                };
+
+                Ok(retry_handle.query(sql, params).await?)
+            }
+        }
     }
 }
 
@@ -175,7 +287,7 @@ impl KeysUpdater {
     LEFT JOIN api_keys a ON u.id = a.user_id
     GROUP BY u.id;
 "#;
-        let rows = self.db.client.query(query, &[]).await?;
+        let rows = self.db.query(query, &[]).await?;
 
         let mut new_keys: foldhash::HashMap<Uuid, Vec<Uuid>> =
             foldhash::HashMap::with_capacity(rows.len());
