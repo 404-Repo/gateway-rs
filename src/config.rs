@@ -63,6 +63,7 @@ pub struct RaftConfig {
     pub heartbeat_interval: u64,
     pub max_payload_entries: u64,
     pub replication_lag_threshold: u64,
+    pub snapshot_logs_since_last: u64,
     pub snapshot_max_chunk_size: u64,
     pub max_in_snapshot_log_to_keep: u64,
 }

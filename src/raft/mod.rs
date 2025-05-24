@@ -332,6 +332,9 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
             replication_lag_threshold: config.raft.replication_lag_threshold,
             snapshot_max_chunk_size: config.raft.snapshot_max_chunk_size,
             max_in_snapshot_log_to_keep: config.raft.max_in_snapshot_log_to_keep,
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                config.raft.snapshot_logs_since_last,
+            ),
             ..Default::default()
         }
         .validate()?,
@@ -499,7 +502,13 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
                         );
                         raft.write()
                             .await
-                            .add_learner(*id, BasicNode { addr: endpoint }, true)
+                            .add_learner(
+                                *id,
+                                BasicNode {
+                                    addr: endpoint.to_string(),
+                                },
+                                true,
+                            )
                             .await?;
                         Ok::<(), anyhow::Error>(())
                     }
@@ -514,7 +523,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
             let mut membership_nodes = BTreeMap::from([(
                 node_id,
                 BasicNode {
-                    addr: server_addr.clone(),
+                    addr: format!(
+                        "{}:{}",
+                        config.network.external_ip, config.network.server_port
+                    ),
                 },
             )]);
             if mode == GatewayMode::Vote {
@@ -526,16 +538,12 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
                             (
                                 id,
                                 BasicNode {
-                                    addr: endpoint.clone(),
+                                    addr: endpoint.to_string(),
                                 },
                             )
                         }),
                 );
             }
-            info!(
-                "Node {} initializing with membership configuration: {:?}",
-                node_id, membership_nodes
-            );
             match raft.write().await.initialize(membership_nodes).await {
                 Ok(_) => info!(
                     "Node {} successfully initialized in {} mode",
