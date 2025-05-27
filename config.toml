@@ -11,7 +11,7 @@ node_id_discovery_sleep = 3
 node_id_discovery_retries = 5
 
 [protocol]
-max_message_size = 65536
+max_message_size = 262144
 receive_message_timeout_ms = 5000
 
 [http]
@@ -66,11 +66,11 @@ level = "Info"
 
 [raft]
 cluster_name = "gateway_cluster"
-election_timeout_min = 1500
-election_timeout_max = 3000
+election_timeout_min = 5000
+election_timeout_max = 10000
 heartbeat_interval = 500
-max_payload_entries = 300
-replication_lag_threshold = 500
+max_payload_entries = 100
+replication_lag_threshold = 1200
 snapshot_logs_since_last = 1000
-snapshot_max_chunk_size = 128000
-max_in_snapshot_log_to_keep = 2000
+snapshot_max_chunk_size = 131072
+max_in_snapshot_log_to_keep = 1000

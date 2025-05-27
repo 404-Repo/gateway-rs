@@ -52,7 +52,7 @@ sdd = "3.0.8"
 hex = "0.4.3"
 schnorrkel = "0.11.4"
 base64 = "0.22.1"
-parity-scale-codec = { version = "3.7.4", features = ["derive"] }
+parity-scale-codec = { version = "3.7.5", features = ["derive"] }
 blake2 = "0.10.6"
 bs58 = "0.5.1"
 itertools = "0.14.0"
