@@ -1,24 +1,16 @@
 use foldhash::fast::RandomState;
 use scc::HashMap;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-#[derive(Deserialize)]
-pub struct TaskResultScored {
-    pub validator_hotkey: String,
-    pub miner_hotkey: String,
-    pub asset: Vec<u8>,
-    pub score: f32,
-    #[serde(skip_deserializing, default = "Instant::now")]
-    pub instant: Instant,
-}
+use crate::api::request::{AddTaskResultRequest, TaskResultType};
 
 struct TaskManagerInner {
-    completed: HashMap<Uuid, Vec<TaskResultScored>, RandomState>,
+    completed: HashMap<Uuid, Vec<AddTaskResultRequest>, RandomState>,
     expected_results: usize,
     execution_time: HashMap<Uuid, Instant, RandomState>,
 }
@@ -31,8 +23,9 @@ pub struct TaskManager {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum TaskStatus {
     NoResult,
+    Failure,
     PartialResult(usize),
-    Completed,
+    Success,
 }
 
 impl Default for TaskStatus {
@@ -87,7 +80,7 @@ impl TaskManager {
         self.cancel_token.cancel();
     }
 
-    pub async fn add_result(&self, task_id: Uuid, result: TaskResultScored) {
+    pub async fn add_result(&self, task_id: Uuid, result: AddTaskResultRequest) {
         self.inner
             .completed
             .entry(task_id)
@@ -97,19 +90,25 @@ impl TaskManager {
 
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
         match self.inner.completed.get(&task_id) {
-            Some(guard) if !guard.is_empty() => {
-                let count = guard.len();
+            Some(results) if !results.is_empty() => {
+                if results
+                    .iter()
+                    .any(|r| matches!(r.result, TaskResultType::Failure { .. }))
+                {
+                    return TaskStatus::Failure;
+                }
+                let count = results.len();
                 if count < self.inner.expected_results {
                     TaskStatus::PartialResult(count)
                 } else {
-                    TaskStatus::Completed
+                    TaskStatus::Success
                 }
             }
             _ => TaskStatus::NoResult,
         }
     }
 
-    pub async fn get_result(&self, task_id: Uuid) -> Option<Vec<TaskResultScored>> {
+    pub async fn get_result(&self, task_id: Uuid) -> Option<Vec<AddTaskResultRequest>> {
         self.inner
             .completed
             .remove(&task_id)
@@ -142,91 +141,104 @@ impl Clone for TaskManager {
     }
 }
 
-#[tokio::test]
-async fn test_cleanup() {
-    const CLEANUP_INTERVAL: Duration = Duration::from_millis(200);
-    const RESULT_LIFETIME: Duration = Duration::from_millis(400);
-    const EXPECTED_RESULTS: usize = 2;
-    const WAIT_DURATION: Duration = Duration::from_millis(600);
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
 
-    fn make_result(validator: &str, miner: &str, score: f32, instant: Instant) -> TaskResultScored {
-        TaskResultScored {
-            validator_hotkey: validator.to_string(),
-            miner_hotkey: miner.to_string(),
-            asset: vec![],
-            score,
-            instant,
+    use crate::api::request::TaskResultType;
+    use crate::common::task::AddTaskResultRequest;
+    use crate::common::task::TaskManager;
+    use crate::common::task::TaskStatus;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn test_cleanup() {
+        const CLEANUP_INTERVAL: Duration = Duration::from_millis(200);
+        const RESULT_LIFETIME: Duration = Duration::from_millis(400);
+        const EXPECTED_RESULTS: usize = 2;
+        const WAIT_DURATION: Duration = Duration::from_millis(600);
+
+        fn make_result(
+            validator: &str,
+            miner: &str,
+            score: f32,
+            instant: Instant,
+        ) -> AddTaskResultRequest {
+            AddTaskResultRequest {
+                validator_hotkey: validator.to_string(),
+                miner_hotkey: Some(miner.to_string()),
+                result: TaskResultType::Success {
+                    asset: vec![],
+                    score,
+                },
+                instant,
+            }
         }
+
+        let task_manager =
+            TaskManager::new(10, EXPECTED_RESULTS, CLEANUP_INTERVAL, RESULT_LIFETIME).await;
+        let now = Instant::now();
+
+        // Task 1: Incomplete, old result
+        let task_id1 = Uuid::new_v4();
+        task_manager
+            .add_result(
+                task_id1,
+                make_result("val1", "miner1", 0.5, now - Duration::from_millis(600)),
+            )
+            .await;
+
+        // Task 2: Complete, last result will expire
+        let task_id2 = Uuid::new_v4();
+        task_manager
+            .add_result(
+                task_id2,
+                make_result("val2a", "miner2a", 0.6, now - Duration::from_millis(600)),
+            )
+            .await;
+        task_manager
+            .add_result(
+                task_id2,
+                make_result("val2b", "miner2b", 0.7, now - Duration::from_millis(200)),
+            )
+            .await;
+
+        // Task 3: Complete, last result recent but will expire
+        let task_id3 = Uuid::new_v4();
+        task_manager
+            .add_result(
+                task_id3,
+                make_result("val3a", "miner3a", 0.8, now - Duration::from_millis(100)),
+            )
+            .await;
+        task_manager
+            .add_result(
+                task_id3,
+                make_result("val3b", "miner3b", 0.9, now - Duration::from_millis(100)),
+            )
+            .await;
+
+        assert_eq!(
+            task_manager.get_status(task_id1).await,
+            TaskStatus::PartialResult(1)
+        );
+        assert_eq!(task_manager.get_status(task_id2).await, TaskStatus::Success);
+        assert_eq!(task_manager.get_status(task_id3).await, TaskStatus::Success);
+
+        tokio::time::sleep(WAIT_DURATION).await;
+
+        assert_eq!(
+            task_manager.get_status(task_id1).await,
+            TaskStatus::NoResult
+        );
+        assert_eq!(
+            task_manager.get_status(task_id2).await,
+            TaskStatus::NoResult
+        );
+        assert_eq!(
+            task_manager.get_status(task_id3).await,
+            TaskStatus::NoResult
+        );
     }
-
-    let task_manager =
-        TaskManager::new(10, EXPECTED_RESULTS, CLEANUP_INTERVAL, RESULT_LIFETIME).await;
-    let now = Instant::now();
-
-    // Task 1: Incomplete, old result
-    let task_id1 = Uuid::new_v4();
-    task_manager
-        .add_result(
-            task_id1,
-            make_result("val1", "miner1", 0.5, now - Duration::from_millis(600)),
-        )
-        .await;
-
-    // Task 2: Complete, last result will expire
-    let task_id2 = Uuid::new_v4();
-    task_manager
-        .add_result(
-            task_id2,
-            make_result("val2a", "miner2a", 0.6, now - Duration::from_millis(600)),
-        )
-        .await;
-    task_manager
-        .add_result(
-            task_id2,
-            make_result("val2b", "miner2b", 0.7, now - Duration::from_millis(200)),
-        )
-        .await;
-
-    // Task 3: Complete, last result recent but will expire
-    let task_id3 = Uuid::new_v4();
-    task_manager
-        .add_result(
-            task_id3,
-            make_result("val3a", "miner3a", 0.8, now - Duration::from_millis(100)),
-        )
-        .await;
-    task_manager
-        .add_result(
-            task_id3,
-            make_result("val3b", "miner3b", 0.9, now - Duration::from_millis(100)),
-        )
-        .await;
-
-    assert_eq!(
-        task_manager.get_status(task_id1).await,
-        TaskStatus::PartialResult(1)
-    );
-    assert_eq!(
-        task_manager.get_status(task_id2).await,
-        TaskStatus::Completed
-    );
-    assert_eq!(
-        task_manager.get_status(task_id3).await,
-        TaskStatus::Completed
-    );
-
-    tokio::time::sleep(WAIT_DURATION).await;
-
-    assert_eq!(
-        task_manager.get_status(task_id1).await,
-        TaskStatus::NoResult
-    );
-    assert_eq!(
-        task_manager.get_status(task_id2).await,
-        TaskStatus::NoResult
-    );
-    assert_eq!(
-        task_manager.get_status(task_id3).await,
-        TaskStatus::NoResult
-    );
 }

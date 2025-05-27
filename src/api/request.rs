@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use std::time::Instant;
 use uuid::Uuid;
 
 use super::response::GatewayInfo;
@@ -29,15 +30,47 @@ pub struct GetTaskStatus {
     pub id: Uuid,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct AddTaskResultRequest {
-    pub id: Uuid,
-    pub signature: String,
-    pub timestamp: String,
     pub validator_hotkey: String,
-    pub miner_hotkey: String,
-    pub asset: Vec<u8>,
-    pub score: f32,
+    pub miner_hotkey: Option<String>,
+    pub result: TaskResultType,
+    #[serde(skip_deserializing, default = "Instant::now")]
+    pub instant: Instant,
+}
+
+impl AddTaskResultRequest {
+    pub fn get_score(&self) -> Option<f32> {
+        match &self.result {
+            TaskResultType::Success { score, .. } => Some(*score),
+            TaskResultType::Failure { .. } => None,
+        }
+    }
+
+    pub fn get_asset(&mut self) -> Option<Vec<u8>> {
+        if let TaskResultType::Success { asset, .. } = &mut self.result {
+            Some(std::mem::take(asset))
+        } else {
+            None
+        }
+    }
+
+    pub fn into_asset(self) -> Option<Vec<u8>> {
+        match self.result {
+            TaskResultType::Success { asset, .. } => Some(asset),
+            TaskResultType::Failure { .. } => None,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self.result, TaskResultType::Success { .. })
+    }
+}
+
+#[derive(Deserialize)]
+pub enum TaskResultType {
+    Success { asset: Vec<u8>, score: f32 },
+    Failure { reason: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]

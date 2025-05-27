@@ -19,12 +19,12 @@ use salvo::rate_limiter::{
 
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::request::{
     AddTaskRequest, AddTaskResultRequest, GatewayInfoExt, GetTaskResultRequest, GetTaskStatus,
-    GetTasksRequest, UpdateGenericKeyRequest,
+    GetTasksRequest, TaskResultType, UpdateGenericKeyRequest,
 };
 use crate::api::response::{
     GenericKeyResponse, GetTaskStatusResponse, GetTasksResponse, LeaderResponse, LoadResponse,
@@ -34,7 +34,6 @@ use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
-use crate::common::task::TaskResultScored;
 use crate::config::HTTPConfig;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
@@ -136,14 +135,22 @@ async fn add_task_handler(
 }
 
 // curl -X POST https://gateway.404.xyz:4443/add_result \
-//   -H "Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW" \
-//   --form 'id="123e4567-e89b-12d3-a456-426614174001"' \
-//   --form 'signature="signature"' \
-//   --form 'timestamp="404_GATEWAY_1713096000"' \
-//   --form 'validator_hotkey="validator_key_123"' \
-//   --form 'miner_hotkey="miner_key_456"' \
-//   --form 'asset=@/path/to/asset.spz' \
-//   --form 'score="0.95"'
+//   -F id=123e4567-e89b-12d3-a456-426614174001 \
+//   -F signature=signature \
+//   -F timestamp=404_GATEWAY_1713096000 \
+//   -F validator_hotkey=validator_key_123 \
+//   -F miner_hotkey=miner_key_456 \
+//   -F status=success \
+//   -F asset=@/path/to/asset.spz \
+//   -F score=0.95
+
+// curl -X POST https://gateway.404.xyz:4443/add_result \
+//   -F id=123e4567-e89b-12d3-a456-426614174001 \
+//   -F signature=signature \
+//   -F timestamp=404_GATEWAY_1713096000 \
+//   -F validator_hotkey=validator_key_123 \
+//   -F status=failure \
+//   -F reason="Task timed out"
 #[handler]
 async fn add_result_handler(
     depot: &mut Depot,
@@ -166,10 +173,10 @@ async fn add_result_handler(
         ));
     }
 
-    let parts: Vec<&str> = content_type.split(';').map(|s| s.trim()).collect();
-    let boundary = parts
-        .iter()
-        .find(|&&part| part.to_lowercase().starts_with("boundary="))
+    let boundary = content_type
+        .split(';')
+        .map(|s| s.trim())
+        .find(|part| part.to_lowercase().starts_with("boundary="))
         .and_then(|part| part.split('=').nth(1))
         .ok_or(ServerError::BadRequest(
             "Missing boundary in Content-Type".into(),
@@ -201,10 +208,16 @@ async fn add_result_handler(
             "timestamp",
             "validator_hotkey",
             "miner_hotkey",
+            "status",
             "asset",
             "score",
+            "reason",
         ])
-        .size_limit(SizeLimit::new().whole_stream(http_cfg.request_file_size_limit));
+        .size_limit(
+            SizeLimit::new()
+                .whole_stream(http_cfg.request_file_size_limit)
+                .for_field("reason", u8::MAX as u64),
+        );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
 
@@ -213,49 +226,51 @@ async fn add_result_handler(
     let mut timestamp = None;
     let mut validator_hotkey = None;
     let mut miner_hotkey = None;
+    let mut status = None;
     let mut asset = None;
     let mut score = None;
+    let mut reason = None;
 
     while let Some(mut field) = multipart
         .next_field()
         .await
-        .map_err(|e| ServerError::BadRequest(format!("Failed to read field: {}", e)))?
+        .map_err(|e| ServerError::BadRequest(format!("Field error: {}", e)))?
     {
         let name = field
             .name()
-            .ok_or(ServerError::BadRequest("Field missing name".into()))?
-            .to_string();
+            .ok_or_else(|| ServerError::BadRequest("Unnamed field".into()))?;
 
-        match name.as_str() {
+        match name {
             "id" => {
-                let id_str = field
-                    .text()
-                    .await
-                    .map_err(|e| ServerError::BadRequest(format!("Failed to read id: {}", e)))?;
                 id =
-                    Some(Uuid::parse_str(&id_str).map_err(|e| {
-                        ServerError::BadRequest(format!("Invalid id format: {}", e))
-                    })?);
+                    Some(field.text().await.map_err(|e| {
+                        ServerError::BadRequest(format!("Failed to read id: {}", e))
+                    })?)
             }
             "signature" => {
                 signature = Some(field.text().await.map_err(|e| {
                     ServerError::BadRequest(format!("Failed to read signature: {}", e))
-                })?);
+                })?)
             }
             "timestamp" => {
                 timestamp = Some(field.text().await.map_err(|e| {
                     ServerError::BadRequest(format!("Failed to read timestamp: {}", e))
-                })?);
+                })?)
             }
             "validator_hotkey" => {
                 validator_hotkey = Some(field.text().await.map_err(|e| {
                     ServerError::BadRequest(format!("Failed to read validator_hotkey: {}", e))
-                })?);
+                })?)
             }
             "miner_hotkey" => {
                 miner_hotkey = Some(field.text().await.map_err(|e| {
                     ServerError::BadRequest(format!("Failed to read miner_hotkey: {}", e))
-                })?);
+                })?)
+            }
+            "status" => {
+                status = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read status: {}", e))
+                })?)
             }
             "asset" => {
                 let mut content = Vec::new();
@@ -267,29 +282,63 @@ async fn add_result_handler(
                 asset = Some(content);
             }
             "score" => {
-                let score_text = field
-                    .text()
-                    .await
-                    .map_err(|e| ServerError::BadRequest(format!("Failed to read score: {}", e)))?;
-                score = Some(score_text.parse::<f32>().map_err(|e| {
-                    ServerError::BadRequest(format!("Invalid score format: {}", e))
-                })?);
+                score = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Failed to read score: {}", e))
+                        })?
+                        .parse::<f32>()
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Invalid score format: {}", e))
+                        })?,
+                )
+            }
+            "reason" => {
+                reason = Some(field.text().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read reason: {}", e))
+                })?)
             }
             _ => continue,
         }
     }
 
-    let add_result = AddTaskResultRequest {
-        id: id.ok_or(ServerError::BadRequest("Missing id field".into()))?,
-        signature: signature.ok_or(ServerError::BadRequest("Missing signature field".into()))?,
-        timestamp: timestamp.ok_or(ServerError::BadRequest("Missing timestamp field".into()))?,
-        validator_hotkey: validator_hotkey.ok_or(ServerError::BadRequest(
-            "Missing validator_hotkey field".into(),
-        ))?,
-        miner_hotkey: miner_hotkey
-            .ok_or(ServerError::BadRequest("Missing miner_hotkey field".into()))?,
-        asset: asset.ok_or(ServerError::BadRequest("Missing asset field".into()))?,
-        score: score.ok_or(ServerError::BadRequest("Missing score field".into()))?,
+    let id = id.ok_or(ServerError::BadRequest("Missing id field".into()))?;
+    let signature = signature.ok_or(ServerError::BadRequest("Missing signature field".into()))?;
+    let timestamp = timestamp.ok_or(ServerError::BadRequest("Missing timestamp field".into()))?;
+    let validator_hotkey = validator_hotkey.ok_or(ServerError::BadRequest(
+        "Missing validator_hotkey field".into(),
+    ))?;
+    let status = status.ok_or(ServerError::BadRequest("Missing status field".into()))?;
+
+    let task_id = Uuid::parse_str(&id)
+        .map_err(|e| ServerError::BadRequest(format!("Invalid id format: {}", e)))?;
+
+    let task_result = match status.as_str() {
+        "success" => {
+            let asset = asset.ok_or(ServerError::BadRequest("Missing asset for success".into()))?;
+            let score = score.ok_or(ServerError::BadRequest("Missing score for success".into()))?;
+            let miner_hotkey =
+                miner_hotkey.ok_or(ServerError::BadRequest("Missing miner_hotkey field".into()))?;
+            AddTaskResultRequest {
+                validator_hotkey,
+                miner_hotkey: Some(miner_hotkey),
+                result: TaskResultType::Success { asset, score },
+                instant: Instant::now(),
+            }
+        }
+        "failure" => {
+            let reason =
+                reason.ok_or(ServerError::BadRequest("Missing reason for failure".into()))?;
+            AddTaskResultRequest {
+                validator_hotkey,
+                miner_hotkey: None,
+                result: TaskResultType::Failure { reason },
+                instant: Instant::now(),
+            }
+        }
+        _ => return Err(ServerError::BadRequest("Invalid status".into())),
     };
 
     let subnet_state = depot
@@ -297,15 +346,15 @@ async fn add_result_handler(
         .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
 
     subnet_state
-        .validate_hotkey(&add_result.validator_hotkey)
+        .validate_hotkey(&task_result.validator_hotkey)
         .map_err(|e| {
             ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
         })?;
 
     verify_hotkey(
-        &add_result.timestamp,
-        &add_result.validator_hotkey,
-        &add_result.signature,
+        &timestamp,
+        &task_result.validator_hotkey,
+        &signature,
         http_cfg.signature_freshness_threshold,
     )
     .map_err(|e| ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e)))?;
@@ -313,31 +362,34 @@ async fn add_result_handler(
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
         ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
     })?;
-
-    let id = add_result.id;
-    let result = TaskResultScored {
-        validator_hotkey: add_result.validator_hotkey,
-        miner_hotkey: add_result.miner_hotkey,
-        asset: add_result.asset,
-        score: add_result.score,
-        instant: Instant::now(),
-    };
-
-    info!(
-        "Received result for task {} from validator {} and miner {}",
-        id, &result.validator_hotkey, &result.miner_hotkey
-    );
-
+    let manager = gateway_state.task_manager();
     let metrics = depot
         .obtain::<Metrics>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
 
-    metrics.inc_task_completed(&result.validator_hotkey);
+    match &task_result.result {
+        TaskResultType::Success { score, .. } => {
+            info!(
+                "Task {} succeeded from validator {}, miner {}, score {}",
+                task_id,
+                &task_result.validator_hotkey,
+                &task_result.miner_hotkey.as_ref().map_or("Unknown", |v| v),
+                score
+            );
+            metrics.inc_task_completed(&task_result.validator_hotkey);
+        }
+        TaskResultType::Failure { reason } => {
+            warn!(
+                "Task {} failed from validator {}, reason: {}",
+                task_id, &task_result.validator_hotkey, reason
+            );
+            metrics.inc_task_failed(&task_result.validator_hotkey);
+        }
+    }
 
-    let manager = gateway_state.task_manager();
-    metrics.record_completion_time(&result.validator_hotkey, manager.get_time(id));
-    manager.add_result(id, result).await;
-    manager.remove_time(id);
+    metrics.record_completion_time(&task_result.validator_hotkey, manager.get_time(task_id));
+    manager.add_result(task_id, task_result).await;
+    manager.remove_time(task_id);
 
     res.status_code(StatusCode::OK);
     res.render(Text::Plain("Ok"));
@@ -378,49 +430,64 @@ pub async fn get_result_handler(
         )));
     }
 
+    let mut successful_results: Vec<AddTaskResultRequest> =
+        results_vec.drain(..).filter(|r| r.is_success()).collect();
+
+    if successful_results.is_empty() {
+        return Err(ServerError::NotFound(format!(
+            "No successful results found for task ID {}",
+            get_task.id
+        )));
+    }
+
     let metrics = depot
         .obtain::<Metrics>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
 
     let (content_type, content_disposition, body, best_validator) = if get_task.all {
-        results_vec.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        successful_results.sort_by(|a, b| {
+            let a_score = a.get_score().unwrap_or(0.0);
+            let b_score = b.get_score().unwrap_or(0.0);
+            b_score
+                .partial_cmp(&a_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let best_validator = results_vec
+
+        let best_validator = successful_results
             .first()
             .map(|r| r.validator_hotkey.clone())
-            .ok_or_else(|| {
-                ServerError::Internal(format!(
-                    "Failed to find best result for task ID {}",
-                    get_task.id
-                ))
-            })?;
+            .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?;
 
         let mut buffer = Vec::new();
         let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
-        for (i, file) in results_vec.into_iter().enumerate() {
+
+        for (i, result) in successful_results.iter_mut().enumerate() {
+            let asset = result.get_asset().ok_or_else(|| {
+                ServerError::Internal("Missing asset on TaskResult during ZIP build".into())
+            })?;
+
             let entry = ZipEntryBuilder::new(
                 format!("{}.spz", i + 1).into(),
                 async_zip::Compression::Stored,
             )
             .build();
+
             zip_writer
-                .write_entry_whole(entry, &file.asset)
+                .write_entry_whole(entry, &asset)
                 .await
                 .map_err(|e| {
                     ServerError::Internal(format!(
-                        "Failed to write zip entry {} for task ID {}: {:?}",
+                        "Failed to write ZIP entry {} for task {}: {:?}",
                         i + 1,
                         get_task.id,
                         e
                     ))
                 })?;
         }
+
         zip_writer.close().await.map_err(|e| {
             ServerError::Internal(format!(
-                "Failed to close zip archive for task ID {}: {:?}",
+                "Failed to close ZIP archive for task {}: {:?}",
                 get_task.id, e
             ))
         })?;
@@ -432,24 +499,27 @@ pub async fn get_result_handler(
             best_validator,
         )
     } else {
-        let best = results_vec
+        let best = successful_results
             .into_iter()
             .max_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
+                let a_score = a.get_score().unwrap_or(0.0);
+                let b_score = b.get_score().unwrap_or(0.0);
+                b_score
+                    .partial_cmp(&a_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .ok_or_else(|| {
-                ServerError::Internal(format!(
-                    "Failed to find the best result for task ID {}",
-                    get_task.id
-                ))
-            })?;
+            .ok_or_else(|| ServerError::Internal("Failed to select best TaskResult".into()))?;
+
         let best_validator = best.validator_hotkey.clone();
+
+        let asset = best
+            .into_asset()
+            .ok_or_else(|| ServerError::Internal("Missing asset on best TaskResult".into()))?;
+
         (
             "application/octet-stream",
             "attachment; filename=\"result.spz\"",
-            best.asset,
+            asset,
             best_validator,
         )
     };
@@ -569,11 +639,13 @@ async fn get_tasks_handler(
 
     metrics.inc_tasks_received(&get_tasks.validator_hotkey, tasks.len());
 
-    info!(
-        "Validator {} received {} tasks",
-        get_tasks.validator_hotkey,
-        tasks.len()
-    );
+    if !tasks.is_empty() {
+        info!(
+            "Validator {} received {} tasks",
+            get_tasks.validator_hotkey,
+            tasks.len()
+        );
+    }
 
     let response = GetTasksResponse { tasks, gateways };
     res.render(Json(response));

@@ -8,8 +8,7 @@ pub struct MetricsEntry {
     pub completion_time_avg: Gauge,
     pub completion_time_max: Gauge,
     pub completed_tasks: Counter,
-    // TODO: Implement failed_tasks
-    pub _failed_tasks: Counter,
+    pub failed_tasks: Counter,
     pub tasks_received: Counter,
     pub best_results_total: Gauge,
 }
@@ -114,7 +113,7 @@ impl Metrics {
                 completion_time_avg: self.inner.completion_time_avg.with_label_values(&[key]),
                 completion_time_max: self.inner.completion_time_max.with_label_values(&[key]),
                 completed_tasks: self.inner.completed_tasks.with_label_values(&[key]),
-                _failed_tasks: self.inner.failed_tasks.with_label_values(&[key]),
+                failed_tasks: self.inner.failed_tasks.with_label_values(&[key]),
                 tasks_received: self.inner.tasks_received.with_label_values(&[key]),
                 best_results_total: self.inner.best_results_total.with_label_values(&[key]),
             });
@@ -150,8 +149,8 @@ impl Metrics {
         self.get_entry(key).completed_tasks.inc();
     }
 
-    pub fn _inc_task_failed(&self, key: &str) {
-        self.get_entry(key)._failed_tasks.inc();
+    pub fn inc_task_failed(&self, key: &str) {
+        self.get_entry(key).failed_tasks.inc();
     }
 
     pub fn inc_best_task(&self, key: &str) {
