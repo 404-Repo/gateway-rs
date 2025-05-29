@@ -6,7 +6,7 @@ on:
 jobs:
   bake-push:
     name: Bake and push images to Google Cloud
-    runs-on: 404Runner
+    runs-on: ubuntu-24.04
     permissions:
       contents: 'read'
       id-token: 'write'
