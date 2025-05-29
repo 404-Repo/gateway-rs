@@ -6,7 +6,7 @@ on:
 jobs:
   bake-push:
     name: Bake and push images to Google Cloud
-    runs-on: ubuntu-24.04
+    runs-on: 404Runner
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -21,7 +21,10 @@ jobs:
           project_id: gen-456515
           workload_identity_provider: projects/369621634572/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-404-repo
       - 
-        name: Configure Docker to use gcloud
+        name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v2'
+        
+      - name: Configure Docker to use gcloud
         run: |
           gcloud auth configure-docker europe-docker.pkg.dev
       -
@@ -30,9 +33,6 @@ jobs:
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - 
-        name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v2'
       -
         name: Set version from SHA7
         run: |
@@ -42,7 +42,6 @@ jobs:
         if: ${{ github.ref_type == 'tag' }}
         run: |
           echo "DOCKER_TAG=$GITHUB_REF_NAME" >> $GITHUB_ENV
-        
       -
         name: Build and push
         uses: docker/bake-action@v6
