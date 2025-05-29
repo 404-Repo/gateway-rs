@@ -11,7 +11,7 @@ group "default" {
 }
 
 target "gen404-image" {
-  platforms  = ["linux/amd64","linux/arm64"]
+  platforms  = ["linux/amd64"]
   context = "."
   dockerfile = "Dockerfile"
   tags = [
