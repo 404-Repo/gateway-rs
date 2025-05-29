@@ -1,2 +1,33 @@
-target
-logs
+# Git
+.git
+.gitignore
+.github
+
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Development environment
+/dev-env
+.cargo/.package-cache
+.cargo/registry
+.cargo/git
+
+# Editor files
+.vscode
+.idea
+*.swp
+*.swo
+
+# Logs
+/logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.old
+
+# Documentation
+*.md
+LICENSE
