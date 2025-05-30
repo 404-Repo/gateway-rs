@@ -42,7 +42,7 @@ impl RClient {
         } else {
             let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
             rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()?
+                .with_protocol_versions(&[&rustls::version::TLS13])?
                 .with_platform_verifier()
                 .with_no_client_auth()
         };

@@ -91,9 +91,10 @@ pub fn generate_self_signed_config() -> Result<ServerConfig> {
     let key = rcgen_cert.key_pair.serialize_der();
     let cert_der: CertificateDer<'static> = rcgen_cert.cert.der().to_vec().into();
 
-    let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], PrivateKeyDer::Pkcs8(key.into()))?;
+    let mut rustls_config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key.into()))?;
 
     rustls_config.alpn_protocols = vec![b"h3".to_vec()];
 

@@ -9,6 +9,7 @@ use futures::TryStreamExt;
 use http::HeaderValue;
 use multer::{Constraints, Multipart};
 use prometheus::{Encoder as _, TextEncoder, TEXT_FORMAT};
+use rustls::SupportedProtocolVersion;
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
@@ -942,6 +943,9 @@ impl Http3Server {
             rate_limits,
             http_config.clone(),
         );
+
+        const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+        let tls_config = tls_config.tls_versions(TLS13_ONLY);
 
         let join_handle = tokio::spawn(async move {
             let tcp_listener = TcpListener::new(addr).rustls(tls_config.clone());
