@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::raft::client::RClientBuilder;
     use crate::raft::init_crypto_provider;
     use crate::raft::LogStore;
     use crate::raft::Network;
@@ -8,7 +9,7 @@ mod tests {
     use crate::raft::Request;
     use crate::raft::StateMachineStore;
     use crate::{
-        config::ProtocolConfig,
+        config::RServerConfig,
         raft::{client::RClient, server::RServer},
     };
     use anyhow::{bail, Result};
@@ -43,7 +44,7 @@ mod tests {
         let network = Network::new(node_clients.clone());
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
-        let pcfg = ProtocolConfig::default();
+        let pcfg = RServerConfig::default();
         let raft = Arc::new(RwLock::new(
             openraft::Raft::new(
                 node_id,
@@ -63,14 +64,14 @@ mod tests {
         node_clients: Arc<scc::HashMap<String, RClient, RandomState>>,
     ) -> Result<(
         Arc<Config>,
-        ProtocolConfig,
+        RServerConfig,
         Vec<Arc<RwLock<Raft>>>,
         Vec<Arc<StateMachineStore>>,
         Vec<RServer>,
     )> {
         init_crypto_provider().unwrap();
 
-        let pcfg = ProtocolConfig::default();
+        let pcfg = RServerConfig::default();
         let config = Arc::new(
             openraft::Config {
                 heartbeat_interval: 500,
@@ -273,8 +274,14 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 22001 + i;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client =
-                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
+            let client = RClientBuilder::new()
+                .remote_addr(server_addr)
+                .server_name("localhost")
+                .local_bind_addr(&client_addr)
+                .dangerous_skip_verification(true)
+                .protocol_cfg(pcfg.clone())
+                .build()
+                .await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -362,8 +369,14 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 25001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client =
-                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
+            let client = RClientBuilder::new()
+                .remote_addr(server_addr)
+                .server_name("localhost")
+                .local_bind_addr(&client_addr)
+                .dangerous_skip_verification(true)
+                .protocol_cfg(pcfg.clone())
+                .build()
+                .await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -463,8 +476,14 @@ mod tests {
         for (i, &(_, server_addr)) in node_configs.iter().enumerate() {
             let client_port = 26001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client =
-                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
+            let client = RClientBuilder::new()
+                .remote_addr(server_addr)
+                .server_name("localhost")
+                .local_bind_addr(&client_addr)
+                .dangerous_skip_verification(true)
+                .protocol_cfg(pcfg.clone())
+                .build()
+                .await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -575,8 +594,14 @@ mod tests {
         for (i, &(_, server_addr)) in initial_configs.iter().enumerate() {
             let client_port = 28001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client =
-                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
+            let client = RClientBuilder::new()
+                .remote_addr(server_addr)
+                .server_name("localhost")
+                .local_bind_addr(&client_addr)
+                .dangerous_skip_verification(true)
+                .protocol_cfg(pcfg.clone())
+                .build()
+                .await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -639,8 +664,14 @@ mod tests {
 
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:28004".to_string();
-        let new_client =
-            RClient::new(new_node_addr, "localhost", &new_client_addr, true, pcfg).await?;
+        let new_client = RClientBuilder::new()
+            .remote_addr(new_node_addr)
+            .server_name("localhost")
+            .local_bind_addr(&new_client_addr)
+            .dangerous_skip_verification(true)
+            .protocol_cfg(pcfg)
+            .build()
+            .await?;
         node_clients
             .insert(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -693,8 +724,14 @@ mod tests {
         for (i, &(_, server_addr)) in initial_configs.iter().enumerate() {
             let client_port = 30001 + i as u16;
             let client_addr = format!("127.0.0.1:{}", client_port);
-            let client =
-                RClient::new(server_addr, "localhost", &client_addr, true, pcfg.clone()).await?;
+            let client = RClientBuilder::new()
+                .remote_addr(server_addr)
+                .server_name("localhost")
+                .local_bind_addr(&client_addr)
+                .dangerous_skip_verification(true)
+                .protocol_cfg(pcfg.clone())
+                .build()
+                .await?;
             node_clients
                 .insert(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -739,8 +776,15 @@ mod tests {
 
         // Create a client connection for the new node.
         let new_client_addr = "127.0.0.1:30004".to_string();
-        let new_client =
-            RClient::new(new_node_addr, "localhost", &new_client_addr, true, pcfg).await?;
+        let new_client = RClientBuilder::new()
+            .remote_addr(new_node_addr)
+            .server_name("localhost")
+            .local_bind_addr(&new_client_addr)
+            .dangerous_skip_verification(true)
+            .protocol_cfg(pcfg)
+            .build()
+            .await?;
+
         node_clients
             .insert(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;

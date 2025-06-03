@@ -2,6 +2,7 @@ use foldhash::fast::RandomState;
 use foldhash::HashSetExt as _;
 use scc::{HashMap, Queue};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ struct Inner<T> {
     q: Queue<QueueEntry<T>>,
     sent: HashMap<(Uuid, String), (), RandomState>,
     ttl: Duration,
+    len: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -62,6 +64,7 @@ impl DupQueueBuilder {
             q: Queue::default(),
             sent: HashMap::with_capacity_and_hasher(SENTMAP_START_CAPACITY, RandomState::default()),
             ttl: self.ttl,
+            len: AtomicUsize::new(0),
         });
         let cleanup_interval = self.cleanup_interval;
         let weak_inner = Arc::downgrade(&inner);
@@ -75,6 +78,7 @@ impl DupQueueBuilder {
                     .pop_if(|entry| entry.timestamp.elapsed() > inner.ttl)
                 {
                     expired_ids.insert(*shared.item.id());
+                    inner.len.fetch_sub(1, Ordering::Relaxed);
                 }
 
                 if !expired_ids.is_empty() {
@@ -107,6 +111,7 @@ where
             timestamp: Instant::now(),
         };
         self.inner.q.push(entry);
+        self.inner.len.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn pop(&self, num: usize, hotkey: &str) -> Vec<(T, Option<Duration>)> {
@@ -118,6 +123,7 @@ where
         while result.len() < num && scanned < initial_len {
             match self.inner.q.pop() {
                 Some(shared) => {
+                    self.inner.len.fetch_sub(1, Ordering::Relaxed);
                     scanned += 1;
                     let mut entry = (*shared).clone();
                     let key = (*entry.item.id(), hotkey.to_string());
@@ -136,6 +142,7 @@ where
 
                     // If there are still duplicates left, put it back on the queue
                     if entry.count > 0 {
+                        self.inner.len.fetch_add(1, Ordering::Relaxed);
                         self.inner.q.push((*entry).clone());
                     }
                 }
@@ -152,7 +159,7 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.inner.q.len()
+        self.inner.len.load(Ordering::Relaxed)
     }
 }
 
@@ -281,13 +288,11 @@ mod tests {
 
     #[test]
     fn heavy_contention_pop() {
-        let q = Arc::new(
-            DupQueue::<Task>::builder()
-                .dup(3)
-                .ttl(10)
-                .cleanup_interval(1)
-                .build(),
-        );
+        let q = DupQueue::<Task>::builder()
+            .dup(1)
+            .ttl(10)
+            .cleanup_interval(1)
+            .build();
 
         let number_of_tasks = 10_000;
         let producers = 2;
@@ -295,7 +300,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(4 + producers));
 
         for _ in 0..producers {
-            let q_producer = Arc::clone(&q);
+            let q_producer = q.clone();
             let b_producer = Arc::clone(&barrier);
             thread::spawn(move || {
                 b_producer.wait();
@@ -310,7 +315,7 @@ mod tests {
         let b_consumer = Arc::clone(&barrier);
 
         for _ in 0..consumers {
-            let q_consumer = Arc::clone(&q);
+            let q_consumer = q.clone();
             let b_consumer = Arc::clone(&b_consumer);
             let counter = Arc::clone(&counter);
             handles.push(thread::spawn(move || {
@@ -339,7 +344,22 @@ mod tests {
             handle.join().expect("Thread panicked");
         }
 
+        assert_eq!(q.len(), 0);
         assert_eq!(counter.load(Ordering::Relaxed), producers * number_of_tasks);
+
+        let q = DupQueue::<Task>::builder()
+            .dup(1)
+            .ttl(2)
+            .cleanup_interval(1)
+            .build();
+
+        for i in 0..100 {
+            q.push(create_task(&i.to_string()));
+        }
+        assert_eq!(q.len(), 100);
+
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(q.len(), 0);
     }
 
     #[test]

@@ -35,18 +35,28 @@ pub struct NetworkConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ProtocolConfig {
+pub struct RServerConfig {
     pub max_message_size: usize,
     pub receive_message_timeout_ms: u64,
+    pub max_idle_timeout_sec: u64,
+    pub keep_alive_interval_sec: u64,
 }
 
-impl Default for ProtocolConfig {
+impl Default for RServerConfig {
     fn default() -> Self {
         Self {
             max_message_size: 64 * 1024,
             receive_message_timeout_ms: 2000,
+            max_idle_timeout_sec: 4,
+            keep_alive_interval_sec: 1,
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RClientConfig {
+    pub max_idle_timeout_sec: u64,
+    pub keep_alive_interval_sec: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +103,11 @@ pub struct HTTPConfig {
     pub subnet_poll_interval_sec: u64,
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
+    // HTTP/3 client timeouts
+    pub post_timeout_sec: u64,
+    pub get_timeout_sec: u64,
+    pub max_idle_timeout_sec: u64,
+    pub keep_alive_interval_sec: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,7 +132,8 @@ pub struct Certificate {
 pub struct NodeConfig {
     pub basic: BasicConfig,
     pub network: NetworkConfig,
-    pub protocol: ProtocolConfig,
+    pub rserver: RServerConfig,
+    pub rclient: RClientConfig,
     pub http: HTTPConfig,
     pub db: DbConfig,
     pub cert: Certificate,
@@ -230,7 +246,7 @@ impl fmt::Display for NodeConfig {
         writeln!(
             f,
             "    Max Message Size: {} bytes",
-            self.protocol.max_message_size
+            self.rserver.max_message_size
         )?;
 
         writeln!(f, "\n  [HTTP]")?;

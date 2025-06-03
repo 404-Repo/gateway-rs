@@ -36,7 +36,7 @@ backon = "1.5.1"
 openraft = { version = "0.9.18", features = ["storage-v2", "serde"] }
 tokio-postgres-rustls = "0.13.0"
 rustls = { version = "0.23.27" }
-rustls-platform-verifier = "0.5.3"
+rustls-platform-verifier = "0.6.0"
 rustls-pemfile = "2.2.0"
 toml = "0.8.22"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }

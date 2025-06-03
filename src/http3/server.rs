@@ -186,13 +186,11 @@ async fn add_result_handler(
     let raw_stream = req
         .take_body()
         .into_stream()
-        .map_err(|err| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Stream error: {}", err))
-        })
+        .map_err(|err| std::io::Error::other(format!("Stream error: {}", err)))
         .and_then(|frame| async move {
-            frame.into_data().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "Frame data error".to_string())
-            })
+            frame
+                .into_data()
+                .map_err(|_| std::io::Error::other("Frame data error".to_string()))
         });
 
     let stream_reader = StreamReader::new(raw_stream);

@@ -10,10 +10,6 @@ node_dns_names = ["node-1", "node-2"]
 node_id_discovery_sleep = 3
 node_id_discovery_retries = 5
 
-[protocol]
-max_message_size = 262144
-receive_message_timeout_ms = 5000
-
 [http]
 compression = true
 compression_lvl = 3
@@ -36,6 +32,10 @@ subnet_number = 17
 subnet_poll_interval_sec = 3600
 max_task_queue_len = 500
 admin_key = "b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+post_timeout_sec = 2
+get_timeout_sec = 2
+max_idle_timeout_sec = 4
+keep_alive_interval_sec = 1
 
 [db]
 host = "db"
@@ -64,6 +64,17 @@ taskqueue_task_ttl = 1800
 [log]
 path = "./logs/gateway.log"
 level = "Info"
+
+
+[rclient]
+max_idle_timeout_sec = 4
+keep_alive_interval_sec = 1
+
+[rserver]
+max_message_size = 262144
+receive_message_timeout_ms = 5000
+max_idle_timeout_sec = 4
+keep_alive_interval_sec = 1
 
 [raft]
 cluster_name = "gateway_cluster"
