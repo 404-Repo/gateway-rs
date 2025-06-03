@@ -49,8 +49,9 @@ use crate::config::NodeConfig;
 use crate::db::DatabaseBuilder;
 use crate::db::KeysUpdater;
 use crate::http3::client::Http3Client;
+use crate::http3::client::Http3ClientBuilder;
 use crate::http3::server::Http3Server;
-use crate::raft::client::RClient;
+use crate::raft::client::RClientBuilder;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
 
@@ -91,9 +92,11 @@ pub struct Gateway {
 }
 
 async fn get_id_for_endpoint(
+    timeout: Duration,
     ep: &str,
     dns_name: &str,
     sleep_timeout: Duration,
+    skip_verification: bool,
     retries: usize,
 ) -> Result<u64> {
     let ip = ep.split(':').next().unwrap_or(ep);
@@ -106,8 +109,14 @@ async fn get_id_for_endpoint(
         .build();
 
     let id = (|| async {
-        if let Ok(mut client) = Http3Client::new(dns_name, &connection_addr, true).await {
-            if let Ok((status, body)) = client.get(&url, Some(Duration::from_secs(2))).await {
+        if let Ok(client) = Http3ClientBuilder::new()
+            .server_domain(dns_name)
+            .server_ip(&connection_addr)
+            .dangerous_skip_verification(skip_verification)
+            .build()
+            .await
+        {
+            if let Ok((status, body)) = client.get(&url, Some(timeout)).await {
                 if status == StatusCode::OK {
                     let body_str = std::str::from_utf8(&body)
                         .context("Failed to convert response body to UTF-8")?;
@@ -131,9 +140,11 @@ async fn get_id_for_endpoint(
 }
 
 pub async fn get_node_ids(
+    timeout: Duration,
     endpoints: &[impl AsRef<str>],
     dns_names: &[impl AsRef<str>],
     sleep_timeout: Duration,
+    skip_verification: bool,
     retries: usize,
 ) -> Result<Vec<u64>> {
     if endpoints.len() != dns_names.len() {
@@ -145,7 +156,14 @@ pub async fn get_node_ids(
         .iter()
         .zip(dns_names.iter())
         .map(|(ep, dns_name)| {
-            get_id_for_endpoint(ep.as_ref(), dns_name.as_ref(), sleep_timeout, retries)
+            get_id_for_endpoint(
+                timeout,
+                ep.as_ref(),
+                dns_name.as_ref(),
+                sleep_timeout,
+                skip_verification,
+                retries,
+            )
         });
     let ids = try_join_all(futures).await?;
     Ok(ids)
@@ -158,6 +176,11 @@ impl Gateway {
         task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
     ) {
+        let mut last_leader: Option<u64> = None;
+        let mut client: Option<Http3Client> = None;
+        let max_idle_timeout_sec = config.http.max_idle_timeout_sec;
+        let keep_alive_interval_sec = config.http.keep_alive_interval_sec;
+
         loop {
             sleep(Duration::from_millis(config.basic.update_gateway_info_ms)).await;
 
@@ -192,36 +215,46 @@ impl Gateway {
                 if let Err(e) = gateway_state.set_gateway_info(info).await {
                     error!("set_gateway_info update error: {:?}", e);
                 }
+                last_leader = Some(leader);
+                client = None;
                 continue;
             }
 
-            let leader_info = match gateway_state.gateway(leader).await {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("Failed to get leader info: {:?}", e);
-                    continue;
-                }
-            };
+            if last_leader != Some(leader) || client.is_none() {
+                client = None;
+                let leader_info = match gateway_state.gateway(leader).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!("Failed to get leader info: {:?}", e);
+                        continue;
+                    }
+                };
 
-            let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
-            let mut client = match Http3Client::new(
-                &leader_info.domain,
-                &server_ip,
-                config.cert.dangerous_skip_verification,
-            )
-            .await
-            {
-                Ok(client) => client,
-                Err(e) => {
-                    error!(
-                        "Failed to create HTTP3 client: {:?} with params: {} {}",
-                        e, &leader_info.domain, server_ip,
-                    );
-                    continue;
+                let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
+                match Http3ClientBuilder::new()
+                    .server_domain(&leader_info.domain)
+                    .server_ip(&server_ip)
+                    .max_idle_timeout_sec(max_idle_timeout_sec)
+                    .keep_alive_interval(keep_alive_interval_sec)
+                    .dangerous_skip_verification(config.cert.dangerous_skip_verification)
+                    .build()
+                    .await
+                {
+                    Ok(c) => {
+                        client = Some(c);
+                        last_leader = Some(leader);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create HTTP3 client: {:?} with params: {} {}",
+                            e, &leader_info.domain, server_ip,
+                        );
+                        continue;
+                    }
                 }
-            };
+            }
 
-            let info = GatewayInfoExt {
+            let info_ext = GatewayInfoExt {
                 node_id: info.node_id,
                 domain: info.domain,
                 ip: info.ip,
@@ -233,7 +266,7 @@ impl Gateway {
                 last_update: info.last_update,
             };
 
-            let payload = match serde_json::to_vec(&info) {
+            let payload = match serde_json::to_vec(&info_ext) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Serialization error: {:?}", e);
@@ -241,27 +274,39 @@ impl Gateway {
                 }
             };
 
-            // Send request to leader
+            let leader_info = match gateway_state.gateway(leader).await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to get leader info: {:?}", e);
+                    continue;
+                }
+            };
             let url = format!(
                 "https://{}:{}/write",
                 leader_info.domain, leader_info.http_port
             );
 
-            match client
-                .post(&url, Bytes::from(payload), Some(Duration::from_secs(2)))
-                .await
-            {
-                Ok((status, response)) => {
-                    if !status.is_success() {
-                        error!(
-                            "Gateway info update failed with status: {}, response: {:?}",
-                            status,
-                            String::from_utf8_lossy(&response)
-                        );
+            if let Some(client) = client.as_ref() {
+                match client
+                    .post(
+                        &url,
+                        Bytes::from(payload),
+                        Some(Duration::from_secs(config.http.post_timeout_sec)),
+                    )
+                    .await
+                {
+                    Ok((status, response)) => {
+                        if !status.is_success() {
+                            error!(
+                                "Gateway info update failed with status: {}, response: {:?}",
+                                status,
+                                String::from_utf8_lossy(&response)
+                            );
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Gateway info update failed: {:?}", e);
+                    Err(e) => {
+                        error!("Gateway info update failed: {:?}", e);
+                    }
                 }
             }
         }
@@ -381,7 +426,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         &server_addr,
         cert_tuple,
         raft.clone(),
-        config.protocol.clone(),
+        config.rserver.clone(),
     )
     .await?;
 
@@ -440,9 +485,11 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     .await;
 
     let node_ids = get_node_ids(
+        Duration::from_secs(config.http.get_timeout_sec),
         &config.network.node_endpoints,
         &config.network.node_dns_names,
         Duration::from_secs(config.network.node_id_discovery_sleep),
+        config.cert.dangerous_skip_verification,
         config.network.node_id_discovery_retries,
     )
     .await?;
@@ -455,14 +502,16 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
             .iter()
             .zip(config.network.node_dns_names.iter())
             .map(|(endpoint, dns_name)| async {
-                let client = RClient::new(
-                    endpoint,
-                    dns_name,
-                    &format!("{}:{}", config.network.bind_ip, 0),
-                    config.cert.dangerous_skip_verification,
-                    config.protocol.clone(),
-                )
-                .await?;
+                let client = RClientBuilder::new()
+                    .remote_addr(endpoint.clone())
+                    .server_name(dns_name.clone())
+                    .local_bind_addr(format!("{}:{}", config.network.bind_ip, 0))
+                    .dangerous_skip_verification(config.cert.dangerous_skip_verification)
+                    .max_idle_timeout_sec(config.rclient.max_idle_timeout_sec)
+                    .keep_alive_interval(config.rclient.keep_alive_interval_sec)
+                    .protocol_cfg(config.rserver.clone())
+                    .build()
+                    .await?;
                 clients_map
                     .insert(endpoint.clone(), client)
                     .map_err(|e| anyhow::anyhow!("{:?}", e))?;

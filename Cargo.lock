@@ -310,12 +310,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -503,9 +497,9 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 
 [[package]]
 name = "camino"
-version = "1.1.9"
+version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b96ec4966b5813e2c0507c1f86115c8c5abaadc3980879c3424042a02fd1ad3"
+checksum = "0da45bc31171d8d6960122e222a67740df867c1dd53b4d51caa297084c185cab"
 dependencies = [
  "serde",
 ]
@@ -713,7 +707,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ddef33a339a91ea89fb53151bd0a4689cfce27055c291dfa69945475d22c747"
 dependencies = [
  "aes-gcm",
- "base64 0.22.1",
+ "base64",
  "hmac",
  "percent-encoding",
  "rand 0.8.5",
@@ -1263,7 +1257,7 @@ dependencies = [
  "async-tungstenite",
  "async_zip",
  "backon",
- "base64 0.22.1",
+ "base64",
  "blake2",
  "bs58",
  "bytes",
@@ -1285,7 +1279,7 @@ dependencies = [
  "rmp-serde",
  "rustls",
  "rustls-pemfile",
- "rustls-platform-verifier",
+ "rustls-platform-verifier 0.6.0",
  "salvo",
  "scc",
  "schnorrkel",
@@ -1476,11 +1470,11 @@ checksum = "84b26c544d002229e640969970a2e74021aadf6e2f96372b9c58eff97de08eb3"
 
 [[package]]
 name = "headers"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "322106e6bd0cba2d5ead589ddb8150a13d7c4217cf80d7c4f682ca994ccc6aa9"
+checksum = "b3314d5adb5d94bcdf56771f2e50dbbc80bb4bdf88967526706205ac9eff24eb"
 dependencies = [
- "base64 0.21.7",
+ "base64",
  "bytes",
  "headers-core",
  "http",
@@ -1620,7 +1614,7 @@ version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c293b6b3d21eca78250dc7dbebd6b9210ec5530e038cbfe0661b5c47ab06e8"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -1901,7 +1895,7 @@ version = "9.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "js-sys",
  "pem",
  "ring",
@@ -2352,7 +2346,7 @@ version = "3.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38af38e8470ac9dee3ce1bae1af9c1671fffc44ddfd8bd1d0a3445bf349a8ef3"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "serde",
 ]
 
@@ -2442,7 +2436,7 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76ff0abab4a9b844b93ef7b81f1efc0a366062aaef2cd702c76256b5dc075c54"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "byteorder",
  "bytes",
  "fallible-iterator",
@@ -2492,9 +2486,9 @@ dependencies = [
 
 [[package]]
 name = "prettyplease"
-version = "0.2.32"
+version = "0.2.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "664ec5419c51e34154eec046ebcba56312d5a2fc3b09a06da188e1ad21afadf6"
+checksum = "9dee91521343f4c5c6a63edd65e54f31f5c92fe8978c40a4282f8372194c6a7d"
 dependencies = [
  "proc-macro2",
  "syn 2.0.101",
@@ -2609,7 +2603,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
+ "rustls-platform-verifier 0.5.3",
  "slab",
  "thiserror 2.0.12",
  "tinyvec",
@@ -2788,11 +2782,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.18"
+version = "0.12.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e98ff6b0dbbe4d5a37318f433d4fc82babd21631f194d370409ceb2e40b2f0b5"
+checksum = "a2f8e5513d63f2e5b386eb5106dc67eaf3f84e95258e210489136b8b92ad6119"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -3035,6 +3029,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-platform-verifier"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eda84358ed17f1f354cf4b1909ad346e6c7bc2513e8c40eb08e0157aa13a9070"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "jni",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier-android",
+ "rustls-webpki",
+ "security-framework",
+ "security-framework-sys",
+ "webpki-root-certs 1.0.0",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rustls-platform-verifier-android"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3125,7 +3140,7 @@ name = "salvo-jwt-auth"
 version = "0.79.0"
 source = "git+https://github.com/salvo-rs/salvo.git?rev=fabdc7520218171b31f004a044bbce0516f10ee1#fabdc7520218171b31f004a044bbce0516f10ee1"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "http-body-util",
  "hyper-rustls",
@@ -3185,7 +3200,7 @@ version = "0.79.0"
 source = "git+https://github.com/salvo-rs/salvo.git?rev=fabdc7520218171b31f004a044bbce0516f10ee1#fabdc7520218171b31f004a044bbce0516f10ee1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "cookie",
  "enumflags2",
@@ -3231,7 +3246,7 @@ name = "salvo_extra"
 version = "0.79.0"
 source = "git+https://github.com/salvo-rs/salvo.git?rev=fabdc7520218171b31f004a044bbce0516f10ee1#fabdc7520218171b31f004a044bbce0516f10ee1"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "etag",
  "futures-util",
  "http-body-util",
@@ -3373,9 +3388,9 @@ dependencies = [
 
 [[package]]
 name = "serde-xml-rs"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "176b7ff880ab6ead7a020e773e9c096467fe347615a3e22ac29300cbdef67a5d"
+checksum = "53630160a98edebde0123eb4dfd0fce6adff091b2305db3154a9e920206eb510"
 dependencies = [
  "log",
  "serde",
@@ -3964,9 +3979,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fdb0c213ca27a9f57ab69ddb290fd80d970922355b83ae380b395d3986b8a2e"
+checksum = "5cc2d9e086a412a451384326f521c8123a99a466b329941a9403696bff9b0da2"
 dependencies = [
  "bitflags",
  "bytes",

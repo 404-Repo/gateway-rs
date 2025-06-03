@@ -1,12 +1,11 @@
-use crate::{
-    common::cert::generate_self_signed_config, config::ProtocolConfig, protocol::Protocol,
-};
+use crate::{common::cert::generate_self_signed_config, config::RServerConfig, protocol::Protocol};
 use anyhow::Result;
 use quinn::{
-    crypto::rustls::QuicServerConfig, Endpoint, Incoming, RecvStream, SendStream, ServerConfig,
+    crypto::rustls::QuicServerConfig, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream,
+    ServerConfig, TransportConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{sync::RwLock, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -25,9 +24,9 @@ impl RServer {
         bind_addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
         raft: Arc<RwLock<Raft>>,
-        protocol_cfg: ProtocolConfig,
+        rserver_cfg: RServerConfig,
     ) -> Result<Self> {
-        let server_config = match cert {
+        let mut server_config = match cert {
             Some((cert_chain, key)) => {
                 let mut rustls_config = rustls::ServerConfig::builder_with_protocol_versions(&[
                     &rustls::version::TLS13,
@@ -41,8 +40,18 @@ impl RServer {
             None => generate_self_signed_config()?,
         };
 
-        let endpoint = Endpoint::server(server_config.clone(), bind_addr.parse()?)?;
-        info!("QUIC server listening on {}", bind_addr);
+        let mut transport_cfg = TransportConfig::default();
+        let idle_timeout =
+            IdleTimeout::try_from(Duration::from_secs(rserver_cfg.max_idle_timeout_sec))?;
+        transport_cfg.max_idle_timeout(Some(idle_timeout));
+        transport_cfg.keep_alive_interval(Some(Duration::from_secs(
+            rserver_cfg.keep_alive_interval_sec,
+        )));
+        server_config.transport_config(Arc::new(transport_cfg));
+
+        let endpoint = Endpoint::server(server_config.clone(), bind_addr.parse::<SocketAddr>()?)?;
+
+        info!("RServer QUIC server listening on {}", bind_addr);
 
         let cancel_token = CancellationToken::new();
         let endpoint_clone = endpoint.clone();
@@ -61,7 +70,7 @@ impl RServer {
                             Some(incoming) => {
                                 let connection_token = accept_token.clone();
                                 let raft_inner = raft_clone.clone();
-                                let p_cfg = protocol_cfg.clone();
+                                let p_cfg = rserver_cfg.clone();
                                 tokio::spawn(async move {
                                     tokio::select! {
                                         res = Self::handle_incoming(incoming, raft_inner, p_cfg.clone()) => {
@@ -96,7 +105,7 @@ impl RServer {
     async fn handle_incoming(
         incoming: Incoming,
         raft: Arc<RwLock<Raft>>,
-        protocol_cfg: ProtocolConfig,
+        rserver_cfg: RServerConfig,
     ) -> Result<()> {
         let connection = incoming.await?;
         let remote_addr = connection.remote_address();
@@ -107,8 +116,8 @@ impl RServer {
                 Ok((send, recv)) => {
                     let protocol = Protocol::new(
                         connection.clone(),
-                        protocol_cfg.max_message_size,
-                        Duration::from_millis(protocol_cfg.receive_message_timeout_ms),
+                        rserver_cfg.max_message_size,
+                        Duration::from_millis(rserver_cfg.receive_message_timeout_ms),
                     );
                     if let Err(e) = Self::handle_request(protocol, send, recv, raft.clone()).await {
                         error!("Error handling request: {}", e);
@@ -201,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_bind() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
-        let pcfg = ProtocolConfig::default();
+        let pcfg = RServerConfig::default();
 
         let addr = "127.0.0.1:4444";
         let _server = RServer::new(addr, None, raft, pcfg).await?;
@@ -219,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_connection() -> Result<()> {
         let raft = create_test_raft_node(1).await?;
-        let pcfg = ProtocolConfig::default();
+        let pcfg = RServerConfig::default();
 
         let addr = "127.0.0.1:4445";
         let _server = RServer::new(addr, None, raft, pcfg.clone()).await?;
@@ -227,8 +236,15 @@ mod tests {
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client =
-            crate::raft::client::RClient::new(addr, "localhost", "127.0.0.1:0", true, pcfg).await?;
+        let client = crate::raft::client::RClientBuilder::new()
+            .remote_addr(addr)
+            .server_name("localhost")
+            .local_bind_addr("127.0.0.1:0")
+            .dangerous_skip_verification(true)
+            .protocol_cfg(pcfg)
+            .build()
+            .await?;
+
         assert!(client.stable_id() > 0);
 
         Ok(())
