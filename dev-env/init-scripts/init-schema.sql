@@ -32,5 +32,7 @@ INSERT INTO users (id, email, display_name)
 VALUES ('123e4567-e89b-12d3-a456-426614174000', 'user@example.com', 'Example User');
 
 INSERT INTO api_keys (user_id, api_key)
-VALUES ('123e4567-e89b-12d3-a456-426614174000', '123e4567-e89b-12d3-a456-426614174001')
-RETURNING id, user_id, api_key, created_at, updated_at;
+VALUES ('123e4567-e89b-12d3-a456-426614174000', '123e4567-e89b-12d3-a456-426614174001');
+
+INSERT INTO api_keys (user_id, api_key)
+VALUES ('123e4567-e89b-12d3-a456-426614174000','123e4567-e89b-12d3-a456-426614174002');

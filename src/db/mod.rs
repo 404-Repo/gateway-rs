@@ -343,6 +343,11 @@ impl KeysUpdater {
         Ok(())
     }
 
+    pub fn get_user_id(&self, api_key: &Uuid) -> Option<Uuid> {
+        self.api_keys
+            .read(api_key, |_, stored_user_id| *stored_user_id)
+    }
+
     pub fn is_valid_api_key(&self, api_key: &Uuid) -> bool {
         self.api_keys.contains(api_key)
     }

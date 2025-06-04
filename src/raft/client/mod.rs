@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::{
     common::cert::SkipServerVerification,
@@ -273,7 +273,8 @@ impl RClient {
         // Try opening the stream once, on error, reconnect and open it again
         let (send_stream, recv_stream) = match conn.open_bi().await {
             Ok(streams) => streams,
-            Err(_) => {
+            Err(e) => {
+                error!("Failed to open bidirectional stream : {e}");
                 conn = self.reconnect().await?;
                 conn.open_bi().await?
             }

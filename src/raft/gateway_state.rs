@@ -189,6 +189,10 @@ impl GatewayState {
         self.keys_updater.is_valid_api_key(api_key)
     }
 
+    pub fn get_user_id(&self, api_key: &Uuid) -> Option<Uuid> {
+        self.keys_updater.get_user_id(api_key)
+    }
+
     pub fn cluster_name(&self) -> &str {
         &self.cluster_name
     }
