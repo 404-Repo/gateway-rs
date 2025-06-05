@@ -90,8 +90,10 @@ pub struct HTTPConfig {
     pub generic_key_rate_limit: usize,
     pub load_rate_limit: usize,
     pub add_task_rate_limit: usize,
+    pub add_result_rate_limit: usize,
     pub leader_rate_limit: usize,
     pub metric_rate_limit: usize,
+    pub get_status_rate_limit: usize,
     // Size limit for the request
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,

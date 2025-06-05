@@ -10,6 +10,7 @@ use http::HeaderValue;
 use multer::{Constraints, Multipart};
 use prometheus::{Encoder as _, TextEncoder, TEXT_FORMAT};
 use rustls::SupportedProtocolVersion;
+use salvo::catcher::Catcher;
 use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
@@ -36,27 +37,28 @@ use crate::bittensor::subnet_state::SubnetState;
 use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
 use crate::config::HTTPConfig;
+use crate::http3::response::custom_response;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use multer::SizeLimit;
 
 use super::error::ServerError;
 
-type H3RateLimiter = RateLimiter<
+type PerIPRateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
     RemoteIpIssuer,
     BasicQuota,
 >;
 
-type H3GenericKeyPerIpRateLimiter = RateLimiter<
+type GenericKeyPerIpRateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<GenericKeyPerIpIssuer as RateIssuer>::Key, FixedGuard>,
     GenericKeyPerIpIssuer,
     BasicQuota,
 >;
-struct GenericKeyPerIpIssuer;
 
+struct GenericKeyPerIpIssuer;
 impl RateIssuer for GenericKeyPerIpIssuer {
     type Key = String;
 
@@ -78,16 +80,37 @@ impl RateIssuer for GenericKeyPerIpIssuer {
     }
 }
 
+type UserIDLimiter = RateLimiter<
+    FixedGuard,
+    MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
+    UserIDLimitIssuer,
+    BasicQuota,
+>;
+struct UserIDLimitIssuer;
+impl RateIssuer for UserIDLimitIssuer {
+    type Key = String;
+
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        let key_header = req.headers().get("X-API-Key")?.to_str().ok()?;
+        let gs = depot.obtain::<GatewayState>().ok()?;
+        let api_uuid = Uuid::from_str(key_header).ok()?;
+        let user_id = gs.get_user_id(&api_uuid)?;
+        Some(format!("u:{}", user_id))
+    }
+}
+
 struct RateLimits {
-    basic_limiter: H3RateLimiter,
-    write_limiter: H3RateLimiter,
-    update_limiter: H3RateLimiter,
-    generic_limiter: H3GenericKeyPerIpRateLimiter,
-    read_limiter: H3RateLimiter,
-    task_limiter: H3RateLimiter,
-    load_limiter: H3RateLimiter,
-    leader_limiter: H3RateLimiter,
-    metric_limiter: H3RateLimiter,
+    basic_limiter: PerIPRateLimiter,
+    write_limiter: PerIPRateLimiter,
+    update_limiter: PerIPRateLimiter,
+    generic_limiter: GenericKeyPerIpRateLimiter,
+    read_limiter: PerIPRateLimiter,
+    task_limiter: UserIDLimiter,
+    result_limiter: PerIPRateLimiter,
+    load_limiter: PerIPRateLimiter,
+    leader_limiter: PerIPRateLimiter,
+    metric_limiter: PerIPRateLimiter,
+    status_limiter: PerIPRateLimiter,
 }
 
 // curl --http3 -X POST "https://gateway.404.xyz:4443/add_task" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
@@ -536,7 +559,7 @@ pub async fn get_result_handler(
     Ok(())
 }
 
-// curl --http3 https://gateway.404.xyz:4443/get_status -X GET -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
+// curl --http3 https://gateway.404.xyz:4443/get_status -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -X GET -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
 #[handler]
 async fn get_status_handler(
     depot: &mut Depot,
@@ -898,20 +921,22 @@ impl Http3Server {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
     ) -> Self {
-        let basic_limiter = Self::create_rate_limiter(http_config.basic_rate_limit);
-        let write_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
-        let update_limiter = Self::create_rate_limiter(http_config.update_key_rate_limit);
-        let generic_limiter = H3GenericKeyPerIpRateLimiter::new(
+        let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
+        let write_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
+        let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
+        let generic_limiter = GenericKeyPerIpRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
             GenericKeyPerIpIssuer,
             BasicQuota::per_minute(http_config.generic_key_rate_limit),
         );
-        let read_limiter = Self::create_rate_limiter(http_config.write_rate_limit);
-        let load_limiter = Self::create_rate_limiter(http_config.load_rate_limit);
-        let task_limiter = Self::create_rate_limiter(http_config.add_task_rate_limit);
-        let leader_limiter = Self::create_rate_limiter(http_config.leader_rate_limit);
-        let metric_limiter = Self::create_rate_limiter(http_config.metric_rate_limit);
+        let task_limiter = Self::create_user_id_rate_limiter(http_config.add_task_rate_limit);
+        let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
+        let read_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
+        let load_limiter = Self::create_ip_rate_limiter(http_config.load_rate_limit);
+        let leader_limiter = Self::create_ip_rate_limiter(http_config.leader_rate_limit);
+        let metric_limiter = Self::create_ip_rate_limiter(http_config.metric_rate_limit);
+        let status_limiter = Self::create_ip_rate_limiter(http_config.get_status_rate_limit);
 
         let rate_limits = RateLimits {
             basic_limiter,
@@ -921,8 +946,10 @@ impl Http3Server {
             read_limiter,
             load_limiter,
             task_limiter,
+            result_limiter,
             leader_limiter,
             metric_limiter,
+            status_limiter,
         };
 
         let subnet_state = SubnetState::new(
@@ -942,6 +969,8 @@ impl Http3Server {
             http_config.clone(),
         );
 
+        let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
+
         const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
         let tls_config = tls_config.tls_versions(TLS13_ONLY);
 
@@ -951,7 +980,7 @@ impl Http3Server {
                 .join(tcp_listener)
                 .bind()
                 .await;
-            Server::new(acceptor).serve(router).await;
+            Server::new(acceptor).serve(service).await;
         });
 
         Self {
@@ -960,7 +989,7 @@ impl Http3Server {
         }
     }
 
-    fn create_rate_limiter(
+    fn create_ip_rate_limiter(
         quota: usize,
     ) -> RateLimiter<
         FixedGuard,
@@ -972,6 +1001,22 @@ impl Http3Server {
             FixedGuard::new(),
             MokaStore::<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
             RemoteIpIssuer,
+            BasicQuota::per_minute(quota),
+        )
+    }
+
+    fn create_user_id_rate_limiter(
+        quota: usize,
+    ) -> RateLimiter<
+        FixedGuard,
+        MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
+        UserIDLimitIssuer,
+        BasicQuota,
+    > {
+        RateLimiter::new(
+            FixedGuard::new(),
+            MokaStore::<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>::new(),
+            UserIDLimitIssuer,
             BasicQuota::per_minute(quota),
         )
     }
@@ -1024,6 +1069,7 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_result")
                     .hoop(file_size_limit_handler)
+                    .hoop(rate_limits.result_limiter)
                     .post(add_result_handler),
             )
             .push(
@@ -1077,6 +1123,7 @@ impl Http3Server {
                 Router::with_path("/get_status")
                     .hoop(size_limit_handler())
                     .hoop(api_key_check)
+                    .hoop(rate_limits.status_limiter)
                     .get(get_status_handler),
             )
             .push(
