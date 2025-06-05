@@ -270,7 +270,7 @@ impl Http3Client {
         let request = http::Request::builder()
             .method("POST")
             .uri(&uri)
-            .header("Content-Type", "application/json")
+            .header("content-type", "application/json")
             .body(())?;
 
         let fut = async {
