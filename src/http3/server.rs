@@ -63,7 +63,7 @@ impl RateIssuer for GenericKeyPerIpIssuer {
     type Key = String;
 
     async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("X-API-Key")?.to_str().ok()?;
+        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
         let gs = depot.obtain::<GatewayState>().ok()?;
         let uuid = Uuid::from_str(key_header).ok()?;
 
@@ -91,7 +91,7 @@ impl RateIssuer for UserIDLimitIssuer {
     type Key = String;
 
     async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("X-API-Key")?.to_str().ok()?;
+        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
         let gs = depot.obtain::<GatewayState>().ok()?;
         let api_uuid = Uuid::from_str(key_header).ok()?;
         let user_id = gs.get_user_id(&api_uuid)?;
@@ -113,7 +113,7 @@ struct RateLimits {
     status_limiter: PerIPRateLimiter,
 }
 
-// curl --http3 -X POST "https://gateway.404.xyz:4443/add_task" -H "Content-Type: application/json" -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
 #[handler]
 async fn add_task_handler(
     depot: &mut Depot,
@@ -158,7 +158,7 @@ async fn add_task_handler(
     Ok(())
 }
 
-// curl -X POST https://gateway.404.xyz:4443/add_result \
+// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
 //   -F id=123e4567-e89b-12d3-a456-426614174001 \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \
@@ -168,7 +168,7 @@ async fn add_task_handler(
 //   -F asset=@/path/to/asset.spz \
 //   -F score=0.95
 
-// curl -X POST https://gateway.404.xyz:4443/add_result \
+// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
 //   -F id=123e4567-e89b-12d3-a456-426614174001 \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \
@@ -186,14 +186,14 @@ async fn add_result_handler(
         .get("content-type")
         .and_then(|ct| ct.to_str().ok())
         .map(|s| s.to_string())
-        .ok_or(ServerError::BadRequest("Missing Content-Type".into()))?;
+        .ok_or(ServerError::BadRequest("Missing content-type".into()))?;
 
     if !content_type
         .to_lowercase()
         .starts_with("multipart/form-data")
     {
         return Err(ServerError::BadRequest(
-            "Invalid Content-Type, expected multipart/form-data".into(),
+            "Invalid content-type, expected multipart/form-data".into(),
         ));
     }
 
@@ -203,7 +203,7 @@ async fn add_result_handler(
         .find(|part| part.to_lowercase().starts_with("boundary="))
         .and_then(|part| part.split('=').nth(1))
         .ok_or(ServerError::BadRequest(
-            "Missing boundary in Content-Type".into(),
+            "Missing boundary in content-type".into(),
         ))?;
 
     let raw_stream = req
@@ -418,12 +418,12 @@ async fn add_result_handler(
     Ok(())
 }
 
-// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
-//   -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" \
+// curl --http3 "https://gateway-eu.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
+//   -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o result.spz
 
-// curl --http3 "https://gateway.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
-//   -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" \
+// curl --http3 "https://gateway-eu.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
+//   -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o results.zip
 #[handler]
 pub async fn get_result_handler(
@@ -549,7 +549,7 @@ pub async fn get_result_handler(
     metrics.inc_best_task(&best_validator);
 
     res.headers_mut()
-        .insert("Content-Type", HeaderValue::from_static(content_type));
+        .insert("content-type", HeaderValue::from_static(content_type));
     res.headers_mut().insert(
         "Content-Disposition",
         HeaderValue::from_static(content_disposition),
@@ -559,7 +559,7 @@ pub async fn get_result_handler(
     Ok(())
 }
 
-// curl --http3 https://gateway.404.xyz:4443/get_status -H "X-API-Key: 123e4567-e89b-12d3-a456-426614174001" -X GET -H "Content-Type: application/json" -d '{"id": "123e4567-e89b-12d3-a456-426614174000"}'
+// curl --http3 "https://gateway-eu.404.xyz:4443/get_status?id=123e4567-e89b-12d3-a456-426614174000" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
 #[handler]
 async fn get_status_handler(
     depot: &mut Depot,
@@ -567,8 +567,7 @@ async fn get_status_handler(
     res: &mut Response,
 ) -> Result<(), ServerError> {
     let get_status = req
-        .parse_json::<GetTaskStatus>()
-        .await
+        .parse_queries::<GetTaskStatus>()
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
@@ -582,8 +581,8 @@ async fn get_status_handler(
     Ok(())
 }
 
-// curl --http3 -X POST https://gateway.404.xyz:4443/get_tasks \
-//   -H "Content-Type: application/json" \
+// curl --http3 -X POST https://gateway-eu.404.xyz:4443/get_tasks \
+//   -H "content-type: application/json" \
 //   -d '{"validator_hotkey": "abc123", "signature": "signatureinbase64", "timestamp": "404_GATEWAY_1743657200", "requested_task_count": 10}'
 #[handler]
 async fn get_tasks_handler(
@@ -674,7 +673,7 @@ async fn get_tasks_handler(
     Ok(())
 }
 
-// curl --http3 -X GET -k https://gateway.404.xyz:4443/get_load
+// curl --http3 -X GET -k https://gateway-eu.404.xyz:4443/get_load
 #[handler]
 async fn get_load_handler(
     depot: &mut Depot,
@@ -783,7 +782,7 @@ async fn api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), Serve
 
     let api_key = req
         .headers()
-        .get("X-API-Key")
+        .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
@@ -803,7 +802,7 @@ async fn generic_api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(
 
     let api_key = req
         .headers()
-        .get("X-API-Key")
+        .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
@@ -823,7 +822,7 @@ async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), Ser
 
     let is_admin = req
         .headers()
-        .get("X-Admin-Key")
+        .get("x-admin-key")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok())
         == Some(http_cfg.admin_key);
@@ -837,7 +836,7 @@ async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), Ser
     }
 }
 
-// curl --http3 -X POST "https://gateway.404.xyz:4443/update_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "Content-Type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/update_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "content-type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
 #[handler]
 async fn generic_key_update_handler(
     depot: &mut Depot,
@@ -865,7 +864,7 @@ async fn generic_key_update_handler(
     Ok(())
 }
 
-// curl --http3 -X GET "https://gateway.404.xyz:4443/get_key" -H "X-Admin-Key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+// curl --http3 -X GET "https://gateway-eu.404.xyz:4443/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 #[handler]
 async fn generic_key_read_handler(
     depot: &mut Depot,
@@ -900,7 +899,7 @@ async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), Se
         .map_err(|e| ServerError::Internal(format!("Failed to encode metrics: {}", e)))?;
 
     res.headers_mut()
-        .insert("Content-Type", HeaderValue::from_static(TEXT_FORMAT));
+        .insert("content-type", HeaderValue::from_static(TEXT_FORMAT));
     res.status_code(StatusCode::OK);
     res.body(buffer);
 
