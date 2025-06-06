@@ -1,5 +1,7 @@
 # 404.xyz Gateway client API
 
+Before you continue reading, check out the [integration cases](integration.md).
+
 **Note:** Replace `{REGION}` with one of the following:
 - `gateway-eu.404.xyz`
 - `gateway-us-east.404.xyz`
@@ -29,8 +31,9 @@ curl --http3 "https://{REGION}:4443/get_status?id=123e4567-e89b-12d3-a456-426614
      -H "x-api-key: <YOUR-API-KEY>"
 ```
 
-### 4. Get Result
-**Note:** Use the task ID obtained from `/add_task`.
+### 4. Get Result in SPZ format.
+**Note:** Use the task ID obtained from `/add_task`.<br>
+To unpack the result, use C++ or Python bindings from https://github.com/404-Repo/spz or the web interface at https://spz.404.xyz/
 
 ```console
 curl --http3 "https://{REGION}:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
@@ -87,8 +90,9 @@ with httpx.Client(http2=True) as client:
 
 **Note:** This endpoint uses a GET request with a JSON body, which is non-standard but specified by the API.
 
-### 4. Get Result
-**Note:** Use the task ID obtained from `/add_task`.
+### 4. Get Result in SPZ format.
+**Note:** Use the task ID obtained from `/add_task`.<br>
+To unpack the result, use C++ or Python bindings from https://github.com/404-Repo/spz or the web interface at https://spz.404.xyz/
 
 ```python
 import httpx
