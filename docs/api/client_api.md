@@ -95,7 +95,7 @@ with httpx.Client(http2=True) as client:
 ```
 
 
-### Complete example with SPZ decompression
+### Complete example with SPZ decompression (Preferred method)
 Download and install prebuilt [pyspz package](https://github.com/404-Repo/spz/releases) for your system.
 ```Python
 import httpx
@@ -122,6 +122,40 @@ def generate_ply(prompt: str, output_file: str = "result.ply") -> bytes:
 
         compressed_data = client.get("/get_result", params={"id": task_id}).content
         ply = pyspz.decompress(compressed_data, include_normals=False)
+        with open(output_file, 'wb') as f:
+            f.write(ply)
+        print(f"Result saved to {output_file}")
+        return ply
+
+if __name__ == "__main__":
+    prompt = "human with happy face"
+    generate_ply(prompt=prompt, output_file="result.ply")
+```
+
+### Complete example with PLY output
+```Python
+import httpx
+import time
+
+API_KEY = "API_KEY"
+GATEWAY = "gateway-eu.404.xyz"
+BASE_URL = f"https://{GATEWAY}:4443"
+
+def generate_ply(prompt: str, output_file: str = "result.ply") -> bytes:
+    with httpx.Client(base_url=BASE_URL, headers={"x-api-key": API_KEY}) as client:
+        task_id = client.post("/add_task", json={"prompt": prompt}).json()["id"]
+        print(f"Task submitted: {task_id}")
+
+        while True:
+            try:
+                status = client.get("/get_status", params={"id": task_id}).json()["status"]
+                if status == "Success": break
+            except (httpx.HTTPError, ValueError, KeyError) as e:
+                print(f"Error getting status: {e}")
+                raise
+            time.sleep(1)
+
+        ply = client.get("/get_result", params={"id": task_id, "format": "ply"}).content
         with open(output_file, 'wb') as f:
             f.write(ply)
         print(f"Result saved to {output_file}")

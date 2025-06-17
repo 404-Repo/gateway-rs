@@ -425,6 +425,19 @@ async fn add_result_handler(
 // curl --http3 "https://gateway-eu.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
 //   -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o results.zip
+#[inline(always)]
+async fn process_asset(asset: Vec<u8>, is_ply: bool) -> Result<Vec<u8>, ServerError> {
+    if is_ply {
+        let mut data = Vec::new();
+        spz_lib::decompress_async(&asset, false, &mut data)
+            .await
+            .map_err(|e| ServerError::Internal(format!("Failed to decompress asset: {:?}", e)))?;
+        Ok(data)
+    } else {
+        Ok(asset)
+    }
+}
+
 #[handler]
 pub async fn get_result_handler(
     depot: &mut Depot,
@@ -434,6 +447,8 @@ pub async fn get_result_handler(
     let get_task = req
         .parse_queries::<GetTaskResultRequest>()
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let is_ply = get_task.format.as_deref() == Some("ply");
 
     let task_manager = depot
         .obtain::<GatewayState>()
@@ -468,17 +483,18 @@ pub async fn get_result_handler(
 
     let (content_type, content_disposition, body, best_validator) = if get_task.all {
         successful_results.sort_by(|a, b| {
-            let a_score = a.get_score().unwrap_or(0.0);
-            let b_score = b.get_score().unwrap_or(0.0);
-            b_score
-                .partial_cmp(&a_score)
+            b.get_score()
+                .unwrap_or(0.0)
+                .partial_cmp(&a.get_score().unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let best_validator = successful_results
-            .first()
-            .map(|r| r.validator_hotkey.clone())
-            .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?;
+        let best_validator = std::mem::take(
+            &mut successful_results
+                .first_mut()
+                .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?
+                .validator_hotkey,
+        );
 
         let mut buffer = Vec::new();
         let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
@@ -488,14 +504,17 @@ pub async fn get_result_handler(
                 ServerError::Internal("Missing asset on TaskResult during ZIP build".into())
             })?;
 
+            let data = process_asset(asset, is_ply).await?;
+
+            let extension = if is_ply { "ply" } else { "spz" };
             let entry = ZipEntryBuilder::new(
-                format!("{}.spz", i + 1).into(),
+                format!("{}.{}", i + 1, extension).into(),
                 async_zip::Compression::Stored,
             )
             .build();
 
             zip_writer
-                .write_entry_whole(entry, &asset)
+                .write_entry_whole(entry, &data)
                 .await
                 .map_err(|e| {
                     ServerError::Internal(format!(
@@ -516,32 +535,33 @@ pub async fn get_result_handler(
 
         (
             "application/zip",
-            "attachment; filename=\"results.zip\"",
+            "attachment; filename=\"results.zip\"".to_string(),
             buffer,
             best_validator,
         )
     } else {
-        let best = successful_results
+        let mut best = successful_results
             .into_iter()
             .max_by(|a, b| {
-                let a_score = a.get_score().unwrap_or(0.0);
-                let b_score = b.get_score().unwrap_or(0.0);
-                b_score
-                    .partial_cmp(&a_score)
+                b.get_score()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.get_score().unwrap_or(0.0))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .ok_or_else(|| ServerError::Internal("Failed to select best TaskResult".into()))?;
 
-        let best_validator = best.validator_hotkey.clone();
-
+        let best_validator = std::mem::take(&mut best.validator_hotkey);
         let asset = best
             .into_asset()
             .ok_or_else(|| ServerError::Internal("Missing asset on best TaskResult".into()))?;
 
+        let data = process_asset(asset, is_ply).await?;
+
+        let extension = if is_ply { "ply" } else { "spz" };
         (
             "application/octet-stream",
-            "attachment; filename=\"result.spz\"",
-            asset,
+            format!("attachment; filename=\"result.{}\"", extension),
+            data,
             best_validator,
         )
     };
@@ -552,7 +572,8 @@ pub async fn get_result_handler(
         .insert("content-type", HeaderValue::from_static(content_type));
     res.headers_mut().insert(
         "Content-Disposition",
-        HeaderValue::from_static(content_disposition),
+        HeaderValue::from_str(&content_disposition)
+            .map_err(|e| ServerError::Internal(format!("Invalid header value: {:?}", e)))?,
     );
     res.body(body);
 

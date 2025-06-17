@@ -23,6 +23,7 @@ pub struct GetTaskResultRequest {
     pub id: Uuid,
     #[serde(default)]
     pub all: bool,
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
