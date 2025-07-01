@@ -1,9 +1,10 @@
 use clap::Parser;
+use clap::ValueEnum;
 use common::log::{init_tracing, log_app_config, log_build_information};
 use std::{env, sync::Arc, time::Duration};
 
 use config::{read_config, NodeConfig};
-use raft::{start_gateway_bootstrap, start_gateway_single, start_gateway_vote};
+use raft::{start_gateway, GatewayMode};
 use tracing::{error, info, warn};
 
 mod api;
@@ -22,13 +23,15 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<String>,
 
-    // First node will be bootstrapped as the leader.
-    #[arg(short, long)]
-    bootstrap: bool,
+    #[arg(long, value_enum, default_value_t = Mode::Vote)]
+    mode: Mode,
+}
 
-    // Run in single-node test mode.
-    #[arg(short, long)]
-    test: bool,
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+enum Mode {
+    Bootstrap,
+    Vote,
+    Single,
 }
 
 #[tokio::main]
@@ -53,13 +56,12 @@ async fn main() {
     let mut attempts = 0;
 
     loop {
-        let result = if cli.test {
-            start_gateway_single(node_config.clone()).await
-        } else if cli.bootstrap {
-            start_gateway_bootstrap(node_config.clone()).await
-        } else {
-            start_gateway_vote(node_config.clone()).await
+        let gateway_mode = match cli.mode {
+            Mode::Bootstrap => GatewayMode::Bootstrap,
+            Mode::Vote => GatewayMode::Vote,
+            Mode::Single => GatewayMode::Single,
         };
+        let result = start_gateway(gateway_mode, node_config.clone()).await;
 
         match result {
             Ok(_gateway) => {

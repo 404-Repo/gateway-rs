@@ -113,6 +113,33 @@ struct RateLimits {
     status_limiter: PerIPRateLimiter,
 }
 
+pub(crate) trait DepotExt {
+    fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
+}
+
+impl DepotExt for salvo::Depot {
+    fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError> {
+        self.obtain::<T>().map_err(|e| {
+            ServerError::Internal(format!(
+                "Failed to obtain {}: {:?}",
+                std::any::type_name::<T>(),
+                e
+            ))
+        })
+    }
+}
+
+#[inline(always)]
+async fn read_text_field(
+    field: multer::Field<'_>,
+    name: &'static str,
+) -> Result<String, ServerError> {
+    field
+        .text()
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("Failed to read {}: {}", name, e)))
+}
+
 // curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
 #[handler]
 async fn add_task_handler(
@@ -130,25 +157,15 @@ async fn add_task_handler(
         prompt: add_task.prompt,
     };
 
-    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
-        if let Some(err) = err_opt {
-            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
-        } else {
-            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
-        }
-    })?;
+    let queue = depot.require::<DupQueue<Task>>()?;
 
-    let http_cfg = depot
-        .obtain::<HTTPConfig>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
+    let http_cfg = depot.require::<HTTPConfig>()?;
 
     if queue.len() >= http_cfg.max_task_queue_len {
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     queue.push(task.clone());
     info!("A new task has been pushed with ID: {}", task.id);
@@ -219,9 +236,7 @@ async fn add_result_handler(
     let stream_reader = StreamReader::new(raw_stream);
     let byte_stream = FramedRead::new(stream_reader, BytesCodec::new()).map_ok(|b| b.freeze());
 
-    let http_cfg = depot
-        .obtain::<HTTPConfig>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
+    let http_cfg = depot.require::<HTTPConfig>()?;
 
     let constraints = Constraints::new()
         .allowed_fields(vec![
@@ -263,37 +278,14 @@ async fn add_result_handler(
             .ok_or_else(|| ServerError::BadRequest("Unnamed field".into()))?;
 
         match name {
-            "id" => {
-                id =
-                    Some(field.text().await.map_err(|e| {
-                        ServerError::BadRequest(format!("Failed to read id: {}", e))
-                    })?)
-            }
-            "signature" => {
-                signature = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read signature: {}", e))
-                })?)
-            }
-            "timestamp" => {
-                timestamp = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read timestamp: {}", e))
-                })?)
-            }
+            "id" => id = Some(read_text_field(field, "id").await?),
+            "signature" => signature = Some(read_text_field(field, "signature").await?),
+            "timestamp" => timestamp = Some(read_text_field(field, "timestamp").await?),
             "validator_hotkey" => {
-                validator_hotkey = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read validator_hotkey: {}", e))
-                })?)
+                validator_hotkey = Some(read_text_field(field, "validator_hotkey").await?)
             }
-            "miner_hotkey" => {
-                miner_hotkey = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read miner_hotkey: {}", e))
-                })?)
-            }
-            "status" => {
-                status = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read status: {}", e))
-                })?)
-            }
+            "miner_hotkey" => miner_hotkey = Some(read_text_field(field, "miner_hotkey").await?),
+            "status" => status = Some(read_text_field(field, "status").await?),
             "asset" => {
                 let mut content = Vec::new();
                 while let Some(chunk) = field.chunk().await.map_err(|e| {
@@ -305,23 +297,15 @@ async fn add_result_handler(
             }
             "score" => {
                 score = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|e| {
-                            ServerError::BadRequest(format!("Failed to read score: {}", e))
-                        })?
+                    read_text_field(field, "score")
+                        .await?
                         .parse::<f32>()
                         .map_err(|e| {
                             ServerError::BadRequest(format!("Invalid score format: {}", e))
                         })?,
                 )
             }
-            "reason" => {
-                reason = Some(field.text().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read reason: {}", e))
-                })?)
-            }
+            "reason" => reason = Some(read_text_field(field, "reason").await?),
             _ => continue,
         }
     }
@@ -381,9 +365,7 @@ async fn add_result_handler(
     )
     .map_err(|e| ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e)))?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
+    let gateway_state = depot.require::<GatewayState>()?;
     let manager = gateway_state.task_manager();
     let metrics = depot
         .obtain::<Metrics>()
@@ -450,10 +432,7 @@ pub async fn get_result_handler(
 
     let is_ply = get_task.format.as_deref() == Some("ply");
 
-    let task_manager = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e)))?
-        .task_manager();
+    let task_manager = depot.require::<GatewayState>()?.task_manager();
 
     let mut results_vec = task_manager
         .get_result(get_task.id)
@@ -591,9 +570,7 @@ async fn get_status_handler(
         .parse_queries::<GetTaskStatus>()
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     let status = gateway_state.task_manager().get_status(get_status.id).await;
 
@@ -616,21 +593,11 @@ async fn get_tasks_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let http_cfg = depot
-        .obtain::<HTTPConfig>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the HTTPConfig: {:?}", e)))?;
+    let http_cfg = depot.require::<HTTPConfig>()?;
 
-    let gateway_state = depot.obtain::<GatewayState>().map_err(|e| {
-        ServerError::Internal(format!("Failed to obtain the state reader: {:?}", e))
-    })?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
-    let queue = depot.obtain::<DupQueue<Task>>().map_err(|err_opt| {
-        if let Some(err) = err_opt {
-            ServerError::Internal(format!("Failed to obtain the task queue: {:?}", err))
-        } else {
-            ServerError::Internal("Failed to obtain the task queue: unknown error".into())
-        }
-    })?;
+    let queue = depot.require::<DupQueue<Task>>()?;
 
     let metrics = depot
         .obtain::<Metrics>()
@@ -701,9 +668,7 @@ async fn get_load_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     let gateways = gateway_state.gateways().await.map_err(|e| {
         ServerError::Internal(format!(
@@ -728,9 +693,7 @@ async fn write_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     if gi.cluster_name != gateway_state.cluster_name() {
         return Err(ServerError::Unauthorized("Unauthorized access".to_string()));
@@ -751,9 +714,7 @@ async fn get_leader_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let gateway_state = depot.require::<GatewayState>()?;
     let leader_id = match gateway_state.leader().await {
         Some(id) => id,
         None => {

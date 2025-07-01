@@ -35,6 +35,56 @@ pub struct DatabaseBuilder {
     dbname: Option<String>,
 }
 
+async fn connect_postgres(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+    ca_pem_path: &str,
+) -> Result<Arc<Client>> {
+    let ca_cert_bytes = fs::read(ca_pem_path)
+        .await
+        .with_context(|| format!("Failed to read CA certificate at {}", ca_pem_path))?;
+    let mut reader = BufReader::new(&ca_cert_bytes[..]);
+    let certs = certs(&mut reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| "Failed to parse CA certificate as PEM")?;
+
+    let mut root_store = RootCertStore::empty();
+    for cert in certs {
+        root_store
+            .add(cert)
+            .with_context(|| "Failed to add CA certificate to root store")?;
+    }
+
+    let tls_connector = MakeRustlsConnect::new(
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+
+    let mut pg_cfg = Config::new();
+    pg_cfg.host(host);
+    pg_cfg.port(port);
+    pg_cfg.user(user);
+    pg_cfg.password(password);
+    pg_cfg.dbname(dbname);
+
+    let (client, connection) = pg_cfg
+        .connect(tls_connector)
+        .await
+        .with_context(|| "Failed to connect to PostgreSQL using rustls")?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("Database connection error: {}", e);
+        }
+    });
+
+    Ok(Arc::new(client))
+}
+
 impl DatabaseBuilder {
     pub fn new() -> Self {
         Self {
@@ -100,43 +150,7 @@ impl DatabaseBuilder {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("Database name is required and cannot be empty"))?;
 
-        let ca_cert_bytes = fs::read(&ca_pem_path)
-            .await
-            .with_context(|| format!("Failed to read CA certificate at {}", ca_pem_path))?;
-        let mut reader = BufReader::new(&ca_cert_bytes[..]);
-        let certs = certs(&mut reader)
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| "Failed to parse CA certificate as PEM")?;
-        let mut root_store = RootCertStore::empty();
-        for cert in certs {
-            root_store
-                .add(cert)
-                .with_context(|| "Failed to add CA certificate to root store")?;
-        }
-
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let tls_connector = MakeRustlsConnect::new(tls_config);
-
-        let mut pg_config = Config::new();
-        pg_config.host(&host);
-        pg_config.port(port);
-        pg_config.user(&user);
-        pg_config.password(&password);
-        pg_config.dbname(&dbname);
-
-        let (client, connection) = pg_config
-            .connect(tls_connector)
-            .await
-            .with_context(|| "Failed to connect to PostgreSQL using rustls")?;
-        let client = Arc::new(client);
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("Database connection error: {}", e);
-            }
-        });
+        let client = connect_postgres(&host, port, &user, &password, &dbname, &ca_pem_path).await?;
 
         Ok(Database {
             client: AtomicOwned::new(client),
@@ -172,39 +186,15 @@ impl Database {
     }
 
     pub async fn reconnect(&self) -> Result<()> {
-        let ca_cert_bytes = fs::read(&self.ca_pem_path)
-            .await
-            .with_context(|| format!("Failed to read CA certificate at {}", self.ca_pem_path))?;
-        let mut reader = BufReader::new(&ca_cert_bytes[..]);
-        let certs = certs(&mut reader)
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| "Failed to parse CA certificate as PEM")?;
-        let mut root_store = RootCertStore::empty();
-        for cert in certs {
-            root_store
-                .add(cert)
-                .with_context(|| "Failed to add CA certificate to root store")?;
-        }
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let tls_connector = MakeRustlsConnect::new(tls_config);
-
-        let mut pg_config = Config::new();
-        pg_config.host(&self.host);
-        pg_config.port(self.port);
-        pg_config.user(&self.user);
-        pg_config.password(&self.password);
-        pg_config.dbname(&self.dbname);
-
-        let (new_client, connection) = pg_config.connect(tls_connector).await?;
-        let new_client = Arc::new(new_client);
-
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                error!("Database connection error: {}", e);
-            }
-        });
+        let new_client = connect_postgres(
+            &self.host,
+            self.port,
+            &self.user,
+            &self.password,
+            &self.dbname,
+            &self.ca_pem_path,
+        )
+        .await?;
 
         let _old = self
             .client
