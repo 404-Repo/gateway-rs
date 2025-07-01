@@ -296,7 +296,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let otf_hotkey = "5F4tQyWrhfGVcNhoqeiNsR6KjD4wMZ2kfhLj4oHYuyHbZAc3";
+        let otf_hotkey = "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7";
         let decoded_hotkey = ss58_decode(otf_hotkey).expect("Failed to decode SS58 hotkey");
 
         let hotkey_arr: &[u8; 32] = decoded_hotkey

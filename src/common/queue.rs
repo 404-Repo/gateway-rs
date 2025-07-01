@@ -116,37 +116,39 @@ where
 
     pub fn pop(&self, num: usize, hotkey: &str) -> Vec<(T, Option<Duration>)> {
         let mut result = Vec::with_capacity(num);
+
+        // Capture the current queue length once so we don't iterate indefinitely
         let initial_len = self.inner.q.len();
-        let mut scanned = 0;
 
-        // Try up to initial_len, or until we've got num results
-        while result.len() < num && scanned < initial_len {
-            match self.inner.q.pop() {
-                Some(shared) => {
-                    self.inner.len.fetch_sub(1, Ordering::Relaxed);
-                    scanned += 1;
-                    let mut entry = (*shared).clone();
-                    let key = (*entry.item.id(), hotkey.to_string());
+        for _ in 0..initial_len {
+            if result.len() >= num {
+                break;
+            }
 
-                    // If this hotkey hasn't seen it yet, mark & deliver
-                    if !self.inner.sent.contains(&key) {
-                        let _ = self.inner.sent.insert(key.clone(), ());
-                        entry.count -= 1;
-                        let dur = if entry.count == 0 {
-                            Some(Instant::now() - entry.timestamp)
-                        } else {
-                            None
-                        };
-                        result.push(((*entry.item).clone(), dur));
-                    }
+            let Some(shared) = self.inner.q.pop() else {
+                break;
+            };
 
-                    // If there are still duplicates left, put it back on the queue
-                    if entry.count > 0 {
-                        self.inner.len.fetch_add(1, Ordering::Relaxed);
-                        self.inner.q.push((*entry).clone());
-                    }
-                }
-                None => break, // queue’s empty
+            // We removed an item from the queue, update our length counter
+            self.inner.len.fetch_sub(1, Ordering::Relaxed);
+
+            let mut entry = (*shared).clone();
+            let key = (*entry.item.id(), hotkey.to_owned());
+
+            // Deliver to this hotkey only once
+            if !self.inner.sent.contains(&key) {
+                let _ = self.inner.sent.insert(key, ());
+                entry.count -= 1;
+
+                let dur = (entry.count == 0).then(|| Instant::now() - entry.timestamp);
+
+                result.push(((*entry.item).clone(), dur));
+            }
+
+            // Re-queue if there are more duplicates left
+            if entry.count > 0 {
+                self.inner.len.fetch_add(1, Ordering::Relaxed);
+                self.inner.q.push((*entry).clone());
             }
         }
 
