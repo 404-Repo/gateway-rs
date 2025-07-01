@@ -1,13 +1,12 @@
 use anyhow::anyhow;
 use anyhow::Result;
-use serde::Deserialize;
-use serde::Deserializer;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 use std::{fmt, path::Path};
 use tracing::Level;
 use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
     pub update_gateway_info_ms: u64,
@@ -19,7 +18,7 @@ pub struct BasicConfig {
     pub taskqueue_task_ttl: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetworkConfig {
     pub bind_ip: String,
     // This IP will be used in the internal state
@@ -34,7 +33,7 @@ pub struct NetworkConfig {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RServerConfig {
     pub max_message_size: usize,
     pub receive_message_timeout_ms: u64,
@@ -53,19 +52,19 @@ impl Default for RServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RClientConfig {
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LogConfig {
     pub path: String,
     pub level: LogLevel,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RaftConfig {
     pub cluster_name: String,
     pub election_timeout_min: u64,
@@ -78,18 +77,20 @@ pub struct RaftConfig {
     pub max_in_snapshot_log_to_keep: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HTTPConfig {
     pub compression: bool,
     pub compression_lvl: u32,
     pub port: u16,
-    // Per minute rate limits
+    // Rate limits
     pub basic_rate_limit: usize,
     pub write_rate_limit: usize,
     pub update_key_rate_limit: usize,
-    pub generic_key_rate_limit: usize,
+    pub add_task_generic_hourly_rate_limit: usize,
+    pub add_task_generic_daily_rate_limit: usize,
+    pub add_task_hourly_rate_limit: usize,
+    pub add_task_daily_rate_limit: usize,
     pub load_rate_limit: usize,
-    pub add_task_rate_limit: usize,
     pub add_result_rate_limit: usize,
     pub leader_rate_limit: usize,
     pub metric_rate_limit: usize,
@@ -112,7 +113,7 @@ pub struct HTTPConfig {
     pub keep_alive_interval_sec: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DbConfig {
     pub host: String,
     pub port: u16,
@@ -123,14 +124,14 @@ pub struct DbConfig {
     pub api_keys_update_interval: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Certificate {
     pub dangerous_skip_verification: bool,
     pub cert_file_path: String,
     pub key_file_path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
     pub basic: BasicConfig,
     pub network: NetworkConfig,
@@ -143,7 +144,7 @@ pub struct NodeConfig {
     pub raft: RaftConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 pub enum LogLevel {
     /// Designates very low priority, often extremely verbose, information.
     Trace = 0,
@@ -220,127 +221,13 @@ fn mask_cluster_name(cluster_name: &str) -> String {
 
 impl fmt::Display for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Node Configuration:")?;
-        writeln!(f, "  [Basic]")?;
-        writeln!(
-            f,
-            "    Max Restart Attempts: {}",
-            self.basic.max_restart_attempts
-        )?;
+        let mut masked = self.clone();
+        masked.raft.cluster_name = mask_cluster_name(&masked.raft.cluster_name);
 
-        writeln!(f, "\n  [Network]")?;
-        writeln!(f, "    Name            : {}", self.network.name)?;
-        writeln!(f, "    Bind to IP      : {}", self.network.bind_ip)?;
-        writeln!(f, "    External IP     : {}", self.network.external_ip)?;
-        writeln!(f, "    Domain          : {}", self.network.domain)?;
-        writeln!(f, "    Server Port     : {}", self.network.server_port)?;
-        writeln!(f, "    Node ID         : {}", self.network.node_id)?;
-        writeln!(f, "    Node Endpoints  :")?;
-        for endpoint in &self.network.node_endpoints {
-            writeln!(f, "      - {}", endpoint)?;
+        match toml::to_string_pretty(&masked) {
+            Ok(toml_repr) => write!(f, "{}", toml_repr),
+            Err(_) => Err(fmt::Error),
         }
-        writeln!(f, "    Node DNS Names  :")?;
-        for dns in &self.network.node_dns_names {
-            writeln!(f, "      - {}", dns)?;
-        }
-
-        writeln!(f, "\n  [Protocol]")?;
-        writeln!(
-            f,
-            "    Max Message Size: {} bytes",
-            self.rserver.max_message_size
-        )?;
-
-        writeln!(f, "\n  [HTTP]")?;
-        writeln!(f, "    Port               : {}", self.http.port)?;
-        writeln!(
-            f,
-            "    Compression        : {}",
-            if self.http.compression {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        )?;
-        writeln!(f, "    Compression Level  : {}", self.http.compression_lvl)?;
-        writeln!(
-            f,
-            "    Load Rate Limit    : {} per minute",
-            self.http.load_rate_limit
-        )?;
-        writeln!(
-            f,
-            "    Add Task Rate Limit: {} per minute",
-            self.http.add_task_rate_limit
-        )?;
-        writeln!(
-            f,
-            "    Leader Rate Limit  : {} per minute",
-            self.http.leader_rate_limit
-        )?;
-        writeln!(
-            f,
-            "    Request Size Limit : {} bytes",
-            self.http.request_size_limit
-        )?;
-
-        writeln!(f, "\n  [Certificate]")?;
-        writeln!(
-            f,
-            "    Dangerous Skip Verification: {}",
-            self.cert.dangerous_skip_verification
-        )?;
-        writeln!(
-            f,
-            "    Cert File Path             : {}",
-            self.cert.cert_file_path
-        )?;
-        writeln!(
-            f,
-            "    Key File Path              : {}",
-            self.cert.key_file_path
-        )?;
-
-        writeln!(f, "\n  [Log]")?;
-        writeln!(f, "    Path : {}", self.log.path)?;
-        writeln!(f, "    Level: {}", self.log.level)?;
-
-        writeln!(f, "\n  [Raft]")?;
-        writeln!(
-            f,
-            "    Cluster Name                 : {}",
-            mask_cluster_name(&self.raft.cluster_name)
-        )?;
-        writeln!(
-            f,
-            "    Election Timeout [Min, Max]  : {} ms, {} ms",
-            self.raft.election_timeout_min, self.raft.election_timeout_max
-        )?;
-        writeln!(
-            f,
-            "    Heartbeat Interval           : {} ms",
-            self.raft.heartbeat_interval
-        )?;
-        writeln!(
-            f,
-            "    Max Payload Entries          : {}",
-            self.raft.max_payload_entries
-        )?;
-        writeln!(
-            f,
-            "    Replication Lag Threshold    : {} ms",
-            self.raft.replication_lag_threshold
-        )?;
-        writeln!(
-            f,
-            "    Snapshot Max Chunk Size      : {} bytes",
-            self.raft.snapshot_max_chunk_size
-        )?;
-        writeln!(
-            f,
-            "    Max In-Snapshot Log To Keep  : {}",
-            self.raft.max_in_snapshot_log_to_keep
-        )
     }
 }
 
