@@ -88,7 +88,7 @@ where
 
 pub fn generate_self_signed_config() -> Result<ServerConfig> {
     let rcgen_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let key = rcgen_cert.key_pair.serialize_der();
+    let key = rcgen_cert.signing_key.serialize_der();
     let cert_der: CertificateDer<'static> = rcgen_cert.cert.der().to_vec().into();
 
     let mut rustls_config =
@@ -110,7 +110,7 @@ pub fn generate_and_create_keycert(domain_names: Vec<String>) -> Result<Keycert>
     let cert_pem = certified_key.cert.pem();
     let cert_bytes: Vec<u8> = cert_pem.as_bytes().to_vec();
 
-    let key_pem = certified_key.key_pair.serialize_pem();
+    let key_pem = certified_key.signing_key.serialize_pem();
     let key_bytes: Vec<u8> = key_pem.as_bytes().to_vec();
 
     let keycert = Keycert::new().cert(cert_bytes).key(key_bytes);

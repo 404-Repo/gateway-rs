@@ -93,9 +93,18 @@ impl RateIssuer for UserIDLimitIssuer {
     async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
         let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
         let gs = depot.obtain::<GatewayState>().ok()?;
-        let api_uuid = Uuid::from_str(key_header).ok()?;
-        let user_id = gs.get_user_id(&api_uuid)?;
-        Some(format!("u:{}", user_id))
+
+        if let Some(user_id) = gs.get_user_id(key_header) {
+            return Some(format!("u:{}", user_id));
+        }
+
+        let socket_addr = req.remote_addr();
+        let ip_str = match socket_addr {
+            salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
+            salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
+            _ => return None,
+        };
+        Some(ip_str)
     }
 }
 
@@ -160,7 +169,6 @@ async fn add_task_handler(
     };
 
     let queue = depot.require::<DupQueue<Task>>()?;
-
     let http_cfg = depot.require::<HTTPConfig>()?;
 
     if queue.len() >= http_cfg.max_task_queue_len {
@@ -177,7 +185,55 @@ async fn add_task_handler(
     Ok(())
 }
 
-// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/update_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "content-type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
+#[handler]
+async fn generic_key_update_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let ugk = req
+        .parse_json::<UpdateGenericKeyRequest>()
+        .await
+        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+
+    gateway_state
+        .update_gateway_generic_key(Some(ugk.generic_key))
+        .await
+        .map_err(|e| {
+            ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
+        })?;
+
+    res.status_code(StatusCode::OK);
+    res.render(Text::Plain("Ok"));
+    Ok(())
+}
+
+// curl --http3 -X GET "https://gateway-eu.404.xyz:4443/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+#[handler]
+async fn generic_key_read_handler(
+    depot: &mut Depot,
+    _req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let gateway_state = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+
+    if let Some(uuid) = gateway_state.generic_key().await {
+        let response = GenericKeyResponse { generic_key: uuid };
+        res.render(Json(response));
+        Ok(())
+    } else {
+        Err(ServerError::Internal("Generic key not found".to_string()))
+    }
+}
+
+// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
 //   -F id=123e4567-e89b-12d3-a456-426614174001 \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \
@@ -759,112 +815,30 @@ async fn id_handler(
 }
 
 #[handler]
-async fn api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+async fn api_or_generic_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
     let gateway_state = depot
         .obtain::<GatewayState>()
         .map_err(|_| ServerError::Internal("Failed to obtain GatewayState".to_string()))?;
 
-    let api_key = req
+    let key_str = req
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
+        .ok_or_else(|| ServerError::Unauthorized("Missing API key".to_string()))?;
 
-    match api_key {
-        Some(key) if gateway_state.is_valid_api_key(&key) => Ok(()),
-        _ => Err(ServerError::Unauthorized(
-            "Invalid or missing API key".to_string(),
-        )),
+    if key_str.len() != uuid::fmt::Hyphenated::LENGTH {
+        return Err(ServerError::BadRequest(
+            "Invalid API key length".to_string(),
+        ));
     }
-}
 
-#[handler]
-async fn generic_api_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|_| ServerError::Internal("Failed to obtain GatewayState".to_string()))?;
+    let uuid = Uuid::parse_str(key_str)
+        .map_err(|_| ServerError::BadRequest("API key must be a valid UUID format".to_string()))?;
 
-    let api_key = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
-
-    match api_key {
-        Some(key) if gateway_state.is_generic_key(&key).await => Ok(()),
-        _ => Err(ServerError::Unauthorized(
-            "Invalid or missing API key".to_string(),
-        )),
-    }
-}
-
-#[handler]
-async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
-    let http_cfg = depot
-        .obtain::<HTTPConfig>()
-        .map_err(|_| ServerError::Internal("Failed to obtain HTTPConfig".to_string()))?;
-
-    let is_admin = req
-        .headers()
-        .get("x-admin-key")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok())
-        == Some(http_cfg.admin_key);
-
-    if is_admin {
+    if gateway_state.is_valid_api_key(key_str) || gateway_state.is_generic_key(&uuid).await {
         Ok(())
     } else {
-        Err(ServerError::Unauthorized(
-            "Invalid or missing admin key".to_string(),
-        ))
-    }
-}
-
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/update_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "content-type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
-#[handler]
-async fn generic_key_update_handler(
-    depot: &mut Depot,
-    req: &mut Request,
-    res: &mut Response,
-) -> Result<(), ServerError> {
-    let ugk = req
-        .parse_json::<UpdateGenericKeyRequest>()
-        .await
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
-
-    gateway_state
-        .update_gateway_generic_key(Some(ugk.generic_key))
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
-        })?;
-
-    res.status_code(StatusCode::OK);
-    res.render(Text::Plain("Ok"));
-    Ok(())
-}
-
-// curl --http3 -X GET "https://gateway-eu.404.xyz:4443/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
-#[handler]
-async fn generic_key_read_handler(
-    depot: &mut Depot,
-    _req: &mut Request,
-    res: &mut Response,
-) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
-
-    if let Some(uuid) = gateway_state.generic_key().await {
-        let response = GenericKeyResponse { generic_key: uuid };
-        res.render(Json(response));
-        Ok(())
-    } else {
-        Err(ServerError::Internal("Generic key not found".to_string()))
+        Err(ServerError::Unauthorized("Invalid API key".to_string()))
     }
 }
 
@@ -888,6 +862,28 @@ async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), Se
     res.body(buffer);
 
     Ok(())
+}
+
+#[handler]
+async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+    let http_cfg = depot
+        .obtain::<HTTPConfig>()
+        .map_err(|_| ServerError::Internal("Failed to obtain HTTPConfig".to_string()))?;
+
+    let is_admin = req
+        .headers()
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        == Some(http_cfg.admin_key);
+
+    if is_admin {
+        Ok(())
+    } else {
+        Err(ServerError::Unauthorized(
+            "Invalid or missing admin key".to_string(),
+        ))
+    }
 }
 
 pub struct Http3Server {
@@ -932,6 +928,7 @@ impl Http3Server {
             write_limiter,
             update_limiter,
             generic_limiter,
+            generic_daily_limiter,
             read_limiter,
             task_limiter,
             task_daily_limiter,
@@ -940,7 +937,6 @@ impl Http3Server {
             leader_limiter,
             metric_limiter,
             status_limiter,
-            generic_daily_limiter,
         };
 
         let subnet_state = SubnetState::new(
@@ -1071,17 +1067,11 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_task")
                     .hoop(size_limit_handler())
-                    .hoop(api_key_check)
                     .hoop(rate_limits.task_limiter)
                     .hoop(rate_limits.task_daily_limiter)
-                    .post(add_task_handler),
-            )
-            .push(
-                Router::with_path("/add_task_generic")
-                    .hoop(size_limit_handler())
-                    .hoop(generic_api_key_check)
                     .hoop(rate_limits.generic_limiter)
                     .hoop(rate_limits.generic_daily_limiter)
+                    .hoop(api_or_generic_key_check)
                     .post(add_task_handler),
             )
             .push(
@@ -1125,23 +1115,16 @@ impl Http3Server {
                     .get(id_handler),
             )
             .push(
-                Router::with_path("/get_key")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limits.read_limiter)
-                    .hoop(admin_key_check)
-                    .get(generic_key_read_handler),
-            )
-            .push(
                 Router::with_path("/get_result")
                     .hoop(size_limit_handler())
-                    .hoop(api_key_check)
+                    .hoop(api_or_generic_key_check)
                     .get(get_result_handler),
             )
             .push(
                 Router::with_path("/get_status")
                     .hoop(size_limit_handler())
-                    .hoop(api_key_check)
                     .hoop(rate_limits.status_limiter)
+                    .hoop(api_or_generic_key_check)
                     .get(get_status_handler),
             )
             .push(
@@ -1156,6 +1139,13 @@ impl Http3Server {
                     .hoop(size_limit_handler())
                     .hoop(rate_limits.metric_limiter)
                     .get(metrics_handler),
+            )
+            .push(
+                Router::with_path("/get_key")
+                    .hoop(size_limit_handler())
+                    .hoop(rate_limits.read_limiter)
+                    .hoop(admin_key_check)
+                    .get(generic_key_read_handler),
             )
     }
 

@@ -1,12 +1,12 @@
 [network]
-bind_ip = "0.0.0.0"
-external_ip = "127.0.0.1"
-domain = "localhost"
 node_id = 1
-server_port = 8080
-name = "primary-node"
-node_endpoints = ["127.0.0.1:8081", "127.0.0.1:8082"]
-node_dns_names = ["primary-node", "secondary-node-1", "secondary-node-2"]
+bind_ip = "172.25.0.2"
+external_ip = "172.25.0.2"
+domain = "node-1"
+server_port = 9090
+name = "node-1"
+node_endpoints = []
+node_dns_names = []
 node_id_discovery_sleep = 3
 node_id_discovery_retries = 5
 
@@ -17,18 +17,17 @@ port = 4443
 basic_rate_limit = 30
 write_rate_limit = 180
 update_key_rate_limit = 10
+load_rate_limit = 60
+leader_rate_limit = 10
 add_task_hourly_rate_limit = 25
 add_task_daily_rate_limit = 50
 add_task_generic_hourly_rate_limit = 20
 add_task_generic_daily_rate_limit = 40
-load_rate_limit = 60
-leader_rate_limit = 10
-add_task_rate_limit = 5
-add_result_rate_limit = 300
 metric_rate_limit = 5
 get_status_rate_limit = 60
 request_size_limit = 102400
 request_file_size_limit = 31457280
+add_result_rate_limit = 300
 wss_bittensor = "wss://entrypoint-finney.opentensor.ai:443"
 wss_max_message_size = 2097152
 wss_max_connect_time = 10
@@ -43,18 +42,22 @@ max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
 
 [db]
-host = ""
+host = "db"
 port = 5432
-user = ""
-password = ""
-db = ""
-ca_path = ""
+user = "postgres"
+password = "api_keys_!54321"
+db = "api_keys_db"
+sslcert = "/certs/client.crt"
+sslkey = "/certs/client.key"
+sslrootcert = "/certs/ca.crt"
 api_keys_update_interval = 120
+keys_cache_ttl_sec = 43200
+keys_cache_max_capacity = 10000
 
 [cert]
 dangerous_skip_verification = true
-cert_file_path = ""
-key_file_path = ""
+cert_file_path = "/etc/certs/cert.pem"
+key_file_path = "/etc/certs/key.pem"
 
 [basic]
 max_restart_attempts = 2
@@ -70,13 +73,13 @@ taskqueue_task_ttl = 1800
 path = "./logs/gateway.log"
 level = "Info"
 
-[rserver]
-max_message_size = 262144
-receive_message_timeout_ms = 5000
+[rclient]
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
 
-[rclient]
+[rserver]
+max_message_size = 262144
+receive_message_timeout_ms = 5000
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
 
@@ -89,5 +92,4 @@ max_payload_entries = 100
 replication_lag_threshold = 1200
 snapshot_logs_since_last = 1000
 snapshot_max_chunk_size = 131072
-max_in_snapshot_log_to_keep = 1000
-
+max_in_snapshot_log_to_keep = 1000 

@@ -4,15 +4,28 @@ services:
     entrypoint: []
     command: >
       sh -c "if [ ! -f /certs/server.crt ]; then
-              echo 'Generating self-signed certificate...';
-              openssl req -new -nodes -text -out /certs/server.csr -keyout /certs/server.key -subj '/CN=db';
-              echo '[extensions]' > /tmp/openssl.cnf;
-              echo 'subjectAltName = DNS:db,DNS:localhost,IP:127.0.0.1,IP:172.25.0.5' >> /tmp/openssl.cnf;
-              openssl x509 -req -in /certs/server.csr -text -days 365 -signkey /certs/server.key -out /certs/server.crt -extfile /tmp/openssl.cnf -extensions extensions;
-              cp /certs/server.crt /certs/ca.crt;
-              chown 999:999 /certs/server.key /certs/server.crt /certs/ca.crt;
-              chmod 600 /certs/server.key;
-              chmod 644 /certs/server.crt /certs/ca.crt;
+              echo 'Generating CA certificate...';
+              openssl genrsa -out /certs/ca.key 2048;
+              openssl req -new -x509 -key /certs/ca.key -out /certs/ca.crt -days 365 -subj '/CN=PostgreSQL CA';
+              
+              echo 'Generating server certificate...';
+              openssl genrsa -out /certs/server.key 2048;
+              openssl req -new -key /certs/server.key -out /certs/server.csr -subj '/CN=db';
+              echo '[extensions]' > /tmp/server.cnf;
+              echo 'subjectAltName = DNS:db,DNS:localhost,IP:127.0.0.1,IP:172.25.0.5' >> /tmp/server.cnf;
+              openssl x509 -req -in /certs/server.csr -CA /certs/ca.crt -CAkey /certs/ca.key -CAcreateserial -out /certs/server.crt -days 365 -extfile /tmp/server.cnf -extensions extensions;
+              
+              echo 'Generating client certificate...';
+              openssl genrsa -out /certs/client.key 2048;
+              openssl req -new -key /certs/client.key -out /certs/client.csr -subj '/CN=postgres';
+              openssl x509 -req -in /certs/client.csr -CA /certs/ca.crt -CAkey /certs/ca.key -CAcreateserial -out /certs/client.crt -days 365;
+              
+              echo 'Setting file permissions...';
+              chown 999:999 /certs/server.key /certs/server.crt /certs/ca.crt /certs/client.key /certs/client.crt;
+              chmod 600 /certs/server.key /certs/client.key;
+              chmod 644 /certs/server.crt /certs/ca.crt /certs/client.crt;
+              
+              echo 'Certificates generated successfully';
             fi"
     volumes:
       - certs:/certs
@@ -51,18 +64,20 @@ services:
     environment:
       - GATEWAY_CONFIG=/usr/local/bin/config.toml
     volumes:
-      - ./config/config1.toml:/usr/local/bin/config.toml
+      - ./config/config-single.toml:/usr/local/bin/config.toml
       - certs:/certs
     networks:
       my_network:
         ipv4_address: 172.25.0.2
     depends_on:
+      cert-gen:
+        condition: service_completed_successfully
       db:
         condition: service_healthy
     expose:
       - "9090"
       - "9091"
-    command: ["/usr/local/bin/gateway", "-t", "-c", "/usr/local/bin/config.toml"]
+    command: ["/usr/local/bin/gateway", "--mode", "single"]
 
 networks:
   my_network:

@@ -120,8 +120,12 @@ pub struct DbConfig {
     pub user: String,
     pub password: String,
     pub db: String,
-    pub ca_path: String,
+    pub sslcert: String,
+    pub sslkey: String,
+    pub sslrootcert: String,
     pub api_keys_update_interval: u64,
+    pub keys_cache_ttl_sec: u64,
+    pub keys_cache_max_capacity: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
