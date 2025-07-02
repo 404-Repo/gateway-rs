@@ -104,8 +104,10 @@ struct RateLimits {
     write_limiter: PerIPRateLimiter,
     update_limiter: PerIPRateLimiter,
     generic_limiter: GenericKeyPerIpRateLimiter,
+    generic_daily_limiter: GenericKeyPerIpRateLimiter,
     read_limiter: PerIPRateLimiter,
     task_limiter: UserIDLimiter,
+    task_daily_limiter: UserIDLimiter,
     result_limiter: PerIPRateLimiter,
     load_limiter: PerIPRateLimiter,
     leader_limiter: PerIPRateLimiter,
@@ -909,9 +911,15 @@ impl Http3Server {
             FixedGuard::new(),
             MokaStore::new(),
             GenericKeyPerIpIssuer,
-            BasicQuota::per_minute(http_config.generic_key_rate_limit),
+            BasicQuota::per_hour(http_config.add_task_generic_hourly_rate_limit),
         );
-        let task_limiter = Self::create_user_id_rate_limiter(http_config.add_task_rate_limit);
+        let task_limiter =
+            Self::create_user_id_rate_limiter_per_hour(http_config.add_task_hourly_rate_limit);
+        let task_daily_limiter =
+            Self::create_user_id_rate_limiter_per_day(http_config.add_task_daily_rate_limit);
+        let generic_daily_limiter = Self::create_generic_key_rate_limiter_per_day(
+            http_config.add_task_generic_daily_rate_limit,
+        );
         let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
         let read_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
         let load_limiter = Self::create_ip_rate_limiter(http_config.load_rate_limit);
@@ -925,12 +933,14 @@ impl Http3Server {
             update_limiter,
             generic_limiter,
             read_limiter,
-            load_limiter,
             task_limiter,
+            task_daily_limiter,
             result_limiter,
+            load_limiter,
             leader_limiter,
             metric_limiter,
             status_limiter,
+            generic_daily_limiter,
         };
 
         let subnet_state = SubnetState::new(
@@ -986,7 +996,7 @@ impl Http3Server {
         )
     }
 
-    fn create_user_id_rate_limiter(
+    fn create_user_id_rate_limiter_per_hour(
         quota: usize,
     ) -> RateLimiter<
         FixedGuard,
@@ -998,7 +1008,32 @@ impl Http3Server {
             FixedGuard::new(),
             MokaStore::<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>::new(),
             UserIDLimitIssuer,
-            BasicQuota::per_minute(quota),
+            BasicQuota::per_hour(quota),
+        )
+    }
+
+    fn create_user_id_rate_limiter_per_day(
+        quota: usize,
+    ) -> RateLimiter<
+        FixedGuard,
+        MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
+        UserIDLimitIssuer,
+        BasicQuota,
+    > {
+        RateLimiter::new(
+            FixedGuard::new(),
+            MokaStore::<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>::new(),
+            UserIDLimitIssuer,
+            BasicQuota::set_hours(quota, 24),
+        )
+    }
+
+    fn create_generic_key_rate_limiter_per_day(quota: usize) -> GenericKeyPerIpRateLimiter {
+        GenericKeyPerIpRateLimiter::new(
+            FixedGuard::new(),
+            MokaStore::new(),
+            GenericKeyPerIpIssuer,
+            BasicQuota::set_hours(quota, 24),
         )
     }
 
@@ -1038,6 +1073,7 @@ impl Http3Server {
                     .hoop(size_limit_handler())
                     .hoop(api_key_check)
                     .hoop(rate_limits.task_limiter)
+                    .hoop(rate_limits.task_daily_limiter)
                     .post(add_task_handler),
             )
             .push(
@@ -1045,6 +1081,7 @@ impl Http3Server {
                     .hoop(size_limit_handler())
                     .hoop(generic_api_key_check)
                     .hoop(rate_limits.generic_limiter)
+                    .hoop(rate_limits.generic_daily_limiter)
                     .post(add_task_handler),
             )
             .push(
