@@ -14,6 +14,6 @@ RUN mkdir -p /app/certs && \
 
 FROM alpine:3.22
 RUN apk add --no-cache libstdc++
-COPY --from=builder /app/target/release/gateway /app/config.toml /usr/local/bin/
+COPY --from=builder /app/target/release/gateway /usr/local/bin/
 COPY --from=builder /app/certs /etc/certs
-CMD ["/usr/local/bin/gateway", "-c", "/usr/local/bin/config.toml"]
+CMD ["/usr/local/bin/gateway"]

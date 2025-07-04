@@ -46,8 +46,8 @@ use crate::common::crypto_provider::init_crypto_provider;
 use crate::common::queue::DupQueue;
 use crate::common::task::TaskManager;
 use crate::config::NodeConfig;
+use crate::db::ApiKeyValidator;
 use crate::db::DatabaseBuilder;
-use crate::db::KeysUpdater;
 use crate::http3::client::Http3Client;
 use crate::http3::client::Http3ClientBuilder;
 use crate::http3::server::Http3Server;
@@ -92,7 +92,7 @@ pub struct Gateway {
     pub _gateway_state: GatewayState,
     pub gateway_info_updater: JoinHandle<()>,
     pub gateway_leader_change: JoinHandle<()>,
-    pub api_keys_updater: JoinHandle<()>,
+    pub api_key_validator_updater: JoinHandle<()>,
     pub task_manager: Arc<TaskManager>,
     pub _log_store: LogStore,
     pub http_server: Http3Server,
@@ -353,7 +353,7 @@ impl Drop for Gateway {
         self.http_server.abort();
         self.gateway_info_updater.abort();
         self.gateway_leader_change.abort();
-        self.api_keys_updater.abort();
+        self.api_key_validator_updater.abort();
         self.server.abort();
         self.task_manager.abort();
     }
@@ -574,15 +574,21 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         .user(&config.db.user)
         .password(&config.db.password)
         .dbname(&config.db.db)
-        .ca_pem_path(&config.db.ca_path)
+        .sslcert_path(&config.db.sslcert)
+        .sslkey_path(&config.db.sslkey)
+        .sslrootcert_path(&config.db.sslrootcert)
         .build()
         .await?;
-    let api_keys_updater = Arc::new(KeysUpdater::new(
+    let api_key_validator = ApiKeyValidator::new(
         Arc::new(db),
         Duration::from_secs(config.db.api_keys_update_interval),
-    ));
+        config.db.keys_cache_ttl_sec,
+        config.db.keys_cache_max_capacity,
+    )?;
+    let api_key_validator = Arc::new(api_key_validator);
 
-    let api_keys_updater_handle = tokio::spawn(KeysUpdater::run(Arc::clone(&api_keys_updater)));
+    let api_key_validator_updater =
+        tokio::spawn(ApiKeyValidator::run(Arc::clone(&api_key_validator)));
     let task_manager = TaskManager::new(
         config.basic.taskmanager_initial_capacity,
         config.basic.unique_validators_per_task,
@@ -596,7 +602,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         raft.clone(),
         config.raft.cluster_name.clone(),
         last_task_acquisition.clone(),
-        api_keys_updater,
+        api_key_validator,
         Arc::clone(&task_manager),
     );
 
@@ -657,7 +663,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         _gateway_state: gateway_state,
         gateway_info_updater,
         gateway_leader_change,
-        api_keys_updater: api_keys_updater_handle,
+        api_key_validator_updater,
         task_manager,
         _log_store: log_store,
         http_server,

@@ -2,7 +2,7 @@ use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use crate::common::task::TaskManager;
-use crate::db::KeysUpdater;
+use crate::db::ApiKeyValidator;
 use anyhow::Result;
 use openraft::{BasicNode, RaftMetrics};
 use serde_json;
@@ -32,7 +32,14 @@ impl fmt::Display for GatewayStateError {
     }
 }
 
-impl std::error::Error for GatewayStateError {}
+impl std::error::Error for GatewayStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GatewayStateError::NotFound(_) => None,
+            GatewayStateError::DeserializeError(e) => Some(e),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct GatewayState {
@@ -40,7 +47,7 @@ pub struct GatewayState {
     raft: Arc<RwLock<Raft>>,
     cluster_name: String,
     last_task_acquisition: Arc<AtomicU64>,
-    keys_updater: Arc<KeysUpdater>,
+    key_validator: Arc<ApiKeyValidator>,
     task_manager: Arc<TaskManager>,
 }
 
@@ -50,7 +57,7 @@ impl GatewayState {
         raft: Arc<RwLock<Raft>>,
         cluster_name: String,
         last_task_acquisition: Arc<AtomicU64>,
-        keys_updater: Arc<KeysUpdater>,
+        key_validator_updater: Arc<ApiKeyValidator>,
         task_manager: Arc<TaskManager>,
     ) -> Self {
         Self {
@@ -58,7 +65,7 @@ impl GatewayState {
             raft,
             cluster_name,
             last_task_acquisition,
-            keys_updater,
+            key_validator: key_validator_updater,
             task_manager,
         }
     }
@@ -185,12 +192,12 @@ impl GatewayState {
         }
     }
 
-    pub fn is_valid_api_key(&self, api_key: &Uuid) -> bool {
-        self.keys_updater.is_valid_api_key(api_key)
+    pub fn is_valid_api_key(&self, api_key: &str) -> bool {
+        self.key_validator.is_valid_api_key(api_key)
     }
 
-    pub fn get_user_id(&self, api_key: &Uuid) -> Option<Uuid> {
-        self.keys_updater.get_user_id(api_key)
+    pub fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
+        self.key_validator.get_user_id(api_key)
     }
 
     pub fn cluster_name(&self) -> &str {

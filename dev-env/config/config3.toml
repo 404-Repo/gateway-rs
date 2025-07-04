@@ -17,7 +17,6 @@ port = 4443
 basic_rate_limit = 30
 write_rate_limit = 180
 update_key_rate_limit = 10
-generic_key_rate_limit = 2
 load_rate_limit = 60
 leader_rate_limit = 10
 add_task_hourly_rate_limit = 25
@@ -48,8 +47,12 @@ port = 5432
 user = "postgres"
 password = "api_keys_!54321"
 db = "api_keys_db"
-ca_path = "/certs/ca.crt"
+sslcert = "/certs/client.crt"
+sslkey = "/certs/client.key"
+sslrootcert = "/certs/ca.crt"
 api_keys_update_interval = 120
+keys_cache_ttl_sec = 43200
+keys_cache_max_capacity = 10000
 
 [cert]
 dangerous_skip_verification = true
