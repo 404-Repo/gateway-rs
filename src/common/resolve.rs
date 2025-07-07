@@ -3,8 +3,7 @@ use anyhow::Result;
 use futures::future::try_join_all;
 use std::net::IpAddr;
 
-// TODO: Use it to remove node_endpoints from config file
-pub async fn _resolve_dns_names_to_ips(dns_names: &[impl AsRef<str>]) -> Result<Vec<IpAddr>> {
+pub async fn lookup_hosts_ips(dns_names: &[impl AsRef<str>]) -> Result<Vec<IpAddr>> {
     let futures = dns_names.iter().map(|dns_name| async {
         let addrs = tokio::net::lookup_host((dns_name.as_ref(), 0)).await?;
         let ip = addrs

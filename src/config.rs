@@ -26,7 +26,6 @@ pub struct NetworkConfig {
     pub domain: String,
     pub server_port: u16,
     pub node_id: u64,
-    pub node_endpoints: Vec<String>,
     pub node_dns_names: Vec<String>,
     pub node_id_discovery_sleep: u64,
     pub node_id_discovery_retries: usize,
