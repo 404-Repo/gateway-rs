@@ -5,7 +5,6 @@ external_ip = "172.25.0.2"
 domain = "node-1"
 server_port = 9090
 name = "node-1"
-node_endpoints = []
 node_dns_names = []
 node_id_discovery_sleep = 3
 node_id_discovery_retries = 5

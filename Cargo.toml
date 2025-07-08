@@ -15,7 +15,7 @@ salvo = { git = "https://github.com/salvo-rs/salvo.git", rev = "fabdc7520218171b
 ] }
 spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "0588dd08ed8bc628f8a2e69f8f8b5d98f3d13fb5", features = ["async"]}
 multer = "3.1.0"
-tokio = { version = "1.46.0", features = ["full"] }
+tokio = { version = "1.46.1", features = ["full"] }
 tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"] }
 async-tungstenite = { version = "0.29.1", features = [
     "tokio-runtime",
