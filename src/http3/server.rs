@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use async_zip::base::write::ZipFileWriter;
@@ -15,9 +14,6 @@ use salvo::conn::quinn::QuinnListener;
 use salvo::conn::rustls::RustlsConfig;
 use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
-use salvo::rate_limiter::{
-    BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
-};
 
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::io::StreamReader;
@@ -43,86 +39,7 @@ use crate::raft::gateway_state::GatewayState;
 use multer::SizeLimit;
 
 use super::error::ServerError;
-
-type PerIPRateLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
-    RemoteIpIssuer,
-    BasicQuota,
->;
-
-type GenericKeyPerIpRateLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<GenericKeyPerIpIssuer as RateIssuer>::Key, FixedGuard>,
-    GenericKeyPerIpIssuer,
-    BasicQuota,
->;
-
-struct GenericKeyPerIpIssuer;
-impl RateIssuer for GenericKeyPerIpIssuer {
-    type Key = String;
-
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-        let uuid = Uuid::from_str(key_header).ok()?;
-
-        if gs.is_generic_key(&uuid).await {
-            let socket_addr = req.remote_addr();
-            let ip_str = match socket_addr {
-                salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
-                salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
-                _ => return None,
-            };
-            return Some(format!("g:{}", ip_str));
-        }
-        None
-    }
-}
-
-type UserIDLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
-    UserIDLimitIssuer,
-    BasicQuota,
->;
-struct UserIDLimitIssuer;
-impl RateIssuer for UserIDLimitIssuer {
-    type Key = String;
-
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-
-        if let Some(user_id) = gs.get_user_id(key_header) {
-            return Some(format!("u:{}", user_id));
-        }
-
-        let socket_addr = req.remote_addr();
-        let ip_str = match socket_addr {
-            salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
-            salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
-            _ => return None,
-        };
-        Some(ip_str)
-    }
-}
-
-struct RateLimits {
-    basic_limiter: PerIPRateLimiter,
-    write_limiter: PerIPRateLimiter,
-    update_limiter: PerIPRateLimiter,
-    generic_limiter: GenericKeyPerIpRateLimiter,
-    generic_daily_limiter: GenericKeyPerIpRateLimiter,
-    read_limiter: PerIPRateLimiter,
-    task_limiter: UserIDLimiter,
-    task_daily_limiter: UserIDLimiter,
-    result_limiter: PerIPRateLimiter,
-    load_limiter: PerIPRateLimiter,
-    leader_limiter: PerIPRateLimiter,
-    metric_limiter: PerIPRateLimiter,
-    status_limiter: PerIPRateLimiter,
-}
+use super::rate_limits::RateLimits;
 
 pub(crate) trait DepotExt {
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
@@ -900,44 +817,7 @@ impl Http3Server {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
     ) -> Self {
-        let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
-        let write_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
-        let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
-        let generic_limiter = GenericKeyPerIpRateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            GenericKeyPerIpIssuer,
-            BasicQuota::per_hour(http_config.add_task_generic_hourly_rate_limit),
-        );
-        let task_limiter =
-            Self::create_user_id_rate_limiter_per_hour(http_config.add_task_hourly_rate_limit);
-        let task_daily_limiter =
-            Self::create_user_id_rate_limiter_per_day(http_config.add_task_daily_rate_limit);
-        let generic_daily_limiter = Self::create_generic_key_rate_limiter_per_day(
-            http_config.add_task_generic_daily_rate_limit,
-        );
-        let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
-        let read_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
-        let load_limiter = Self::create_ip_rate_limiter(http_config.load_rate_limit);
-        let leader_limiter = Self::create_ip_rate_limiter(http_config.leader_rate_limit);
-        let metric_limiter = Self::create_ip_rate_limiter(http_config.metric_rate_limit);
-        let status_limiter = Self::create_ip_rate_limiter(http_config.get_status_rate_limit);
-
-        let rate_limits = RateLimits {
-            basic_limiter,
-            write_limiter,
-            update_limiter,
-            generic_limiter,
-            generic_daily_limiter,
-            read_limiter,
-            task_limiter,
-            task_daily_limiter,
-            result_limiter,
-            load_limiter,
-            leader_limiter,
-            metric_limiter,
-            status_limiter,
-        };
+        let rate_limits = RateLimits::new(http_config);
 
         let subnet_state = SubnetState::new(
             http_config.wss_bittensor.clone(),
@@ -976,63 +856,6 @@ impl Http3Server {
         }
     }
 
-    fn create_ip_rate_limiter(
-        quota: usize,
-    ) -> RateLimiter<
-        FixedGuard,
-        MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
-        RemoteIpIssuer,
-        BasicQuota,
-    > {
-        RateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
-            RemoteIpIssuer,
-            BasicQuota::per_minute(quota),
-        )
-    }
-
-    fn create_user_id_rate_limiter_per_hour(
-        quota: usize,
-    ) -> RateLimiter<
-        FixedGuard,
-        MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
-        UserIDLimitIssuer,
-        BasicQuota,
-    > {
-        RateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>::new(),
-            UserIDLimitIssuer,
-            BasicQuota::per_hour(quota),
-        )
-    }
-
-    fn create_user_id_rate_limiter_per_day(
-        quota: usize,
-    ) -> RateLimiter<
-        FixedGuard,
-        MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
-        UserIDLimitIssuer,
-        BasicQuota,
-    > {
-        RateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>::new(),
-            UserIDLimitIssuer,
-            BasicQuota::set_hours(quota, 24),
-        )
-    }
-
-    fn create_generic_key_rate_limiter_per_day(quota: usize) -> GenericKeyPerIpRateLimiter {
-        GenericKeyPerIpRateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            GenericKeyPerIpIssuer,
-            BasicQuota::set_hours(quota, 24),
-        )
-    }
-
     fn setup_router(
         node_id: usize,
         task_queue: DupQueue<Task>,
@@ -1067,11 +890,12 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_task")
                     .hoop(size_limit_handler())
-                    .hoop(rate_limits.task_limiter)
-                    .hoop(rate_limits.task_daily_limiter)
-                    .hoop(rate_limits.generic_limiter)
-                    .hoop(rate_limits.generic_daily_limiter)
+                    .hoop(rate_limits.add_task_basic_per_ip_rate_limiter)
                     .hoop(api_or_generic_key_check)
+                    .hoop(rate_limits.generic_global_limiter)
+                    .hoop(rate_limits.generic_per_ip_limiter)
+                    .hoop(rate_limits.user_id_global_limiter)
+                    .hoop(rate_limits.user_id_per_user_limiter)
                     .post(add_task_handler),
             )
             .push(
