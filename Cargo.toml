@@ -5,7 +5,7 @@ edition = "2021"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { git = "https://github.com/salvo-rs/salvo.git", rev = "fabdc7520218171b31f004a044bbce0516f10ee1", features = [
+salvo = { version = "0.80.0", features = [
     "quinn",
     "rustls",
     "rate-limiter",
@@ -13,7 +13,7 @@ salvo = { git = "https://github.com/salvo-rs/salvo.git", rev = "fabdc7520218171b
     "size-limiter",
     "compression",
 ] }
-spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "0588dd08ed8bc628f8a2e69f8f8b5d98f3d13fb5", features = ["async"]}
+spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "999b57ea29af93cb851917a98d23d62f1d633988", features = ["async"]}
 multer = "3.1.0"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"] }
@@ -25,7 +25,7 @@ async_zip = { version = "0.0.17", features = ["deflate"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
 tokio-util = "0.7.15"
-clap = "4.5.40"
+clap = "4.5.41"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 tracing-appender = "0.2.3"
@@ -39,7 +39,7 @@ tokio-postgres-rustls = "0.13.0"
 rustls = { version = "0.23.28" }
 rustls-platform-verifier = "0.6.0"
 rustls-pemfile = "2.2.0"
-toml = "0.8.23"
+toml = "0.9.0"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

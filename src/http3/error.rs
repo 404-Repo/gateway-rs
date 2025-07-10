@@ -1,10 +1,8 @@
 use bytes::Bytes;
 use futures::stream;
 use http::{header::CONTENT_TYPE, HeaderValue, StatusCode};
-use salvo::conn::SocketAddr;
 use salvo::{async_trait, Depot, Request, Response, Writer};
 use std::convert::Infallible;
-use tracing::error;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -27,7 +25,7 @@ impl ServerError {
 
 #[async_trait]
 impl Writer for ServerError {
-    async fn write(self, req: &mut Request, _depot: &mut Depot, res: &mut Response) {
+    async fn write(self, _req: &mut Request, _depot: &mut Depot, res: &mut Response) {
         res.status_code(self.status_code());
         res.headers_mut().insert(
             CONTENT_TYPE,
@@ -46,20 +44,6 @@ impl Writer for ServerError {
             ServerError::Unauthorized(msg) => format!("Unauthorized request: {}", msg),
             ServerError::NotFound(msg) => msg,
         };
-
-        let client_ip = match req.remote_addr() {
-            SocketAddr::IPv4(addr_v4) => addr_v4.ip().to_string(),
-            SocketAddr::IPv6(addr_v6) => addr_v6.ip().to_string(),
-            _ => "unknown".to_string(),
-        };
-
-        error!(
-            "Error handling request from {}: {} {} - {}",
-            client_ip,
-            req.method(),
-            req.uri().path(),
-            msg
-        );
 
         let bytes = Bytes::from(msg);
         let single = stream::once(async move { Ok::<_, Infallible>(bytes) });
