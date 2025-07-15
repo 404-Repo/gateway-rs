@@ -10,6 +10,7 @@ pub enum ServerError {
     Internal(String),
     Unauthorized(String),
     NotFound(String),
+    TooManyRequests(String),
 }
 
 impl ServerError {
@@ -19,6 +20,7 @@ impl ServerError {
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
@@ -43,6 +45,7 @@ impl Writer for ServerError {
             }
             ServerError::Unauthorized(msg) => format!("Unauthorized request: {}", msg),
             ServerError::NotFound(msg) => msg,
+            ServerError::TooManyRequests(msg) => format!("Too many requests: {}", msg),
         };
 
         let bytes = Bytes::from(msg);

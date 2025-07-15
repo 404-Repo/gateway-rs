@@ -17,6 +17,9 @@ mod metrics;
 mod protocol;
 mod raft;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "Gateway", version = "1.0", about = "Gateway")]
 struct Cli {

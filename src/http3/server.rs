@@ -39,7 +39,8 @@ use crate::raft::gateway_state::GatewayState;
 use multer::SizeLimit;
 
 use super::error::ServerError;
-use super::rate_limits::RateLimits;
+use super::user_rate_limits::RateLimits;
+use crate::http3::company_rate_limits::{company_rate_limit, CompanyRateLimiterStore};
 
 pub(crate) trait DepotExt {
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
@@ -752,7 +753,10 @@ async fn api_or_generic_key_check(depot: &mut Depot, req: &mut Request) -> Resul
     let uuid = Uuid::parse_str(key_str)
         .map_err(|_| ServerError::BadRequest("API key must be a valid UUID format".to_string()))?;
 
-    if gateway_state.is_valid_api_key(key_str) || gateway_state.is_generic_key(&uuid).await {
+    if gateway_state.is_valid_api_key(key_str)
+        || gateway_state.is_generic_key(&uuid).await
+        || gateway_state.is_company_key(key_str)
+    {
         Ok(())
     } else {
         Err(ServerError::Unauthorized("Invalid API key".to_string()))
@@ -869,6 +873,8 @@ impl Http3Server {
         let file_size_limit_handler = SecureMaxSize(config.request_file_size_limit as usize);
 
         let metrics = Metrics::new(0.05).expect("Failed to create Metrics");
+        // in-memory store for per-company rate limiting
+        let company_store = CompanyRateLimiterStore::new();
 
         let router = if config.compression {
             Router::new().hoop(
@@ -887,15 +893,17 @@ impl Http3Server {
             .hoop(affix_state::inject(config))
             .hoop(affix_state::inject(node_id))
             .hoop(affix_state::inject(metrics))
+            .hoop(affix_state::inject(company_store))
             .push(
                 Router::with_path("/add_task")
                     .hoop(size_limit_handler())
-                    .hoop(rate_limits.add_task_basic_per_ip_rate_limiter)
+                    .hoop(rate_limits.unauthorized_only_limiter)
                     .hoop(api_or_generic_key_check)
                     .hoop(rate_limits.generic_global_limiter)
                     .hoop(rate_limits.generic_per_ip_limiter)
                     .hoop(rate_limits.user_id_global_limiter)
                     .hoop(rate_limits.user_id_per_user_limiter)
+                    .hoop(company_rate_limit)
                     .post(add_task_handler),
             )
             .push(

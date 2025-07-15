@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use foldhash::fast::RandomState;
-use foldhash::{HashMapExt as _, HashSetExt as _};
 use moka::sync::Cache;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
@@ -325,10 +324,16 @@ pub struct ApiKeyValidator {
     users: scc::HashMap<Uuid, Vec<String>, RandomState>,
     // reverse mapping: api_key_hash -> user_id
     api_key_hashes: scc::HashMap<String, Uuid, RandomState>,
+    // mapping from company_id -> (name, hourly, daily) rate limits
+    companies: scc::HashMap<Uuid, (String, u64, u64), RandomState>,
+    // reverse mapping: company_api_key_hash -> company_id
+    company_api_key_hashes: scc::HashMap<String, Uuid, RandomState>,
     // Argon2 hasher for API key verification
     hasher: ApiKeyHasher,
     // For validated API keys (api_key -> user_id) with TTL
     validation_cache: Cache<String, Uuid, RandomState>,
+    // For validated company API keys (api_key -> company_id) with TTL
+    company_validation_cache: Cache<String, Uuid, RandomState>,
     update_interval: Duration,
 }
 
@@ -344,12 +349,23 @@ impl ApiKeyValidator {
             .time_to_live(Duration::from_secs(cache_ttl_sec))
             .build_with_hasher(RandomState::default());
 
+        let company_validation_cache = Cache::builder()
+            .max_capacity(cache_max_capacity)
+            .time_to_live(Duration::from_secs(cache_ttl_sec))
+            .build_with_hasher(RandomState::default());
+
+        let companies = scc::HashMap::with_capacity_and_hasher(4096, RandomState::default());
+        let company_api_key_hashes =
+            scc::HashMap::with_capacity_and_hasher(4096, RandomState::default());
         Ok(Self {
             db,
             users: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
             api_key_hashes: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
+            companies,
+            company_api_key_hashes,
             hasher: ApiKeyHasher::new()?,
             validation_cache,
+            company_validation_cache,
             update_interval,
         })
     }
@@ -365,6 +381,11 @@ impl ApiKeyValidator {
     }
 
     async fn update_hashes(&self) -> Result<()> {
+        self.update_users_data().await?;
+        self.update_companies_data().await
+    }
+
+    async fn update_users_data(&self) -> Result<()> {
         let query = r#"
     SELECT
         u.id,
@@ -375,13 +396,14 @@ impl ApiKeyValidator {
 "#;
         let rows = self.db.query(query, &[]).await?;
 
-        let mut new_keys: foldhash::HashMap<Uuid, Vec<String>> =
-            foldhash::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let user_id: Uuid = row.get("id");
-            let api_key_hashes: Vec<String> = row.get("api_key_hashes");
-            new_keys.insert(user_id, api_key_hashes);
-        }
+        let new_keys: foldhash::HashMap<Uuid, Vec<String>> = rows
+            .into_iter()
+            .map(|row| {
+                let user_id: Uuid = row.get("id");
+                let api_key_hashes: Vec<String> = row.get("api_key_hashes");
+                (user_id, api_key_hashes)
+            })
+            .collect();
 
         let total_api_keys: usize = new_keys.values().map(|v| v.len()).sum();
         info!(
@@ -390,17 +412,14 @@ impl ApiKeyValidator {
             new_keys.len()
         );
 
-        let mut new_user_ids: foldhash::HashSet<&Uuid> =
-            foldhash::HashSet::with_capacity(new_keys.len());
-        for user_id in new_keys.keys() {
-            new_user_ids.insert(user_id);
-        }
+        let new_user_ids: foldhash::HashSet<_> = new_keys.keys().copied().collect();
         self.users
             .retain_async(|k, _| new_user_ids.contains(k))
             .await;
         for (user_id, new_api_key_hashes) in &new_keys {
             self.users
-                .entry(*user_id)
+                .entry_async(*user_id)
+                .await
                 .and_modify(|v| {
                     if *v != *new_api_key_hashes {
                         *v = new_api_key_hashes.clone();
@@ -409,10 +428,8 @@ impl ApiKeyValidator {
                 .or_insert(new_api_key_hashes.clone());
         }
 
-        let total_api_key_hashes: usize = new_keys.values().map(|v| v.len()).sum();
-        let mut new_api_key_hash_set: foldhash::HashSet<String> =
-            foldhash::HashSet::with_capacity(total_api_key_hashes);
-        new_api_key_hash_set.extend(new_keys.values().flatten().cloned());
+        let new_api_key_hash_set: foldhash::HashSet<String> =
+            new_keys.values().flatten().cloned().collect();
 
         self.api_key_hashes
             .retain_async(|k, _| new_api_key_hash_set.contains(k))
@@ -421,7 +438,8 @@ impl ApiKeyValidator {
         for (user_id, api_key_hashes_vec) in &new_keys {
             for api_key_hash in api_key_hashes_vec {
                 self.api_key_hashes
-                    .entry(api_key_hash.clone())
+                    .entry_async(api_key_hash.clone())
+                    .await
                     .and_modify(|existing_user| {
                         if *existing_user != *user_id {
                             *existing_user = *user_id;
@@ -429,6 +447,81 @@ impl ApiKeyValidator {
                     })
                     .or_insert(*user_id);
             }
+        }
+        Ok(())
+    }
+
+    async fn update_companies_data(&self) -> Result<()> {
+        let comp_rows = self
+            .db
+            .query(
+                "SELECT id, name, rate_limit_hourly, rate_limit_daily FROM companies",
+                &[],
+            )
+            .await?;
+
+        let new_companies: foldhash::HashMap<Uuid, (String, u64, u64)> = comp_rows
+            .into_iter()
+            .map(|row| {
+                let company_id: Uuid = row.get("id");
+                let name: String = row.get("name");
+                let hourly: i32 = row.get("rate_limit_hourly");
+                let daily: i32 = row.get("rate_limit_daily");
+                (company_id, (name, hourly as u64, daily as u64))
+            })
+            .collect();
+
+        let company_keys: foldhash::HashSet<_> = new_companies.keys().copied().collect();
+        self.companies
+            .retain_async(|k, _| company_keys.contains(k))
+            .await;
+        for (cid, limits) in &new_companies {
+            self.companies
+                .entry_async(*cid)
+                .await
+                .and_modify(|v| {
+                    if *v != *limits {
+                        *v = limits.clone();
+                    }
+                })
+                .or_insert(limits.clone());
+        }
+
+        let cak_rows = self
+            .db
+            .query("SELECT company_id, api_key_hash FROM company_api_keys", &[])
+            .await?;
+
+        let new_company_keys: foldhash::HashMap<String, Uuid> = cak_rows
+            .into_iter()
+            .map(|row| {
+                let company_id: Uuid = row.get("company_id");
+                let hash: String = row.get("api_key_hash");
+                (hash, company_id)
+            })
+            .collect();
+
+        info!(
+            "Retrieved {} company API keys for {} companies from the database",
+            new_company_keys.len(),
+            new_companies.len()
+        );
+
+        let cak_hashes: foldhash::HashSet<_> = new_company_keys.keys().cloned().collect();
+        self.company_api_key_hashes
+            .retain_async(|k, _| cak_hashes.contains(k))
+            .await;
+
+        for (hash, cid) in new_company_keys {
+            self.company_api_key_hashes
+                .entry_async(hash)
+                .await
+                .and_modify(|v| {
+                    if *v != cid {
+                        *v = cid;
+                    }
+                })
+                .or_insert(cid);
         }
 
         Ok(())
@@ -450,11 +543,42 @@ impl ApiKeyValidator {
         result
     }
 
+    fn find_company_for_api_key(&self, api_key: &str) -> Option<Uuid> {
+        if let Some(company_id) = self.company_validation_cache.get(api_key) {
+            return Some(company_id);
+        }
+
+        let mut company_id = None;
+        self.company_api_key_hashes.scan(|hash, cid| {
+            if self.hasher.verify_api_key(api_key, hash).unwrap_or(false) {
+                company_id = Some(*cid);
+            }
+        });
+
+        if let Some(cid) = company_id {
+            self.company_validation_cache
+                .insert(api_key.to_string(), cid);
+        }
+        company_id
+    }
+
     pub fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
         self.find_user_for_api_key(api_key)
     }
 
     pub fn is_valid_api_key(&self, api_key: &str) -> bool {
         self.find_user_for_api_key(api_key).is_some()
+    }
+
+    pub fn is_company_key(&self, api_key: &str) -> bool {
+        self.find_company_for_api_key(api_key).is_some()
+    }
+
+    pub fn get_company_info_from_key(&self, api_key: &str) -> Option<(Uuid, (String, u64, u64))> {
+        self.find_company_for_api_key(api_key).and_then(|cid| {
+            self.companies
+                .get(&cid)
+                .map(|company_info| (cid, company_info.get().clone()))
+        })
     }
 }

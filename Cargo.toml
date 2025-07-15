@@ -17,7 +17,7 @@ spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "999b57ea29af9
 multer = "3.1.0"
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-postgres = { version = "0.7.13", features = ["with-uuid-1"] }
-async-tungstenite = { version = "0.29.1", features = [
+async-tungstenite = { version = "0.30.0", features = [
     "tokio-runtime",
     "tokio-rustls-native-certs",
 ] }
@@ -34,24 +34,24 @@ h3 = { version = "0.0.8", features = ["tracing"] }
 h3-quinn = { version = "0.0.10" }
 http = "1.3.1"
 backon = "1.5.1"
-openraft = { version = "0.9.20", features = ["storage-v2", "serde"] }
+openraft = { version = "0.9.21", features = ["storage-v2", "serde"] }
 tokio-postgres-rustls = "0.13.0"
-rustls = { version = "0.23.28" }
+rustls = { version = "0.23.29" }
 rustls-platform-verifier = "0.6.0"
 rustls-pemfile = "2.2.0"
-toml = "0.9.0"
+toml = "0.9.2"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 rmp-serde = "1.3.0"
 anyhow = "1.0.98"
 bytes = "1.10.1"
-rcgen = { version = "0.14.1", features = ["pem"] }
+rcgen = { version = "0.14.2", features = ["pem"] }
 foldhash = "0.1.5"
 scc = "2.3.4"
-sdd = "3.0.8"
+sdd = "3.0.9"
 hex = "0.4.3"
-schnorrkel = "0.11.4"
+schnorrkel = "0.11.5"
 base64 = "0.22.1"
 parity-scale-codec = { version = "3.7.5", features = ["derive"] }
 blake2 = "0.10.6"
@@ -60,6 +60,7 @@ itertools = "0.14.0"
 prometheus = "0.14.0"
 argon2 = "0.5.3"
 moka = { version = "0.12.10", features = ["sync"] }
+mimalloc = { version = "0.1.47", default-features = false }
 
 [build-dependencies]
 anyhow = "1.0.98"

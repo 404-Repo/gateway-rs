@@ -40,3 +40,25 @@ VALUES ('123e4567-e89b-12d3-a456-426614174000', '$argon2d$v=19$m=9216,t=4,p=1$a3
 -- Plain text: 123e4567-e89b-12d3-a456-426614174002
 INSERT INTO api_keys (user_id, api_key_hash, api_key_partial)
 VALUES ('123e4567-e89b-12d3-a456-426614174000', '$argon2d$v=19$m=9216,t=4,p=1$RWJ1akVHY1pCTGtLQ3VWag$8FMv75EwUfq944H8ZgIOOgYccDKduX57443QQGgJc0E', '123e45');
+
+-- Companies table
+CREATE TABLE IF NOT EXISTS companies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) NOT NULL UNIQUE,
+  rate_limit_hourly INT NOT NULL DEFAULT 60,
+  rate_limit_daily INT NOT NULL DEFAULT 600,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_companies_name ON companies(name);
+
+-- Company API keys table
+CREATE TABLE IF NOT EXISTS company_api_keys (
+  id SERIAL PRIMARY KEY,
+  company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  api_key_hash VARCHAR(255) NOT NULL,
+  api_key_partial VARCHAR(6) NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_company_api_keys_company_id ON company_api_keys(company_id);
+CREATE INDEX IF NOT EXISTS idx_company_api_keys_hash ON company_api_keys(api_key_hash);

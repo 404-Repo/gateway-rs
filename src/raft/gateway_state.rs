@@ -196,8 +196,16 @@ impl GatewayState {
         self.key_validator.is_valid_api_key(api_key)
     }
 
+    pub fn is_company_key(&self, api_key: &str) -> bool {
+        self.key_validator.is_company_key(api_key)
+    }
+
     pub fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
         self.key_validator.get_user_id(api_key)
+    }
+
+    pub fn get_company_rate_limits(&self, api_key: &str) -> Option<(Uuid, (String, u64, u64))> {
+        self.key_validator.get_company_info_from_key(api_key)
     }
 
     pub fn cluster_name(&self) -> &str {
