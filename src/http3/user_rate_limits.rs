@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use salvo::prelude::*;
 use salvo::rate_limiter::{
@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use crate::config::HTTPConfig;
 use crate::raft::gateway_state::GatewayState;
+
+static BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type PerIPRateLimiter = RateLimiter<
     FixedGuard,
@@ -45,6 +47,13 @@ pub type UserIDLimiter = RateLimiter<
     BasicQuota,
 >;
 
+pub type UnauthorizedOnlyRateLimiter = RateLimiter<
+    FixedGuard,
+    MokaStore<<UnauthorizedOnlyIssuer as RateIssuer>::Key, FixedGuard>,
+    UnauthorizedOnlyIssuer,
+    BasicQuota,
+>;
+
 pub struct GenericKeyPerIpIssuer;
 
 impl RateIssuer for GenericKeyPerIpIssuer {
@@ -58,20 +67,15 @@ impl RateIssuer for GenericKeyPerIpIssuer {
         let ip_str = match req.remote_addr() {
             salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
             salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
-            _ => {
-                return if gs.is_generic_key(&uuid).await {
-                    Some("g_unknown_ip".into())
-                } else {
-                    None
-                }
-            }
+            _ => return None,
         };
 
         if gs.is_generic_key(&uuid).await {
-            Some(format!("g_{}", ip_str))
-        } else {
-            Some(ip_str)
+            return Some(format!("g_{}", ip_str));
         }
+
+        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Some(counter.to_string())
     }
 }
 
@@ -87,7 +91,9 @@ impl RateIssuer for GlobalGenericKeyIssuer {
         if gs.is_generic_key(&uuid).await {
             return Some("g_gk".to_string());
         }
-        Some(Instant::now().elapsed().as_secs().to_string())
+
+        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Some(counter.to_string())
     }
 }
 
@@ -102,7 +108,9 @@ impl RateIssuer for GlobalUserIDIssuer {
         if gs.get_user_id(key_header).is_some() {
             return Some("g_uid".to_string());
         }
-        Some(Instant::now().elapsed().as_secs().to_string())
+
+        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Some(counter.to_string())
     }
 }
 
@@ -118,13 +126,41 @@ impl RateIssuer for UserIDLimitIssuer {
             return Some(format!("u_{}", user_id));
         }
 
-        let socket_addr = req.remote_addr();
-        let ip_str = match socket_addr {
-            salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
-            salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
-            _ => return None,
+        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Some(counter.to_string())
+    }
+}
+
+pub struct UnauthorizedOnlyIssuer;
+
+impl RateIssuer for UnauthorizedOnlyIssuer {
+    type Key = String;
+
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        let ip_str = || match req.remote_addr() {
+            salvo::conn::SocketAddr::IPv4(addr) => Some(addr.ip().to_string()),
+            salvo::conn::SocketAddr::IPv6(addr) => Some(addr.ip().to_string()),
+            _ => None,
         };
-        Some(ip_str)
+
+        let gs = depot.obtain::<GatewayState>().ok()?;
+
+        if let Some(key_str) = req.headers().get("x-api-key").and_then(|h| h.to_str().ok()) {
+            if let Ok(uuid) = Uuid::parse_str(key_str) {
+                let is_authorized = gs.is_valid_api_key(key_str)
+                    || gs.is_generic_key(&uuid).await
+                    || gs.is_company_key(key_str);
+
+                if is_authorized {
+                    // Authorized, bypass rate limiting
+                    let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    return Some(counter.to_string());
+                }
+            }
+        }
+
+        // For any case that is not a valid, authorized key, we rate limit by IP
+        ip_str()
     }
 }
 
@@ -132,8 +168,8 @@ pub struct RateLimits {
     pub basic_limiter: PerIPRateLimiter,
     pub write_limiter: PerIPRateLimiter,
     pub update_limiter: PerIPRateLimiter,
-    /// This only prevents spam per IP (for unauthenticated users).
-    pub add_task_basic_per_ip_rate_limiter: PerIPRateLimiter,
+    // This only prevents spam per IP (for unauthenticated users).
+    pub unauthorized_only_limiter: UnauthorizedOnlyRateLimiter,
     pub generic_global_limiter: GlobalGenericKeyRateLimiter,
     pub generic_per_ip_limiter: GenericKeyPerIpRateLimiter,
     pub user_id_global_limiter: GlobalUserIDRateLimiter,
@@ -151,8 +187,12 @@ impl RateLimits {
         let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
         let write_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
         let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
-        let add_task_basic_limiter =
-            Self::create_ip_rate_limiter_per_hour(http_config.add_task_basic_per_ip_rate_limit);
+        let unauthorized_only_limiter = UnauthorizedOnlyRateLimiter::new(
+            FixedGuard::new(),
+            MokaStore::new(),
+            UnauthorizedOnlyIssuer,
+            BasicQuota::per_hour(http_config.add_task_basic_per_ip_rate_limit),
+        );
 
         let generic_global_limiter = GlobalGenericKeyRateLimiter::new(
             FixedGuard::new(),
@@ -190,7 +230,7 @@ impl RateLimits {
             basic_limiter,
             write_limiter,
             update_limiter,
-            add_task_basic_per_ip_rate_limiter: add_task_basic_limiter,
+            unauthorized_only_limiter,
             generic_global_limiter,
             generic_per_ip_limiter,
             user_id_global_limiter,
@@ -217,22 +257,6 @@ impl RateLimits {
             MokaStore::<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
             RemoteIpIssuer,
             BasicQuota::per_minute(quota),
-        )
-    }
-
-    fn create_ip_rate_limiter_per_hour(
-        quota: usize,
-    ) -> RateLimiter<
-        FixedGuard,
-        MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
-        RemoteIpIssuer,
-        BasicQuota,
-    > {
-        RateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
-            RemoteIpIssuer,
-            BasicQuota::per_hour(quota),
         )
     }
 }
