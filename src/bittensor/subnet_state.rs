@@ -16,6 +16,9 @@ use tracing::{error, info};
 
 use super::crypto::ss58_decode;
 
+const WSS_TIMEOUT_SECS: u64 = 10;
+const MIN_REQUIRED_STAKE: u64 = 10_000 * 1_000_000_000;
+
 pub type AccountId = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,14 +110,13 @@ impl SubnetState {
         let account_id = ss58_decode(hotkey)?;
         if let Some(hk) = self.inner.map.get(&account_id.0) {
             let total_stake = hk.total_stake;
-            let required = 10_000 * 1_000_000_000;
-            if total_stake > required {
+            if total_stake > MIN_REQUIRED_STAKE {
                 Ok(())
             } else {
                 Err(anyhow!(
                     "Hotkey found but insufficient stake: {} < {}",
                     total_stake,
-                    required
+                    MIN_REQUIRED_STAKE
                 ))
             }
         } else {
@@ -213,7 +215,7 @@ async fn get_subnet_state(
 ) -> Result<foldhash::HashMap<AccountId, HotkeyData>> {
     let ws_config = WebSocketConfig::default().max_message_size(Some(wss_max_message_size));
     let (mut socket, _) = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(WSS_TIMEOUT_SECS),
         connect_async_with_config(bittensor_wss, Some(ws_config)),
     )
     .await??;

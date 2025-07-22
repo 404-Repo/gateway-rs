@@ -12,6 +12,9 @@ use crate::api::HasUuid;
 
 const SENTMAP_START_CAPACITY: usize = 1024;
 const EXPIREDMAP_START_CAPACITY: usize = 8;
+const DEFAULT_DUP_COUNT: usize = 1;
+const DEFAULT_TTL_SECS: u64 = 300;
+const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 1;
 
 #[derive(Clone)]
 struct QueueEntry<T> {
@@ -98,9 +101,9 @@ where
 {
     pub fn builder() -> DupQueueBuilder {
         DupQueueBuilder {
-            dup: 1,
-            ttl: Duration::from_secs(300),
-            cleanup_interval: Duration::from_secs(1),
+            dup: DEFAULT_DUP_COUNT,
+            ttl: Duration::from_secs(DEFAULT_TTL_SECS),
+            cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
         }
     }
 
