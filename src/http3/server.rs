@@ -42,6 +42,8 @@ use super::error::ServerError;
 use super::user_rate_limits::RateLimits;
 use crate::http3::company_rate_limits::{company_rate_limit, CompanyRateLimiterStore};
 
+const MAX_REASON_LENGTH: u64 = u8::MAX as u64;
+
 pub(crate) trait DepotExt {
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
 }
@@ -229,7 +231,7 @@ async fn add_result_handler(
         .size_limit(
             SizeLimit::new()
                 .whole_stream(http_cfg.request_file_size_limit)
-                .for_field("reason", u8::MAX as u64),
+                .for_field("reason", MAX_REASON_LENGTH),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
@@ -528,6 +530,11 @@ pub async fn get_result_handler(
     res.headers_mut().insert(
         "Content-Disposition",
         HeaderValue::from_str(&content_disposition)
+            .map_err(|e| ServerError::Internal(format!("Invalid header value: {:?}", e)))?,
+    );
+    res.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&body.len().to_string())
             .map_err(|e| ServerError::Internal(format!("Invalid header value: {:?}", e)))?,
     );
     res.body(body);

@@ -17,6 +17,8 @@ mod metrics;
 mod protocol;
 mod raft;
 
+const RESTART_DELAY_SECS: u64 = 2;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -87,7 +89,7 @@ async fn main() {
                     break;
                 } else {
                     warn!("Retrying...");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(RESTART_DELAY_SECS)).await;
                 }
             }
         }
