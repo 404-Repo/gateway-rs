@@ -25,8 +25,9 @@ load_rate_limit = 60
 leader_rate_limit = 10
 metric_rate_limit = 5
 get_status_rate_limit = 60
-request_size_limit = 102400
+request_size_limit = 4096
 request_file_size_limit = 31457280
+raft_write_size_limit = 262144
 add_result_rate_limit = 300
 wss_bittensor = "wss://entrypoint-finney.opentensor.ai:443"
 wss_max_message_size = 2097152
@@ -94,3 +95,8 @@ replication_lag_threshold = 1200
 snapshot_logs_since_last = 1000
 snapshot_max_chunk_size = 131072
 max_in_snapshot_log_to_keep = 1000
+
+[prompt]
+min_len = 3
+max_len = 384
+allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
