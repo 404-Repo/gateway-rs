@@ -4,8 +4,8 @@ use scc::{HashMap, Queue};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
+use tokio::task::{self, JoinHandle};
 use uuid::Uuid;
 
 use crate::api::HasUuid;
@@ -34,6 +34,13 @@ struct Inner<T> {
 #[derive(Clone)]
 pub struct DupQueue<T> {
     inner: Arc<Inner<T>>,
+    _cleanup_task: Arc<JoinHandle<()>>,
+}
+
+impl<T> Drop for DupQueue<T> {
+    fn drop(&mut self) {
+        self._cleanup_task.abort();
+    }
 }
 
 pub struct DupQueueBuilder {
@@ -71,9 +78,9 @@ impl DupQueueBuilder {
         });
         let cleanup_interval = self.cleanup_interval;
         let weak_inner = Arc::downgrade(&inner);
-        thread::spawn(move || {
+        let handle = task::spawn(async move {
             while let Some(inner) = weak_inner.upgrade() {
-                thread::sleep(cleanup_interval);
+                tokio::time::sleep(cleanup_interval).await;
 
                 let mut expired_ids = foldhash::HashSet::with_capacity(EXPIREDMAP_START_CAPACITY);
                 while let Ok(Some(shared)) = inner
@@ -91,7 +98,10 @@ impl DupQueueBuilder {
                 }
             }
         });
-        DupQueue { inner }
+        DupQueue {
+            inner,
+            _cleanup_task: Arc::new(handle),
+        }
     }
 }
 
@@ -175,9 +185,10 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tokio::sync::Barrier;
+    use tokio::task;
     use uuid::Uuid;
 
     fn create_task(prompt: &str) -> Task {
@@ -187,8 +198,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_single_push_pop() {
+    #[tokio::test]
+    async fn test_single_push_pop() {
         // With dup = 3, an element may be delivered to up to 3 distinct hotkeys. (only the final delivery returns Some(duration))
         let queue = Arc::new(
             DupQueue::<Task>::builder()
@@ -229,8 +240,8 @@ mod tests {
         assert!(queue.pop(3, "d").is_empty());
     }
 
-    #[test]
-    fn test_multiple_pushes() {
+    #[tokio::test]
+    async fn test_multiple_pushes() {
         let queue = Arc::new(
             DupQueue::<Task>::builder()
                 .dup(2)
@@ -255,8 +266,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_pop_more_than_exists() {
+    #[tokio::test]
+    async fn test_pop_more_than_exists() {
         for &dup in &[1usize, 4usize] {
             let queue = Arc::new(
                 DupQueue::<Task>::builder()
@@ -291,8 +302,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn heavy_contention_pop() {
+    #[tokio::test]
+    async fn heavy_contention_pop() {
         let q = DupQueue::<Task>::builder()
             .dup(1)
             .ttl(10)
@@ -307,8 +318,8 @@ mod tests {
         for _ in 0..producers {
             let q_producer = q.clone();
             let b_producer = Arc::clone(&barrier);
-            thread::spawn(move || {
-                b_producer.wait();
+            task::spawn(async move {
+                b_producer.wait().await;
                 for i in 0..number_of_tasks {
                     q_producer.push(create_task(&i.to_string()));
                 }
@@ -323,8 +334,8 @@ mod tests {
             let q_consumer = q.clone();
             let b_consumer = Arc::clone(&b_consumer);
             let counter = Arc::clone(&counter);
-            handles.push(thread::spawn(move || {
-                b_consumer.wait();
+            handles.push(task::spawn(async move {
+                b_consumer.wait().await;
                 let mut idle_start: Option<Instant> = None;
                 loop {
                     if counter.load(Ordering::Relaxed) == producers * number_of_tasks {
@@ -339,14 +350,14 @@ mod tests {
                         if idle_start.unwrap().elapsed() >= Duration::from_secs(5) {
                             break;
                         }
-                        thread::sleep(Duration::from_millis(50));
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
             }));
         }
 
         for handle in handles {
-            handle.join().expect("Thread panicked");
+            handle.await.expect("Task panicked");
         }
 
         assert_eq!(q.len(), 0);
@@ -363,12 +374,12 @@ mod tests {
         }
         assert_eq!(q.len(), 100);
 
-        std::thread::sleep(Duration::from_millis(2500));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(q.len(), 0);
     }
 
-    #[test]
-    fn test_requeue_duplicates_in_pop() {
+    #[tokio::test]
+    async fn test_requeue_duplicates_in_pop() {
         let queue = Arc::new(
             DupQueue::<Task>::builder()
                 .dup(3)
@@ -402,8 +413,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_concurrent_push_pop() {
+    #[tokio::test]
+    async fn test_concurrent_push_pop() {
         let queue = Arc::new(
             DupQueue::<Task>::builder()
                 .dup(3)
@@ -412,18 +423,18 @@ mod tests {
                 .build(),
         );
         let q_producer = Arc::clone(&queue);
-        let producer = thread::spawn(move || {
+        let producer = task::spawn(async move {
             for i in 0..10 {
                 q_producer.push(create_task(&format!("Task {}", i)));
             }
         });
-        producer.join().unwrap();
+        producer.await.unwrap();
 
         let mut handles = Vec::new();
         for idx in 0..3 {
             let q = Arc::clone(&queue);
             let hotkey = format!("h{}", idx);
-            handles.push(thread::spawn(move || {
+            handles.push(task::spawn(async move {
                 let res = q.pop(5, &hotkey);
                 // Each pop call returns distinct tasks for that hotkey.
                 let set: HashSet<_> = res.iter().map(|(task, _)| task.id.clone()).collect();
@@ -435,12 +446,12 @@ mod tests {
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
     }
 
-    #[test]
-    fn test_cleanup_removes_old_entries() {
+    #[tokio::test]
+    async fn test_cleanup_removes_old_entries() {
         let queue = DupQueue::<Task>::builder()
             .dup(1)
             .ttl(1)
@@ -448,7 +459,7 @@ mod tests {
             .build();
         let task = create_task("Old Task");
         queue.push(task);
-        thread::sleep(Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(queue.pop(1, "any").is_empty());
     }
 }
