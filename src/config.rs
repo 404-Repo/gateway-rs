@@ -98,6 +98,7 @@ pub struct HTTPConfig {
     // Size limit for the request
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,
+    pub raft_write_size_limit: u64,
     pub wss_bittensor: String,
     pub wss_max_message_size: usize,
     pub signature_freshness_threshold: u64,
@@ -111,6 +112,13 @@ pub struct HTTPConfig {
     pub get_timeout_sec: u64,
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PromptConfig {
+    pub min_len: usize,
+    pub max_len: usize,
+    pub allowed_pattern: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -142,6 +150,7 @@ pub struct NodeConfig {
     pub rserver: RServerConfig,
     pub rclient: RClientConfig,
     pub http: HTTPConfig,
+    pub prompt: PromptConfig,
     pub db: DbConfig,
     pub cert: Certificate,
     pub log: LogConfig,

@@ -1,6 +1,7 @@
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use anyhow::anyhow;
+use anyhow::Result;
 use async_zip::base::write::ZipFileWriter;
 use async_zip::ZipEntryBuilder;
 use futures::io::Cursor;
@@ -32,11 +33,14 @@ use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::log::get_build_information;
 use crate::common::queue::DupQueue;
-use crate::config::HTTPConfig;
+use crate::config::{HTTPConfig, NodeConfig, PromptConfig};
 use crate::http3::response::custom_response;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use multer::SizeLimit;
+use regex::Regex;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use super::error::ServerError;
 use super::user_rate_limits::RateLimits;
@@ -83,6 +87,29 @@ async fn add_task_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
+    let prompt_cfg = depot.require::<PromptConfig>()?;
+    let len = add_task.prompt.chars().count();
+    if len < prompt_cfg.min_len {
+        return Err(ServerError::BadRequest(format!(
+            "Prompt is too short: minimum length is {} characters (got {})",
+            prompt_cfg.min_len, len
+        )));
+    }
+    if len > prompt_cfg.max_len {
+        return Err(ServerError::BadRequest(format!(
+            "Prompt is too long: maximum length is {} characters (got {})",
+            prompt_cfg.max_len, len
+        )));
+    }
+
+    let prompt_regex = depot.require::<Regex>()?;
+    if !prompt_regex.is_match(&add_task.prompt) {
+        return Err(ServerError::BadRequest(format!(
+            "Prompt contains invalid characters; allowed pattern: {}",
+            prompt_cfg.allowed_pattern
+        )));
+    }
+
     let task = Task {
         id: Uuid::new_v4(),
         prompt: add_task.prompt,
@@ -117,9 +144,7 @@ async fn generic_key_update_handler(
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     gateway_state
         .update_gateway_generic_key(Some(ugk.generic_key))
@@ -140,9 +165,7 @@ async fn generic_key_read_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     if let Some(uuid) = gateway_state.generic_key().await {
         let response = GenericKeyResponse { generic_key: uuid };
@@ -325,9 +348,7 @@ async fn add_result_handler(
         _ => return Err(ServerError::BadRequest("Invalid status".into())),
     };
 
-    let subnet_state = depot
-        .obtain::<SubnetState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
+    let subnet_state = depot.require::<SubnetState>()?;
 
     subnet_state
         .validate_hotkey(&task_result.validator_hotkey)
@@ -345,9 +366,7 @@ async fn add_result_handler(
 
     let gateway_state = depot.require::<GatewayState>()?;
     let manager = gateway_state.task_manager();
-    let metrics = depot
-        .obtain::<Metrics>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+    let metrics = depot.require::<Metrics>()?;
 
     match &task_result.result {
         TaskResultType::Success { score, .. } => {
@@ -434,9 +453,7 @@ pub async fn get_result_handler(
         )));
     }
 
-    let metrics = depot
-        .obtain::<Metrics>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+    let metrics = depot.require::<Metrics>()?;
 
     let (content_type, content_disposition, body, best_validator) = if get_task.all {
         successful_results.sort_by(|a, b| {
@@ -582,18 +599,14 @@ async fn get_tasks_handler(
 
     let queue = depot.require::<DupQueue<Task>>()?;
 
-    let metrics = depot
-        .obtain::<Metrics>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+    let metrics = depot.require::<Metrics>()?;
 
     let gateways = gateway_state
         .gateways()
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
 
-    let subnet_state = depot
-        .obtain::<SubnetState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain the SubnetState: {:?}", e)))?;
+    let subnet_state = depot.require::<SubnetState>()?;
 
     subnet_state
         .validate_hotkey(&get_tasks.validator_hotkey)
@@ -731,9 +744,7 @@ async fn id_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let node_id = depot
-        .obtain::<usize>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain node_id: {:?}", e)))?;
+    let node_id = *depot.require::<usize>()?;
 
     res.render(node_id.to_string());
     Ok(())
@@ -741,9 +752,7 @@ async fn id_handler(
 
 #[handler]
 async fn api_or_generic_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
-    let gateway_state = depot
-        .obtain::<GatewayState>()
-        .map_err(|_| ServerError::Internal("Failed to obtain GatewayState".to_string()))?;
+    let gateway_state = depot.require::<GatewayState>()?;
 
     let key_str = req
         .headers()
@@ -772,9 +781,7 @@ async fn api_or_generic_key_check(depot: &mut Depot, req: &mut Request) -> Resul
 
 #[handler]
 async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), ServerError> {
-    let metrics = depot
-        .obtain::<Metrics>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain Metrics: {:?}", e)))?;
+    let metrics = depot.require::<Metrics>()?;
 
     let metric_families = metrics.registry().gather();
     let encoder = TextEncoder::new();
@@ -794,9 +801,7 @@ async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), Se
 
 #[handler]
 async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
-    let http_cfg = depot
-        .obtain::<HTTPConfig>()
-        .map_err(|_| ServerError::Internal("Failed to obtain HTTPConfig".to_string()))?;
+    let http_cfg = depot.require::<HTTPConfig>()?;
 
     let is_admin = req
         .headers()
@@ -821,31 +826,25 @@ pub struct Http3Server {
 
 impl Http3Server {
     pub async fn run(
-        node_id: usize,
-        addr: SocketAddr,
+        config: Arc<NodeConfig>,
         tls_config: RustlsConfig,
-        http_config: &HTTPConfig,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
-    ) -> Self {
-        let rate_limits = RateLimits::new(http_config);
+    ) -> Result<Self> {
+        let addr_str = format!("{}:{}", config.network.bind_ip, config.http.port);
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| anyhow!("Invalid listen address {}: {}", addr_str, e))?;
 
         let subnet_state = SubnetState::new(
-            http_config.wss_bittensor.clone(),
-            http_config.subnet_number,
+            config.http.wss_bittensor.clone(),
+            config.http.subnet_number,
             None,
-            Duration::from_secs(http_config.subnet_poll_interval_sec),
-            http_config.wss_max_message_size,
+            Duration::from_secs(config.http.subnet_poll_interval_sec),
+            config.http.wss_max_message_size,
         );
 
-        let router = Self::setup_router(
-            node_id,
-            task_queue,
-            subnet_state.clone(),
-            gateway_state,
-            rate_limits,
-            http_config.clone(),
-        );
+        let router = Self::setup_router(config, &subnet_state, &gateway_state, &task_queue)?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
@@ -861,46 +860,56 @@ impl Http3Server {
             Server::new(acceptor).serve(service).await;
         });
 
-        Self {
+        Ok(Self {
             join_handle,
             subnet_state,
-        }
+        })
     }
 
     fn setup_router(
-        node_id: usize,
-        task_queue: DupQueue<Task>,
-        subnet_state: SubnetState,
-        gateway_state: GatewayState,
-        rate_limits: RateLimits,
-        config: HTTPConfig,
-    ) -> Router {
-        let request_size_limit = config.request_size_limit;
-        let size_limit_handler = || SecureMaxSize(request_size_limit as usize);
-        let file_size_limit_handler = SecureMaxSize(config.request_file_size_limit as usize);
+        config: Arc<NodeConfig>,
+        subnet_state: &SubnetState,
+        gateway_state: &GatewayState,
+        task_queue: &DupQueue<Task>,
+    ) -> Result<Router> {
+        let http_config = &config.http;
+        let prompt_config = &config.prompt;
 
-        let metrics = Metrics::new(0.05).expect("Failed to create Metrics");
-        // in-memory store for per-company rate limiting
+        let prompt_regex = Regex::new(&prompt_config.allowed_pattern)
+            .map_err(|e| anyhow!("Invalid prompt regex: {}", e))?;
+
+        let rate_limits = RateLimits::new(http_config);
+
+        let request_size_limit = http_config.request_size_limit as usize;
+        let size_limit_handler = || SecureMaxSize(request_size_limit);
+        let request_file_size_limit = http_config.request_file_size_limit as usize;
+        let file_size_limit_handler = || SecureMaxSize(request_file_size_limit);
+        let raft_write_size_limit = http_config.raft_write_size_limit as usize;
+        let raft_write_size_limit_handler = || SecureMaxSize(raft_write_size_limit);
+
+        let metrics = Metrics::new(0.05).map_err(|e| anyhow!(e))?;
         let company_store = CompanyRateLimiterStore::new();
 
-        let router = if config.compression {
+        let router = if http_config.compression {
             Router::new().hoop(
                 Compression::new()
                     .force_priority(true)
-                    .enable_zstd(CompressionLevel::Precise(config.compression_lvl)),
+                    .enable_zstd(CompressionLevel::Precise(http_config.compression_lvl)),
             )
         } else {
             Router::new()
         };
 
-        router
-            .hoop(affix_state::inject(task_queue))
-            .hoop(affix_state::inject(gateway_state))
-            .hoop(affix_state::inject(subnet_state))
-            .hoop(affix_state::inject(config))
-            .hoop(affix_state::inject(node_id))
+        Ok(router
+            .hoop(affix_state::inject(task_queue.clone()))
+            .hoop(affix_state::inject(gateway_state.clone()))
+            .hoop(affix_state::inject(subnet_state.clone()))
+            .hoop(affix_state::inject(http_config.clone()))
+            .hoop(affix_state::inject(config.network.node_id as usize))
             .hoop(affix_state::inject(metrics))
             .hoop(affix_state::inject(company_store))
+            .hoop(affix_state::inject(prompt_config.clone()))
+            .hoop(affix_state::inject(prompt_regex))
             .push(
                 Router::with_path("/add_task")
                     .hoop(size_limit_handler())
@@ -915,7 +924,7 @@ impl Http3Server {
             )
             .push(
                 Router::with_path("/add_result")
-                    .hoop(file_size_limit_handler)
+                    .hoop(file_size_limit_handler())
                     .hoop(rate_limits.result_limiter)
                     .post(add_result_handler),
             )
@@ -938,7 +947,7 @@ impl Http3Server {
             )
             .push(
                 Router::with_path("/write")
-                    .hoop(size_limit_handler())
+                    .hoop(raft_write_size_limit_handler())
                     .hoop(rate_limits.write_limiter)
                     .post(write_handler),
             )
@@ -985,7 +994,7 @@ impl Http3Server {
                     .hoop(rate_limits.read_limiter)
                     .hoop(admin_key_check)
                     .get(generic_key_read_handler),
-            )
+            ))
     }
 
     pub fn abort(&self) {
