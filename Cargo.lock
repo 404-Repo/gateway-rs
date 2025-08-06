@@ -1300,6 +1300,7 @@ dependencies = [
  "prometheus",
  "quinn",
  "rcgen",
+ "regex",
  "rmp-serde",
  "rustls",
  "rustls-pemfile",

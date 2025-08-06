@@ -6,7 +6,7 @@ pub mod server;
 pub mod store;
 mod tests;
 
-use anyhow::Context as _;
+use anyhow::bail;
 use anyhow::Result;
 use backon::BackoffBuilder;
 use backon::ConstantBuilder;
@@ -127,12 +127,13 @@ async fn get_id_for_endpoint(
         {
             if let Ok((status, body)) = client.get(&url, Some(timeout)).await {
                 if status == StatusCode::OK {
-                    let body_str = std::str::from_utf8(&body)
-                        .context("Failed to convert response body to UTF-8")?;
+                    let body_str = std::str::from_utf8(&body).map_err(|e| {
+                        anyhow::anyhow!("Failed to convert response body to UTF-8: {}", e)
+                    })?;
                     let id = body_str
                         .trim()
                         .parse::<u64>()
-                        .context("Failed to parse ID as u64")?;
+                        .map_err(|e| anyhow::anyhow!("Failed to parse ID as u64: {}", e))?;
                     return Ok(id);
                 }
             }
@@ -611,15 +612,17 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         generate_and_create_keycert(vec!["localhost".to_string()])?
     };
 
-    let http_server = Http3Server::run(
-        config.network.node_id as usize,
-        format!("{}:{}", config.network.bind_ip, config.http.port).parse()?,
+    let http_server = match Http3Server::run(
+        config.clone(),
         RustlsConfig::new(key_cert),
-        &config.http,
         gateway_state.clone(),
         task_queue.clone(),
     )
-    .await;
+    .await
+    {
+        Ok(srv) => srv,
+        Err(e) => bail!("Failed to start HTTP3 server: {:?}", e),
+    };
 
     let peer_dns_names: Vec<_> = {
         let mut names = config
