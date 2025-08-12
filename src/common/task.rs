@@ -1,6 +1,7 @@
 use foldhash::fast::RandomState;
 use scc::HashMap;
 use serde::Serialize;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task;
@@ -13,6 +14,7 @@ struct TaskManagerInner {
     completed: HashMap<Uuid, Vec<AddTaskResultRequest>, RandomState>,
     expected_results: usize,
     execution_time: HashMap<Uuid, Instant, RandomState>,
+    prompts: HashMap<Uuid, String, RandomState>,
 }
 
 pub struct TaskManager {
@@ -23,7 +25,7 @@ pub struct TaskManager {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum TaskStatus {
     NoResult,
-    Failure,
+    Failure { reason: String },
     PartialResult(usize),
     Success,
 }
@@ -31,6 +33,17 @@ pub enum TaskStatus {
 impl Default for TaskStatus {
     fn default() -> Self {
         Self::NoResult
+    }
+}
+
+impl fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskStatus::NoResult => f.write_str("NoResult"),
+            TaskStatus::Success => f.write_str("Success"),
+            TaskStatus::Failure { .. } => f.write_str("Failure"),
+            TaskStatus::PartialResult(n) => write!(f, "PartialResult({})", n),
+        }
     }
 }
 
@@ -48,6 +61,7 @@ impl TaskManager {
                 initial_capacity,
                 RandomState::default(),
             ),
+            prompts: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
         });
 
         let cancel_token = CancellationToken::new();
@@ -65,6 +79,15 @@ impl TaskManager {
                                 .last()
                                 .is_some_and(|last| now.duration_since(last.instant) < result_lifetime)
                         });
+
+                        // Clean up stale execution times and prompts
+                        inner_clone
+                            .execution_time
+                            .retain(|_, start| now.duration_since(*start) < result_lifetime);
+
+                        inner_clone
+                            .prompts
+                            .retain(|task_id, _| inner_clone.execution_time.contains(task_id));
                     }
                 }
             }
@@ -91,11 +114,11 @@ impl TaskManager {
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
         match self.inner.completed.get(&task_id) {
             Some(results) if !results.is_empty() => {
-                if results
-                    .iter()
-                    .any(|r| matches!(r.result, TaskResultType::Failure { .. }))
-                {
-                    return TaskStatus::Failure;
+                if let Some(reason) = results.iter().rev().find_map(|r| match &r.result {
+                    TaskResultType::Failure { reason } => Some(reason.clone()),
+                    _ => None,
+                }) {
+                    return TaskStatus::Failure { reason };
                 }
                 let count = results.len();
                 if count < self.inner.expected_results {
@@ -115,8 +138,16 @@ impl TaskManager {
             .map(|(_, value)| value)
     }
 
-    pub fn add_time(&self, task_id: Uuid) {
+    pub fn add_task(&self, task_id: Uuid, prompt: String) {
         let _ = self.inner.execution_time.insert(task_id, Instant::now());
+        let _ = self.inner.prompts.insert(task_id, prompt);
+    }
+
+    pub fn get_prompt(&self, task_id: Uuid) -> Option<String> {
+        self.inner
+            .prompts
+            .get(&task_id)
+            .map(|entry| entry.get().clone())
     }
 
     pub fn get_time(&self, task_id: Uuid) -> f64 {
@@ -129,6 +160,7 @@ impl TaskManager {
 
     pub fn remove_time(&self, task_id: Uuid) {
         self.inner.execution_time.remove(&task_id);
+        self.inner.prompts.remove(&task_id);
     }
 }
 

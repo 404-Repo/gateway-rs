@@ -247,6 +247,7 @@ async fn get_subnet_state(
 }
 
 // Useful for debugging
+#[allow(dead_code)]
 pub struct Balance {
     pub rao: u64,
 }
