@@ -125,8 +125,13 @@ async fn add_task_handler(
     let gateway_state = depot.require::<GatewayState>()?;
 
     queue.push(task.clone());
-    info!("A new task has been pushed with ID: {}", task.id);
-    gateway_state.task_manager().add_time(task.id);
+    info!(
+        "A new task has been pushed with ID: {}, prompt: {}",
+        task.id, task.prompt
+    );
+    gateway_state
+        .task_manager()
+        .add_task(task.id, task.prompt.clone());
 
     res.render(Json(task));
     Ok(())
@@ -371,8 +376,12 @@ async fn add_result_handler(
     match &task_result.result {
         TaskResultType::Success { score, .. } => {
             info!(
-                "Task {} succeeded from validator {}, miner {}, score {}",
+                "Task {} , prompt: '{}' , succeeded from validator {}, miner {}, score {}",
                 task_id,
+                manager
+                    .get_prompt(task_id)
+                    .as_deref()
+                    .unwrap_or("<unknown>"),
                 &task_result.validator_hotkey,
                 &task_result.miner_hotkey.as_ref().map_or("Unknown", |v| v),
                 score
@@ -381,8 +390,14 @@ async fn add_result_handler(
         }
         TaskResultType::Failure { reason } => {
             warn!(
-                "Task {} failed from validator {}, reason: {}",
-                task_id, &task_result.validator_hotkey, reason
+                "Task {} , prompt: '{}' , failed from validator {}, reason: {}",
+                task_id,
+                manager
+                    .get_prompt(task_id)
+                    .as_deref()
+                    .unwrap_or("<unknown>"),
+                &task_result.validator_hotkey,
+                reason
             );
             metrics.inc_task_failed(&task_result.validator_hotkey);
         }
@@ -443,15 +458,24 @@ pub async fn get_result_handler(
         )));
     }
 
-    let mut successful_results: Vec<AddTaskResultRequest> =
-        results_vec.drain(..).filter(|r| r.is_success()).collect();
-
-    if successful_results.is_empty() {
+    let any_success = results_vec.iter().any(|r| r.is_success());
+    if !any_success {
+        let reason = results_vec
+            .iter()
+            .rev()
+            .find_map(|r| match &r.result {
+                TaskResultType::Failure { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Unknown failure".to_string());
         return Err(ServerError::NotFound(format!(
-            "No successful results found for task ID {}",
-            get_task.id
+            "No successful results found for task ID {}. Failure reason: {}",
+            get_task.id, reason
         )));
     }
+
+    let mut successful_results: Vec<AddTaskResultRequest> =
+        results_vec.drain(..).filter(|r| r.is_success()).collect();
 
     let metrics = depot.require::<Metrics>()?;
 
@@ -574,7 +598,7 @@ async fn get_status_handler(
 
     let status = gateway_state.task_manager().get_status(get_status.id).await;
 
-    res.render(Json(GetTaskStatusResponse { status }));
+    res.render(Json(GetTaskStatusResponse::from(status)));
 
     Ok(())
 }
