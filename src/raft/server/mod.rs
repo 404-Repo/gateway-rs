@@ -197,7 +197,7 @@ mod tests {
 
         let raft = openraft::Raft::new(
             node_id,
-            config.clone(),
+            Arc::clone(&config),
             network,
             log_store,
             state_machine_store,
