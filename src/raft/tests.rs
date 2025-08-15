@@ -48,7 +48,7 @@ mod tests {
         let raft = Arc::new(RwLock::new(
             openraft::Raft::new(
                 node_id,
-                config.clone(),
+                Arc::clone(&config),
                 network,
                 log_store,
                 state_machine_store.clone(),
@@ -654,7 +654,7 @@ mod tests {
         let (new_raft, new_sm, new_server) = setup_node(
             new_node_id,
             new_node_addr,
-            config.clone(),
+            Arc::clone(&config),
             node_clients.clone(),
         )
         .await?;
@@ -766,7 +766,7 @@ mod tests {
         let (new_raft, new_sm, new_server) = setup_node(
             new_node_id,
             new_node_addr,
-            config.clone(),
+            Arc::clone(&config),
             node_clients.clone(),
         )
         .await?;

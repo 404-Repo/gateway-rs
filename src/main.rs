@@ -66,7 +66,7 @@ async fn main() {
             Mode::Vote => GatewayMode::Vote,
             Mode::Single => GatewayMode::Single,
         };
-        let result = start_gateway(gateway_mode, node_config.clone()).await;
+        let result = start_gateway(gateway_mode, Arc::clone(&node_config)).await;
 
         match result {
             Ok(_gateway) => {

@@ -265,13 +265,30 @@ impl Http3Client {
         data: Bytes,
         timeout_duration: Option<Duration>,
     ) -> Result<(StatusCode, Bytes)> {
+        self.post_with_headers(url, data, None::<&[(String, String)]>, timeout_duration)
+            .await
+    }
+
+    pub async fn post_with_headers(
+        &self,
+        url: &str,
+        data: Bytes,
+        extra_headers: Option<&[(String, String)]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<(StatusCode, Bytes)> {
         let mut send_req = self.get_connection_handle().await?;
         let uri = url.parse::<http::uri::Uri>()?;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(&uri)
-            .header("content-type", "application/json")
-            .body(())?;
+        let mut builder = http::Request::builder().method("POST").uri(&uri);
+
+        builder = builder.header("content-type", "application/json");
+        if let Some(headers) = extra_headers {
+            for (name, value) in headers.iter() {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        }
+        builder = builder.header("content-length", data.len());
+
+        let request = builder.body(())?;
 
         let fut = async {
             let mut stream = send_req.send_request(request).await?;
