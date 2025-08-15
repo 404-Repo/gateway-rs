@@ -2,15 +2,19 @@ use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use crate::common::task::TaskManager;
+use crate::config::NodeConfig;
 use crate::db::ApiKeyValidator;
+use crate::http3::client::Http3ClientBuilder;
 use anyhow::Result;
+use bytes::Bytes;
 use openraft::{BasicNode, RaftMetrics};
 use serde_json;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, RwLock};
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -45,28 +49,28 @@ impl std::error::Error for GatewayStateError {
 pub struct GatewayState {
     state: Arc<StateMachineStore>,
     raft: Arc<RwLock<Raft>>,
-    cluster_name: String,
     last_task_acquisition: Arc<AtomicU64>,
     key_validator: Arc<ApiKeyValidator>,
     task_manager: Arc<TaskManager>,
+    config: Arc<NodeConfig>,
 }
 
 impl GatewayState {
     pub fn new(
         state: Arc<StateMachineStore>,
         raft: Arc<RwLock<Raft>>,
-        cluster_name: String,
         last_task_acquisition: Arc<AtomicU64>,
         key_validator_updater: Arc<ApiKeyValidator>,
         task_manager: Arc<TaskManager>,
+        config: Arc<NodeConfig>,
     ) -> Self {
         Self {
             state,
             raft,
-            cluster_name,
             last_task_acquisition,
             key_validator: key_validator_updater,
             task_manager,
+            config,
         }
     }
 
@@ -148,9 +152,12 @@ impl GatewayState {
         Ok(())
     }
 
-    pub async fn update_gateway_generic_key(&self, new_key: Option<Uuid>) -> Result<()> {
-        let raft_guard = self.raft.write().await;
-
+    pub async fn update_gateway_generic_key(
+        &self,
+        current_node_id: u64,
+        new_key: Option<Uuid>,
+        admin_key: Option<String>,
+    ) -> Result<()> {
         let key_to_set = if self.state.get("generic_key").await.is_none() {
             new_key.unwrap_or_else(Uuid::new_v4)
         } else if let Some(key) = new_key {
@@ -162,15 +169,90 @@ impl GatewayState {
         let serialized_key = serde_json::to_string(&key_to_set)
             .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to JSON: {}", e))?;
 
-        raft_guard
-            .client_write(Request::Set {
-                key: "generic_key".to_string(),
-                value: serialized_key,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))?;
+        let leader_id = self.leader().await;
 
-        Ok(())
+        if leader_id != Some(current_node_id) {
+            let leader_id = leader_id.ok_or_else(|| anyhow::anyhow!("No leader elected"))?;
+            let leader_info = self
+                .gateway(leader_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
+
+            let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
+            let url = format!(
+                "https://{}:{}/update_key",
+                leader_info.domain, leader_info.http_port
+            );
+
+            let client = Http3ClientBuilder::new()
+                .server_domain(&leader_info.domain)
+                .server_ip(&server_ip)
+                .dangerous_skip_verification(self.config.cert.dangerous_skip_verification)
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create HTTP3 client to leader: {:?}", e))?;
+
+            let payload = serde_json::to_vec(&serde_json::json!({ "generic_key": key_to_set }))
+                .map_err(|e| anyhow::anyhow!("Failed to serialize payload: {}", e))?;
+
+            let mut headers_vec = Vec::new();
+            if let Some(k) = admin_key {
+                headers_vec.push(("x-admin-key".to_string(), k));
+            }
+            let extra_headers = if !headers_vec.is_empty() {
+                Some(&headers_vec[..])
+            } else {
+                None
+            };
+
+            match client
+                .post_with_headers(
+                    &url,
+                    Bytes::from(payload),
+                    extra_headers,
+                    Some(Duration::from_secs(self.config.http.forward_timeout_sec)),
+                )
+                .await
+            {
+                Ok((status, _body)) if status.is_success() => {
+                    let key_str = key_to_set.to_string();
+                    let prefix: String = key_str.chars().take(6).collect();
+                    info!(
+                        "Gateway generic key updated (forwarded), prefix: {}",
+                        prefix
+                    );
+                    return Ok(());
+                }
+                Ok((status, body)) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to forward to leader: {} {:?}",
+                        status,
+                        String::from_utf8_lossy(&body)
+                    ))
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
+            }
+        }
+
+        let write_result = {
+            let raft_guard = self.raft.write().await;
+            raft_guard
+                .client_write(Request::Set {
+                    key: "generic_key".to_string(),
+                    value: serialized_key,
+                })
+                .await
+        };
+
+        match write_result {
+            Ok(_) => {
+                let key_str = key_to_set.to_string();
+                let prefix: String = key_str.chars().take(6).collect();
+                info!("Gateway generic key updated (leader), prefix: {}", prefix);
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!("Failed to complete client_write: {}", e)),
+        }
     }
 
     pub async fn generic_key(&self) -> Option<Uuid> {
@@ -209,10 +291,14 @@ impl GatewayState {
     }
 
     pub fn cluster_name(&self) -> &str {
-        &self.cluster_name
+        &self.config.raft.cluster_name
     }
 
     pub fn task_manager(&self) -> Arc<TaskManager> {
         self.task_manager.clone()
+    }
+
+    pub fn preconfigured_generic_key(&self) -> Option<Uuid> {
+        self.config.http.generic_key
     }
 }
