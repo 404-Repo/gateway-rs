@@ -210,7 +210,7 @@ impl GatewayState {
                     &url,
                     Bytes::from(payload),
                     extra_headers,
-                    Some(Duration::from_secs(5)),
+                    Some(Duration::from_secs(self.config.http.forward_timeout_sec)),
                 )
                 .await
             {
@@ -239,7 +239,7 @@ impl GatewayState {
             raft_guard
                 .client_write(Request::Set {
                     key: "generic_key".to_string(),
-                    value: serialized_key.clone(),
+                    value: serialized_key,
                 })
                 .await
         };
@@ -296,5 +296,9 @@ impl GatewayState {
 
     pub fn task_manager(&self) -> Arc<TaskManager> {
         self.task_manager.clone()
+    }
+
+    pub fn preconfigured_generic_key(&self) -> Option<Uuid> {
+        self.config.http.generic_key
     }
 }

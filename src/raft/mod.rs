@@ -36,6 +36,7 @@ use tokio::time::sleep;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::api::request::GatewayInfoExt;
 use crate::api::response::GatewayInfo;
@@ -322,9 +323,10 @@ impl Gateway {
     pub async fn gateway_generic_key_update(
         gateway_state: &GatewayState,
         current_node_id: u64,
+        configured_key: Option<Uuid>,
     ) -> Result<()> {
         gateway_state
-            .update_gateway_generic_key(current_node_id, None, None)
+            .update_gateway_generic_key(current_node_id, configured_key, None)
             .await
     }
 
@@ -341,9 +343,12 @@ impl Gateway {
                 if let Some(leader_id) = current_leader {
                     info!("Leader changed to node {}", leader_id);
                     if leader_id == current_node_id {
-                        let _ =
-                            Gateway::gateway_generic_key_update(&gateway_state, current_node_id)
-                                .await;
+                        let _ = Gateway::gateway_generic_key_update(
+                            &gateway_state,
+                            current_node_id,
+                            gateway_state.preconfigured_generic_key(),
+                        )
+                        .await;
                     }
                 } else {
                     info!("Leadership changed, but no leader is elected yet");

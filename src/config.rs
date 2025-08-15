@@ -107,8 +107,10 @@ pub struct HTTPConfig {
     pub subnet_poll_interval_sec: u64,
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
+    pub generic_key: Option<Uuid>,
     // HTTP/3 client timeouts
     pub post_timeout_sec: u64,
+    pub forward_timeout_sec: u64,
     pub get_timeout_sec: u64,
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
