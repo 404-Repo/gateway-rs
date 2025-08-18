@@ -150,9 +150,15 @@ async fn generic_key_update_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let gateway_state = depot.require::<GatewayState>()?;
+    let current_node_id = *depot.require::<usize>()? as u64;
+    let admin_key = req
+        .headers()
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     gateway_state
-        .update_gateway_generic_key(Some(ugk.generic_key))
+        .update_gateway_generic_key(current_node_id, Some(ugk.generic_key), admin_key)
         .await
         .map_err(|e| {
             ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))

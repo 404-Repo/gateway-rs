@@ -36,6 +36,7 @@ use tokio::time::sleep;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::api::request::GatewayInfoExt;
 use crate::api::response::GatewayInfo;
@@ -319,8 +320,14 @@ impl Gateway {
         }
     }
 
-    pub async fn gateway_generic_key_update(gateway_state: &GatewayState) -> Result<()> {
-        gateway_state.update_gateway_generic_key(None).await
+    pub async fn gateway_generic_key_update(
+        gateway_state: &GatewayState,
+        current_node_id: u64,
+        configured_key: Option<Uuid>,
+    ) -> Result<()> {
+        gateway_state
+            .update_gateway_generic_key(current_node_id, configured_key, None)
+            .await
     }
 
     pub async fn gateway_leader_change(gateway_state: GatewayState, current_node_id: u64) {
@@ -336,7 +343,12 @@ impl Gateway {
                 if let Some(leader_id) = current_leader {
                     info!("Leader changed to node {}", leader_id);
                     if leader_id == current_node_id {
-                        let _ = Gateway::gateway_generic_key_update(&gateway_state).await;
+                        let _ = Gateway::gateway_generic_key_update(
+                            &gateway_state,
+                            current_node_id,
+                            gateway_state.preconfigured_generic_key(),
+                        )
+                        .await;
                     }
                 } else {
                     info!("Leadership changed, but no leader is elected yet");
@@ -526,10 +538,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let raft = Arc::new(RwLock::new(
         Raft::new(
             config.network.node_id,
-            raft_config.clone(),
+            Arc::clone(&raft_config),
             Network::new(clients_map.clone()),
             log_store.clone(),
-            state_machine_store.clone(),
+            Arc::clone(&state_machine_store),
         )
         .await?,
     ));
@@ -598,10 +610,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let gateway_state = GatewayState::new(
         state_machine_store,
         raft.clone(),
-        config.raft.cluster_name.clone(),
         last_task_acquisition.clone(),
         api_key_validator,
         Arc::clone(&task_manager),
+        Arc::clone(&config),
     );
 
     let key_cert = if use_cert_files {
@@ -613,7 +625,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     };
 
     let http_server = match Http3Server::run(
-        config.clone(),
+        Arc::clone(&config),
         RustlsConfig::new(key_cert),
         gateway_state.clone(),
         task_queue.clone(),
@@ -673,7 +685,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     .await?;
 
     let gateway_info_updater = tokio::spawn(Gateway::gateway_info_updater(
-        config.clone(),
+        Arc::clone(&config),
         gateway_state.clone(),
         task_queue.clone(),
         last_task_acquisition.clone(),
