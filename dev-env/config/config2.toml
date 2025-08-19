@@ -102,5 +102,3 @@ max_in_snapshot_log_to_keep = 1000
 min_len = 3
 max_len = 384
 allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
-# Optional: set a static generic_key for this node (UUID). Leave commented or empty for auto-generated behavior.
-# generic_key = ""

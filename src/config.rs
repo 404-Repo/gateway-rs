@@ -223,26 +223,40 @@ impl FromStr for LogLevel {
     }
 }
 
-fn mask_cluster_name(cluster_name: &str) -> String {
-    let char_count = cluster_name.chars().count();
-    if char_count < 3 {
-        "*".to_owned()
+fn mask_string(s: &str, visible: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > visible {
+        let visible_part: String = s.chars().take(visible).collect();
+        let mask: String = "*".repeat(char_count - visible);
+        format!("{}{}", visible_part, mask)
     } else {
-        let visible: String = cluster_name.chars().take(3).collect();
-        let mask: String = "*".repeat(char_count - 3);
-        format!("{}{}", visible, mask)
+        "*".repeat(char_count)
+    }
+}
+
+fn mask_key_in_toml(toml_str: &mut String, key: &str, visible: usize) {
+    if let Some(start) = toml_str.find(key) {
+        let masked_key = mask_string(key, visible);
+        toml_str.replace_range(start..start + key.len(), &masked_key);
     }
 }
 
 impl fmt::Display for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut masked = self.clone();
-        masked.raft.cluster_name = mask_cluster_name(&masked.raft.cluster_name);
+        masked.raft.cluster_name = mask_string(&masked.raft.cluster_name, 3);
 
-        match toml::to_string_pretty(&masked) {
-            Ok(toml_repr) => write!(f, "{}", toml_repr),
-            Err(_) => Err(fmt::Error),
+        let mut toml_str = toml::to_string_pretty(&masked).map_err(|_| fmt::Error)?;
+
+        let admin_key_str = self.http.admin_key.to_string();
+        mask_key_in_toml(&mut toml_str, &admin_key_str, 6);
+
+        if let Some(key) = self.http.generic_key {
+            let generic_key_str = key.to_string();
+            mask_key_in_toml(&mut toml_str, &generic_key_str, 6);
         }
+
+        write!(f, "{}", toml_str)
     }
 }
 
