@@ -1,12 +1,10 @@
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
-use h3;
 use h3::error::ConnectionError;
 use h3_quinn::{Connection as H3QuinnConnection, OpenStreams};
 use http::{self, StatusCode};
 use quinn::{self, Connection as QuinnConnection, Endpoint, IdleTimeout, TransportConfig};
-use rustls;
 use rustls_platform_verifier::BuilderVerifierExt;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::sync::atomic::Ordering::{AcqRel, Acquire};

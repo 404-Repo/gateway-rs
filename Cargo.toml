@@ -5,7 +5,7 @@ edition = "2021"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { version = "0.81.0", features = [
+salvo = { version = "0.82.0", features = [
     "quinn",
     "rustls",
     "rate-limiter",
