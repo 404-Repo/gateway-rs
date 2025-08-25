@@ -35,43 +35,31 @@ pub struct GetTaskStatus {
 pub struct AddTaskResultRequest {
     pub validator_hotkey: String,
     pub miner_hotkey: Option<String>,
-    pub result: TaskResultType,
+    pub miner_uid: Option<u32>,
+    pub miner_rating: Option<f32>,
+    pub asset: Option<Vec<u8>>,
+    pub score: Option<f32>,
+    pub reason: Option<String>,
     #[serde(skip_deserializing, default = "Instant::now")]
     pub instant: Instant,
 }
 
 impl AddTaskResultRequest {
     pub fn get_score(&self) -> Option<f32> {
-        match &self.result {
-            TaskResultType::Success { score, .. } => Some(*score),
-            TaskResultType::Failure { .. } => None,
-        }
+        self.score
     }
 
     pub fn get_asset(&mut self) -> Option<Vec<u8>> {
-        if let TaskResultType::Success { asset, .. } = &mut self.result {
-            Some(std::mem::take(asset))
-        } else {
-            None
-        }
+        self.asset.take()
     }
 
     pub fn into_asset(self) -> Option<Vec<u8>> {
-        match self.result {
-            TaskResultType::Success { asset, .. } => Some(asset),
-            TaskResultType::Failure { .. } => None,
-        }
+        self.asset
     }
 
     pub fn is_success(&self) -> bool {
-        matches!(self.result, TaskResultType::Success { .. })
+        self.reason.is_none()
     }
-}
-
-#[derive(Deserialize)]
-pub enum TaskResultType {
-    Success { asset: Vec<u8>, score: f32 },
-    Failure { reason: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
