@@ -9,9 +9,7 @@ use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::api::request::{
-    AddTaskResultRequest, GetTaskResultRequest, GetTaskStatus, TaskResultType,
-};
+use crate::api::request::{AddTaskResultRequest, GetTaskResultRequest, GetTaskStatus};
 use crate::api::response::GetTaskStatusResponse;
 use crate::bittensor::crypto::verify_hotkey;
 use crate::bittensor::subnet_state::SubnetState;
@@ -90,10 +88,7 @@ pub async fn get_result_handler(
         let reason = results_vec
             .iter()
             .rev()
-            .find_map(|r| match &r.result {
-                TaskResultType::Failure { reason } => Some(reason.clone()),
-                _ => None,
-            })
+            .find_map(|r| r.reason.clone())
             .unwrap_or_else(|| "Unknown failure".to_string());
         return Err(ServerError::NotFound(format!(
             "No successful results found for task ID {}. Failure reason: {}",
@@ -230,29 +225,116 @@ pub async fn get_status_handler(
     Ok(())
 }
 
-// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
-//   -F id=123e4567-e89b-12d3-a456-426614174001 \
-//   -F signature=signature \
-//   -F timestamp=404_GATEWAY_1713096000 \
-//   -F validator_hotkey=validator_key_123 \
-//   -F miner_hotkey=miner_key_456 \
-//   -F status=success \
-//   -F asset=@/path/to/asset.spz \
-//   -F score=0.95
+struct AddResultMultipartData {
+    id: Option<String>,
+    signature: Option<String>,
+    timestamp: Option<String>,
+    validator_hotkey: Option<String>,
+    miner_hotkey: Option<String>,
+    status: Option<String>,
+    asset: Option<Vec<u8>>,
+    score: Option<f32>,
+    reason: Option<String>,
+    miner_uid: Option<u32>,
+    miner_rating: Option<f32>,
+}
 
-// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
-//   -F id=123e4567-e89b-12d3-a456-426614174001 \
-//   -F signature=signature \
-//   -F timestamp=404_GATEWAY_1713096000 \
-//   -F validator_hotkey=validator_key_123 \
-//   -F status=failure \
-//   -F reason="Task timed out"
-#[handler]
-pub async fn add_result_handler(
+async fn parse_add_result_multipart(
+    mut multipart: Multipart<'_>,
+) -> Result<AddResultMultipartData, ServerError> {
+    let mut id = None;
+    let mut signature = None;
+    let mut timestamp = None;
+    let mut validator_hotkey = None;
+    let mut miner_hotkey = None;
+    let mut status = None;
+    let mut asset = None;
+    let mut score = None;
+    let mut reason = None;
+    let mut miner_uid = None;
+    let mut miner_rating = None;
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("Field error: {}", e)))?
+    {
+        let name = field
+            .name()
+            .ok_or_else(|| ServerError::BadRequest("Unnamed field".into()))?;
+
+        match name {
+            "id" => id = Some(read_text_field(field, "id").await?),
+            "signature" => signature = Some(read_text_field(field, "signature").await?),
+            "timestamp" => timestamp = Some(read_text_field(field, "timestamp").await?),
+            "validator_hotkey" => {
+                validator_hotkey = Some(read_text_field(field, "validator_hotkey").await?)
+            }
+            "miner_hotkey" => miner_hotkey = Some(read_text_field(field, "miner_hotkey").await?),
+            "status" => status = Some(read_text_field(field, "status").await?),
+            "asset" => {
+                let mut content = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|e| {
+                    ServerError::BadRequest(format!("Failed to read asset chunk: {}", e))
+                })? {
+                    content.extend_from_slice(&chunk);
+                }
+                asset = Some(content);
+            }
+            "score" => {
+                score = Some(
+                    read_text_field(field, "score")
+                        .await?
+                        .parse::<f32>()
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Invalid score format: {}", e))
+                        })?,
+                )
+            }
+            "reason" => reason = Some(read_text_field(field, "reason").await?),
+            "miner_uid" => {
+                miner_uid = Some(
+                    read_text_field(field, "miner_uid")
+                        .await?
+                        .parse::<u32>()
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Invalid miner_uid format: {}", e))
+                        })?,
+                )
+            }
+            "miner_rating" => {
+                miner_rating = Some(
+                    read_text_field(field, "miner_rating")
+                        .await?
+                        .parse::<f32>()
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Invalid miner_rating format: {}", e))
+                        })?,
+                )
+            }
+            _ => continue,
+        }
+    }
+
+    Ok(AddResultMultipartData {
+        id,
+        signature,
+        timestamp,
+        validator_hotkey,
+        miner_hotkey,
+        status,
+        asset,
+        score,
+        reason,
+        miner_uid,
+        miner_rating,
+    })
+}
+
+async fn parse_add_result_request(
     depot: &mut Depot,
     req: &mut Request,
-    res: &mut Response,
-) -> Result<(), ServerError> {
+) -> Result<(Uuid, AddTaskResultRequest, String, String), ServerError> {
     let content_type = req
         .headers()
         .get("content-type")
@@ -304,6 +386,8 @@ pub async fn add_result_handler(
             "asset",
             "score",
             "reason",
+            "miner_uid",
+            "miner_rating",
         ])
         .size_limit(
             SizeLimit::new()
@@ -311,97 +395,97 @@ pub async fn add_result_handler(
                 .for_field("reason", MAX_REASON_LENGTH),
         );
 
-    let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
+    let multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
+    let form_data = parse_add_result_multipart(multipart).await?;
 
-    let mut id = None;
-    let mut signature = None;
-    let mut timestamp = None;
-    let mut validator_hotkey = None;
-    let mut miner_hotkey = None;
-    let mut status = None;
-    let mut asset = None;
-    let mut score = None;
-    let mut reason = None;
-
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ServerError::BadRequest(format!("Field error: {}", e)))?
-    {
-        let name = field
-            .name()
-            .ok_or_else(|| ServerError::BadRequest("Unnamed field".into()))?;
-
-        match name {
-            "id" => id = Some(read_text_field(field, "id").await?),
-            "signature" => signature = Some(read_text_field(field, "signature").await?),
-            "timestamp" => timestamp = Some(read_text_field(field, "timestamp").await?),
-            "validator_hotkey" => {
-                validator_hotkey = Some(read_text_field(field, "validator_hotkey").await?)
-            }
-            "miner_hotkey" => miner_hotkey = Some(read_text_field(field, "miner_hotkey").await?),
-            "status" => status = Some(read_text_field(field, "status").await?),
-            "asset" => {
-                let mut content = Vec::new();
-                while let Some(chunk) = field.chunk().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read asset chunk: {}", e))
-                })? {
-                    content.extend_from_slice(&chunk);
-                }
-                asset = Some(content);
-            }
-            "score" => {
-                score = Some(
-                    read_text_field(field, "score")
-                        .await?
-                        .parse::<f32>()
-                        .map_err(|e| {
-                            ServerError::BadRequest(format!("Invalid score format: {}", e))
-                        })?,
-                )
-            }
-            "reason" => reason = Some(read_text_field(field, "reason").await?),
-            _ => continue,
-        }
-    }
-
-    let id = id.ok_or(ServerError::BadRequest("Missing id field".into()))?;
-    let signature = signature.ok_or(ServerError::BadRequest("Missing signature field".into()))?;
-    let timestamp = timestamp.ok_or(ServerError::BadRequest("Missing timestamp field".into()))?;
-    let validator_hotkey = validator_hotkey.ok_or(ServerError::BadRequest(
+    let id = form_data
+        .id
+        .ok_or(ServerError::BadRequest("Missing id field".into()))?;
+    let signature = form_data
+        .signature
+        .ok_or(ServerError::BadRequest("Missing signature field".into()))?;
+    let timestamp = form_data
+        .timestamp
+        .ok_or(ServerError::BadRequest("Missing timestamp field".into()))?;
+    let validator_hotkey = form_data.validator_hotkey.ok_or(ServerError::BadRequest(
         "Missing validator_hotkey field".into(),
     ))?;
-    let status = status.ok_or(ServerError::BadRequest("Missing status field".into()))?;
+    let status = form_data
+        .status
+        .ok_or(ServerError::BadRequest("Missing status field".into()))?;
 
     let task_id = Uuid::parse_str(&id)
         .map_err(|e| ServerError::BadRequest(format!("Invalid id format: {}", e)))?;
 
     let task_result = match status.as_str() {
         "success" => {
-            let asset = asset.ok_or(ServerError::BadRequest("Missing asset for success".into()))?;
-            let score = score.ok_or(ServerError::BadRequest("Missing score for success".into()))?;
-            let miner_hotkey =
-                miner_hotkey.ok_or(ServerError::BadRequest("Missing miner_hotkey field".into()))?;
+            let asset = form_data
+                .asset
+                .ok_or(ServerError::BadRequest("Missing asset for success".into()))?;
+            let score = form_data
+                .score
+                .ok_or(ServerError::BadRequest("Missing score for success".into()))?;
+            let miner_hotkey = form_data
+                .miner_hotkey
+                .ok_or(ServerError::BadRequest("Missing miner_hotkey field".into()))?;
             AddTaskResultRequest {
                 validator_hotkey,
                 miner_hotkey: Some(miner_hotkey),
-                result: TaskResultType::Success { asset, score },
+                miner_uid: form_data.miner_uid,
+                miner_rating: form_data.miner_rating,
+                asset: Some(asset),
+                score: Some(score),
+                reason: None,
                 instant: Instant::now(),
             }
         }
         "failure" => {
-            let reason =
-                reason.ok_or(ServerError::BadRequest("Missing reason for failure".into()))?;
+            let reason = form_data
+                .reason
+                .ok_or(ServerError::BadRequest("Missing reason for failure".into()))?;
             AddTaskResultRequest {
                 validator_hotkey,
                 miner_hotkey: None,
-                result: TaskResultType::Failure { reason },
+                miner_uid: None,
+                miner_rating: None,
+                asset: None,
+                score: None,
+                reason: Some(reason),
                 instant: Instant::now(),
             }
         }
         _ => return Err(ServerError::BadRequest("Invalid status".into())),
     };
 
+    Ok((task_id, task_result, timestamp, signature))
+}
+
+// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
+//   -F id=123e4567-e89b-12d3-a456-426614174001 \
+//   -F signature=signature \
+//   -F timestamp=404_GATEWAY_1713096000 \
+//   -F validator_hotkey=validator_key_123 \
+//   -F miner_hotkey=miner_key_456 \
+//   -F status=success \
+//   -F asset=@/path/to/asset.spz \
+//   -F score=0.95
+
+// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
+//   -F id=123e4567-e89b-12d3-a456-426614174001 \
+//   -F signature=signature \
+//   -F timestamp=404_GATEWAY_1713096000 \
+//   -F validator_hotkey=validator_key_123 \
+//   -F status=failure \
+//   -F reason="Task timed out"
+
+#[handler]
+pub async fn add_result_handler(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+) -> Result<(), ServerError> {
+    let (task_id, task_result, timestamp, signature) = parse_add_result_request(depot, req).await?;
+    let http_cfg = depot.require::<HTTPConfig>()?;
     let subnet_state = depot.require::<SubnetState>()?;
 
     subnet_state
@@ -422,34 +506,34 @@ pub async fn add_result_handler(
     let manager = gateway_state.task_manager();
     let metrics = depot.require::<Metrics>()?;
 
-    match &task_result.result {
-        TaskResultType::Success { score, .. } => {
-            info!(
-                "Task {} , prompt: '{}' , succeeded from validator {}, miner {}, score {}",
-                task_id,
-                manager
-                    .get_prompt(task_id)
-                    .as_deref()
-                    .unwrap_or("<unknown>"),
-                &task_result.validator_hotkey,
-                &task_result.miner_hotkey.as_ref().map_or("Unknown", |v| v),
-                score
-            );
-            metrics.inc_task_completed(&task_result.validator_hotkey);
-        }
-        TaskResultType::Failure { reason } => {
-            warn!(
-                "Task {} , prompt: '{}' , failed from validator {}, reason: {}",
-                task_id,
-                manager
-                    .get_prompt(task_id)
-                    .as_deref()
-                    .unwrap_or("<unknown>"),
-                &task_result.validator_hotkey,
-                reason
-            );
-            metrics.inc_task_failed(&task_result.validator_hotkey);
-        }
+    if task_result.is_success() {
+        info!(
+            "Task {}, prompt: '{}', succeeded from validator {}, miner {}, miner_uid {:?}, miner_rating {:?}, score {}",
+            task_id,
+            manager
+                .get_prompt(task_id)
+                .as_deref()
+                .unwrap_or("<unknown>"),
+            &task_result.validator_hotkey,
+            &task_result.miner_hotkey.as_ref().map_or("Unknown", |v| v),
+            task_result.miner_uid,
+            task_result.miner_rating,
+            task_result.score.unwrap_or(0.0),
+        );
+        metrics.inc_task_completed(&task_result.validator_hotkey);
+    } else {
+        let reason = task_result.reason.as_deref().unwrap_or("Unknown failure");
+        warn!(
+            "Task {}, prompt: '{}', failed from validator {}, reason: {}",
+            task_id,
+            manager
+                .get_prompt(task_id)
+                .as_deref()
+                .unwrap_or("<unknown>"),
+            &task_result.validator_hotkey,
+            reason
+        );
+        metrics.inc_task_failed(&task_result.validator_hotkey);
     }
 
     metrics.record_completion_time(&task_result.validator_hotkey, manager.get_time(task_id));

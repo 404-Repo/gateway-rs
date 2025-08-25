@@ -8,7 +8,7 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::api::request::{AddTaskResultRequest, TaskResultType};
+use crate::api::request::AddTaskResultRequest;
 
 struct TaskManagerInner {
     completed: HashMap<Uuid, Vec<AddTaskResultRequest>, RandomState>,
@@ -25,9 +25,15 @@ pub struct TaskManager {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum TaskStatus {
     NoResult,
-    Failure { reason: String },
+    Failure {
+        reason: String,
+    },
     PartialResult(usize),
-    Success,
+    Success {
+        miner_hotkey: String,
+        miner_uid: Option<u32>,
+        miner_rating: Option<f32>,
+    },
 }
 
 impl Default for TaskStatus {
@@ -40,7 +46,7 @@ impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TaskStatus::NoResult => f.write_str("NoResult"),
-            TaskStatus::Success => f.write_str("Success"),
+            TaskStatus::Success { .. } => f.write_str("Success"),
             TaskStatus::Failure { .. } => f.write_str("Failure"),
             TaskStatus::PartialResult(n) => write!(f, "PartialResult({})", n),
         }
@@ -114,17 +120,37 @@ impl TaskManager {
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
         match self.inner.completed.get(&task_id) {
             Some(results) if !results.is_empty() => {
-                if let Some(reason) = results.iter().rev().find_map(|r| match &r.result {
-                    TaskResultType::Failure { reason } => Some(reason.clone()),
-                    _ => None,
-                }) {
+                if let Some(reason) = results.iter().rev().find_map(|r| r.reason.clone()) {
                     return TaskStatus::Failure { reason };
                 }
-                let count = results.len();
-                if count < self.inner.expected_results {
-                    TaskStatus::PartialResult(count)
+                let mut success_count: usize = 0;
+                let mut best_index: Option<usize> = None;
+                let mut best_score: f32 = f32::NEG_INFINITY;
+
+                for (idx, result) in results.iter().enumerate() {
+                    if result.is_success() {
+                        success_count += 1;
+                        let score = result.get_score().unwrap_or(0.0);
+                        if score >= best_score {
+                            best_score = score;
+                            best_index = Some(idx);
+                        }
+                    }
+                }
+
+                if success_count < self.inner.expected_results {
+                    TaskStatus::PartialResult(success_count)
+                } else if let Some(index) = best_index {
+                    let best = &results[index];
+                    TaskStatus::Success {
+                        miner_hotkey: best.miner_hotkey.clone().unwrap_or_default(),
+                        miner_uid: best.miner_uid,
+                        miner_rating: best.miner_rating,
+                    }
                 } else {
-                    TaskStatus::Success
+                    TaskStatus::Failure {
+                        reason: "No successful result found".to_string(),
+                    }
                 }
             }
             _ => TaskStatus::NoResult,
@@ -177,8 +203,7 @@ impl Clone for TaskManager {
 mod tests {
     use uuid::Uuid;
 
-    use crate::api::request::TaskResultType;
-    use crate::common::task::AddTaskResultRequest;
+    use crate::api::request::AddTaskResultRequest;
     use crate::common::task::TaskManager;
     use crate::common::task::TaskStatus;
     use std::time::Duration;
@@ -200,10 +225,11 @@ mod tests {
             AddTaskResultRequest {
                 validator_hotkey: validator.to_string(),
                 miner_hotkey: Some(miner.to_string()),
-                result: TaskResultType::Success {
-                    asset: vec![],
-                    score,
-                },
+                miner_uid: None,
+                miner_rating: None,
+                asset: Some(vec![]),
+                score: Some(score),
+                reason: None,
                 instant,
             }
         }
@@ -255,8 +281,14 @@ mod tests {
             task_manager.get_status(task_id1).await,
             TaskStatus::PartialResult(1)
         );
-        assert_eq!(task_manager.get_status(task_id2).await, TaskStatus::Success);
-        assert_eq!(task_manager.get_status(task_id3).await, TaskStatus::Success);
+        assert_ne!(
+            task_manager.get_status(task_id2).await,
+            TaskStatus::PartialResult(1)
+        );
+        assert_ne!(
+            task_manager.get_status(task_id3).await,
+            TaskStatus::PartialResult(1)
+        );
 
         tokio::time::sleep(WAIT_DURATION).await;
 
