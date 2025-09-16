@@ -14,12 +14,11 @@ use std::{collections::hash_map::RandomState, fmt};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use super::crypto::ss58_decode;
+use super::crypto::{ss58_decode, AccountId32};
+use super::hotkey::Hotkey;
 
 const WSS_TIMEOUT_SECS: u64 = 10;
 const MIN_REQUIRED_STAKE: u64 = 10_000 * 1_000_000_000;
-
-pub type AccountId = [u8; 32];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HotkeyData {
@@ -27,14 +26,14 @@ pub struct HotkeyData {
     pub alpha_stake: u64,
     pub total_stake: u64,
     pub tao_stake: u64,
-    pub coldkey: AccountId,
+    pub coldkey: AccountId32,
 }
 
 #[derive(Decode, Encode, PartialEq, Eq, Clone, Debug)]
 pub struct State {
     pub netuid: Compact<u16>,
-    pub hotkeys: Vec<AccountId>,
-    pub coldkeys: Vec<AccountId>,
+    pub hotkeys: Vec<AccountId32>,
+    pub coldkeys: Vec<AccountId32>,
     pub active: Vec<bool>,
     pub validator_permit: Vec<bool>,
     pub pruning_score: Vec<Compact<u16>>,
@@ -53,7 +52,7 @@ pub struct State {
 }
 
 struct Inner {
-    map: HashMap<AccountId, HotkeyData, RandomState>,
+    map: HashMap<AccountId32, HotkeyData, RandomState>,
     join_handle: JoinHandle<()>,
 }
 
@@ -85,7 +84,8 @@ impl SubnetState {
                                 let map = &inner.map;
                                 map.retain_async(|k, _| new_state.contains_key(k)).await;
                                 for (hotkey, data) in new_state {
-                                    map.entry(hotkey)
+                                    map.entry_async(hotkey)
+                                        .await
                                         .and_modify(|v| {
                                             if *v != data {
                                                 *v = data.clone()
@@ -106,9 +106,9 @@ impl SubnetState {
     }
 
     // Check that the hotkey exists and has at least 10k TAO
-    pub fn validate_hotkey(&self, hotkey: &str) -> Result<()> {
+    pub async fn validate_hotkey(&self, hotkey: &Hotkey) -> Result<()> {
         let account_id = ss58_decode(hotkey)?;
-        if let Some(hk) = self.inner.map.get(&account_id.0) {
+        if let Some(hk) = self.inner.map.get_async(&account_id).await {
             let total_stake = hk.total_stake;
             if total_stake > MIN_REQUIRED_STAKE {
                 Ok(())
@@ -125,8 +125,12 @@ impl SubnetState {
     }
 
     #[allow(dead_code)]
-    pub fn get(&self, hotkey: &AccountId) -> Option<HotkeyData> {
-        self.inner.map.get(hotkey).map(|entry| entry.get().clone())
+    pub async fn get(&self, hotkey: &AccountId32) -> Option<HotkeyData> {
+        self.inner
+            .map
+            .get_async(hotkey)
+            .await
+            .map(|entry| entry.get().clone())
     }
 
     pub fn abort(&self) {
@@ -156,7 +160,7 @@ where
     ))
 }
 
-fn build_hotkeys_state(subnet_state: State) -> Result<foldhash::HashMap<AccountId, HotkeyData>> {
+fn build_hotkeys_state(subnet_state: State) -> Result<foldhash::HashMap<AccountId32, HotkeyData>> {
     let State {
         hotkeys,
         coldkeys,
@@ -212,7 +216,7 @@ async fn get_subnet_state(
     netuid: u16,
     block: Option<u64>,
     wss_max_message_size: usize,
-) -> Result<foldhash::HashMap<AccountId, HotkeyData>> {
+) -> Result<foldhash::HashMap<AccountId32, HotkeyData>> {
     let ws_config = WebSocketConfig::default().max_message_size(Some(wss_max_message_size));
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(WSS_TIMEOUT_SECS),
@@ -302,14 +306,8 @@ mod tests {
         let otf_hotkey = "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7";
         let decoded_hotkey = ss58_decode(otf_hotkey).expect("Failed to decode SS58 hotkey");
 
-        let hotkey_arr: &[u8; 32] = decoded_hotkey
-            .0
-            .as_slice()
-            .try_into()
-            .expect("Hotkey slice was not 32 bytes");
-
         assert!(
-            subnet_state.get(hotkey_arr).is_some(),
+            subnet_state.get(&decoded_hotkey).await.is_some(),
             "Expected hotkey not found in state."
         );
     }

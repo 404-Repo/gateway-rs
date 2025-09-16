@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::future;
+use h3::client::RequestStream;
 use h3::error::ConnectionError;
 use h3_quinn::{Connection as H3QuinnConnection, OpenStreams};
 use http::{self, StatusCode};
@@ -168,13 +169,13 @@ impl Http3Client {
                 .connection_handle
                 .load(Acquire, &guard)
                 .as_ref()
-                .map(|h| h.clone());
+                .cloned();
             let quic_conn_opt = self
                 .inner
                 .quinn_conn_handle
                 .load(Acquire, &guard)
                 .as_ref()
-                .map(|c| c.clone());
+                .cloned();
             (req_handle_opt, quic_conn_opt)
         };
 
@@ -228,6 +229,18 @@ impl Http3Client {
         }
     }
 
+    async fn recv_response(
+        mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    ) -> Result<(StatusCode, Bytes)> {
+        let response = stream.recv_response().await?;
+        let mut buf = BytesMut::new();
+        while let Some(mut chunk) = stream.recv_data().await? {
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            buf.extend_from_slice(&bytes);
+        }
+        Ok((response.status(), buf.freeze()))
+    }
+
     pub async fn get(
         &self,
         url: &str,
@@ -240,13 +253,7 @@ impl Http3Client {
         let fut = async {
             let mut stream = send_req.send_request(request).await?;
             stream.finish().await?;
-            let response = stream.recv_response().await?;
-            let mut buf = BytesMut::new();
-            while let Some(mut chunk) = stream.recv_data().await? {
-                let bytes = chunk.copy_to_bytes(chunk.remaining());
-                buf.extend_from_slice(&bytes);
-            }
-            Ok((response.status(), buf.freeze()))
+            Self::recv_response(stream).await
         };
 
         match timeout_duration {
@@ -263,7 +270,7 @@ impl Http3Client {
         data: Bytes,
         timeout_duration: Option<Duration>,
     ) -> Result<(StatusCode, Bytes)> {
-        self.post_with_headers(url, data, None::<&[(String, String)]>, timeout_duration)
+        self.post_with_headers(url, data, None::<&[(&str, &str)]>, timeout_duration)
             .await
     }
 
@@ -271,7 +278,7 @@ impl Http3Client {
         &self,
         url: &str,
         data: Bytes,
-        extra_headers: Option<&[(String, String)]>,
+        extra_headers: Option<&[(&str, &str)]>,
         timeout_duration: Option<Duration>,
     ) -> Result<(StatusCode, Bytes)> {
         let mut send_req = self.get_connection_handle().await?;
@@ -281,7 +288,7 @@ impl Http3Client {
         builder = builder.header("content-type", "application/json");
         if let Some(headers) = extra_headers {
             for (name, value) in headers.iter() {
-                builder = builder.header(name.as_str(), value.as_str());
+                builder = builder.header(*name, *value);
             }
         }
         builder = builder.header("content-length", data.len());
@@ -292,13 +299,7 @@ impl Http3Client {
             let mut stream = send_req.send_request(request).await?;
             stream.send_data(data).await?;
             stream.finish().await?;
-            let response = stream.recv_response().await?;
-            let mut buf = BytesMut::new();
-            while let Some(mut chunk) = stream.recv_data().await? {
-                let bytes = chunk.copy_to_bytes(chunk.remaining());
-                buf.extend_from_slice(&bytes);
-            }
-            Ok((response.status(), buf.freeze()))
+            Self::recv_response(stream).await
         };
 
         match timeout_duration {

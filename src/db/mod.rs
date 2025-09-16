@@ -192,36 +192,20 @@ impl DatabaseBuilder {
         self
     }
 
+    fn require_nonempty(opt: Option<String>, name: &str) -> Result<String> {
+        opt.filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("{name} is required and cannot be empty"))
+    }
+
     pub async fn build(self) -> Result<Database> {
-        let sslcert_path = self
-            .sslcert_path
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("sslcert path is required and cannot be empty"))?;
-        let sslkey_path = self
-            .sslkey_path
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("sslkey path is required and cannot be empty"))?;
-        let sslrootcert_path = self
-            .sslrootcert_path
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("sslrootcert path is required and cannot be empty"))?;
-        let host = self
-            .host
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("Host is required and cannot be empty"))?;
+        let sslcert_path = Self::require_nonempty(self.sslcert_path, "sslcert path")?;
+        let sslkey_path = Self::require_nonempty(self.sslkey_path, "sslkey path")?;
+        let sslrootcert_path = Self::require_nonempty(self.sslrootcert_path, "sslrootcert path")?;
+        let host = Self::require_nonempty(self.host, "Host")?;
+        let user = Self::require_nonempty(self.user, "User")?;
+        let password = Self::require_nonempty(self.password, "Password")?;
+        let dbname = Self::require_nonempty(self.dbname, "Database name")?;
         let port = self.port.ok_or_else(|| anyhow!("Port is required"))?;
-        let user = self
-            .user
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("User is required and cannot be empty"))?;
-        let password = self
-            .password
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("Password is required and cannot be empty"))?;
-        let dbname = self
-            .dbname
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("Database name is required and cannot be empty"))?;
 
         let client = connect_postgres(&PostgresConnectionConfig {
             host: &host,
@@ -412,40 +396,36 @@ impl ApiKeyValidator {
             new_keys.len()
         );
 
+        let mut new_api_key_to_user =
+            foldhash::HashMap::with_capacity_and_hasher(total_api_keys, RandomState::default());
+        for (user_id, hashes) in &new_keys {
+            for hash in hashes {
+                new_api_key_to_user.insert(hash.clone(), *user_id);
+            }
+        }
+
+        self.api_key_hashes
+            .retain_async(|k, _| new_api_key_to_user.contains_key(k))
+            .await;
+        for (hash, user_id) in new_api_key_to_user {
+            let _ = self.api_key_hashes.insert_async(hash, user_id).await;
+        }
+
         let new_user_ids: foldhash::HashSet<_> = new_keys.keys().copied().collect();
         self.users
             .retain_async(|k, _| new_user_ids.contains(k))
             .await;
-        for (user_id, new_api_key_hashes) in &new_keys {
-            self.users
-                .entry_async(*user_id)
-                .await
-                .and_modify(|v| {
-                    if *v != *new_api_key_hashes {
-                        *v = new_api_key_hashes.clone();
+
+        for (user_id, new_api_key_hashes) in new_keys {
+            match self.users.entry_async(user_id).await {
+                scc::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &new_api_key_hashes {
+                        *entry.get_mut() = new_api_key_hashes;
                     }
-                })
-                .or_insert(new_api_key_hashes.clone());
-        }
-
-        let new_api_key_hash_set: foldhash::HashSet<String> =
-            new_keys.values().flatten().cloned().collect();
-
-        self.api_key_hashes
-            .retain_async(|k, _| new_api_key_hash_set.contains(k))
-            .await;
-
-        for (user_id, api_key_hashes_vec) in &new_keys {
-            for api_key_hash in api_key_hashes_vec {
-                self.api_key_hashes
-                    .entry_async(api_key_hash.clone())
-                    .await
-                    .and_modify(|existing_user| {
-                        if *existing_user != *user_id {
-                            *existing_user = *user_id;
-                        }
-                    })
-                    .or_insert(*user_id);
+                }
+                scc::hash_map::Entry::Vacant(entry) => {
+                    entry.insert_entry(new_api_key_hashes);
+                }
             }
         }
         Ok(())
@@ -475,16 +455,17 @@ impl ApiKeyValidator {
         self.companies
             .retain_async(|k, _| company_keys.contains(k))
             .await;
-        for (cid, limits) in &new_companies {
-            self.companies
-                .entry_async(*cid)
-                .await
-                .and_modify(|v| {
-                    if *v != *limits {
-                        *v = limits.clone();
+        for (cid, limits) in new_companies {
+            match self.companies.entry_async(cid).await {
+                scc::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &limits {
+                        *entry.get_mut() = limits;
                     }
-                })
-                .or_insert(limits.clone());
+                }
+                scc::hash_map::Entry::Vacant(entry) => {
+                    entry.insert_entry(limits);
+                }
+            }
         }
 
         let cak_rows = self
@@ -501,84 +482,111 @@ impl ApiKeyValidator {
             })
             .collect();
 
+        let num_companies = company_keys.len();
         info!(
             "Retrieved {} company API keys for {} companies from the database",
             new_company_keys.len(),
-            new_companies.len()
+            num_companies
         );
 
-        let cak_hashes: foldhash::HashSet<_> = new_company_keys.keys().cloned().collect();
         self.company_api_key_hashes
-            .retain_async(|k, _| cak_hashes.contains(k))
+            .retain_async(|k, _| new_company_keys.contains_key(k))
             .await;
 
         for (hash, cid) in new_company_keys {
-            self.company_api_key_hashes
-                .entry_async(hash)
-                .await
-                .and_modify(|v| {
-                    if *v != cid {
-                        *v = cid;
-                    }
-                })
-                .or_insert(cid);
+            let _ = self.company_api_key_hashes.insert_async(hash, cid).await;
         }
 
         Ok(())
     }
 
-    fn find_user_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        if let Some(user_id) = self.validation_cache.get(api_key) {
-            return Some(user_id);
+    #[inline]
+    async fn find_id_for_api_key(
+        &self,
+        api_key: &str,
+        cache: &Cache<String, Uuid, RandomState>,
+        hashes: &scc::HashMap<String, Uuid, RandomState>,
+    ) -> Option<Uuid> {
+        if let Some(id) = cache.get(api_key) {
+            return Some(id);
         }
 
-        // Scan through hashes to find a match
-        let mut result = None;
-        self.api_key_hashes.scan(|hash, user_id| {
-            if let Ok(true) = self.hasher.verify_api_key(api_key, hash) {
-                result = Some(*user_id);
-                self.validation_cache.insert(api_key.to_string(), *user_id);
+        let collected_hashes = {
+            let mut pairs = Vec::with_capacity(hashes.len());
+            hashes
+                .iter_async(|hash, id| {
+                    pairs.push((hash.clone(), *id));
+                    true
+                })
+                .await;
+            pairs
+        };
+
+        if collected_hashes.is_empty() {
+            return None;
+        }
+
+        let api_key_owned = api_key.to_string();
+        let hasher = self.hasher.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            for (hash, id) in collected_hashes {
+                if hasher
+                    .verify_api_key(&api_key_owned, &hash)
+                    .unwrap_or(false)
+                {
+                    return Some(id);
+                }
             }
-        });
+            None
+        })
+        .await
+        .unwrap_or(None);
+
+        if let Some(id) = result {
+            cache.insert(api_key.to_string(), id);
+        }
+
         result
     }
 
-    fn find_company_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        if let Some(company_id) = self.company_validation_cache.get(api_key) {
-            return Some(company_id);
-        }
-
-        let mut company_id = None;
-        self.company_api_key_hashes.scan(|hash, cid| {
-            if self.hasher.verify_api_key(api_key, hash).unwrap_or(false) {
-                company_id = Some(*cid);
-            }
-        });
-
-        if let Some(cid) = company_id {
-            self.company_validation_cache
-                .insert(api_key.to_string(), cid);
-        }
-        company_id
+    async fn find_user_for_api_key(&self, api_key: &str) -> Option<Uuid> {
+        self.find_id_for_api_key(api_key, &self.validation_cache, &self.api_key_hashes)
+            .await
     }
 
-    pub fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
-        self.find_user_for_api_key(api_key)
+    async fn find_company_for_api_key(&self, api_key: &str) -> Option<Uuid> {
+        self.find_id_for_api_key(
+            api_key,
+            &self.company_validation_cache,
+            &self.company_api_key_hashes,
+        )
+        .await
     }
 
-    pub fn is_valid_api_key(&self, api_key: &str) -> bool {
-        self.find_user_for_api_key(api_key).is_some()
+    pub async fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
+        self.find_user_for_api_key(api_key).await
     }
 
-    pub fn is_company_key(&self, api_key: &str) -> bool {
-        self.find_company_for_api_key(api_key).is_some()
+    pub async fn is_valid_api_key(&self, api_key: &str) -> bool {
+        self.find_user_for_api_key(api_key).await.is_some()
     }
 
-    pub fn get_company_info_from_key(&self, api_key: &str) -> Option<(Uuid, (String, u64, u64))> {
-        self.find_company_for_api_key(api_key).and_then(|cid| {
+    pub async fn is_company_key(&self, api_key: &str) -> bool {
+        self.find_company_for_api_key(api_key).await.is_some()
+    }
+
+    pub async fn get_company_info_from_key(
+        &self,
+        api_key: &str,
+    ) -> Option<(Uuid, (String, u64, u64))> {
+        if let Some(cid) = self.find_company_for_api_key(api_key).await {
             self.companies
-                .get(&cid)
+                .get_async(&cid)
+                .await
                 .map(|company_info| (cid, company_info.get().clone()))
-        })
+        } else {
+            None
+        }
     }
 }

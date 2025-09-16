@@ -1,4 +1,4 @@
-FROM rust:1.87.0-alpine3.22 AS builder
+FROM rust:1.89.0-alpine3.22 AS builder
 
 RUN apk add --no-cache build-base alpine-sdk musl-dev openssl
 RUN apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community --no-cache mold>=2.39.1

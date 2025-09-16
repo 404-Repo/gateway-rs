@@ -12,10 +12,11 @@ use uuid::Uuid;
 use crate::api::request::{AddTaskResultRequest, GetTaskResultRequest, GetTaskStatus};
 use crate::api::response::GetTaskStatusResponse;
 use crate::bittensor::crypto::verify_hotkey;
+use crate::bittensor::hotkey::Hotkey;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::config::HTTPConfig;
 use crate::http3::error::ServerError;
-use crate::http3::handlers::common::DepotExt;
+use crate::http3::handlers::common::{DepotExt, BOUNDARY_PREFIX, MULTIPART_PREFIX};
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use async_zip::base::write::ZipFileWriter;
@@ -109,12 +110,11 @@ pub async fn get_result_handler(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let best_validator = std::mem::take(
-            &mut successful_results
-                .first_mut()
-                .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?
-                .validator_hotkey,
-        );
+        let best_validator = successful_results
+            .first()
+            .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?
+            .validator_hotkey
+            .clone();
 
         let mut buffer = Vec::new();
         let mut zip_writer = ZipFileWriter::new(Cursor::new(&mut buffer));
@@ -160,7 +160,7 @@ pub async fn get_result_handler(
             best_validator,
         )
     } else {
-        let mut best = successful_results
+        let best = successful_results
             .into_iter()
             .max_by(|a, b| {
                 b.get_score()
@@ -170,7 +170,7 @@ pub async fn get_result_handler(
             })
             .ok_or_else(|| ServerError::Internal("Failed to select best TaskResult".into()))?;
 
-        let best_validator = std::mem::take(&mut best.validator_hotkey);
+        let best_validator = best.validator_hotkey.clone();
         let asset = best
             .into_asset()
             .ok_or_else(|| ServerError::Internal("Missing asset on best TaskResult".into()))?;
@@ -186,7 +186,7 @@ pub async fn get_result_handler(
         )
     };
 
-    metrics.inc_best_task(&best_validator);
+    metrics.inc_best_task(&best_validator).await;
 
     res.headers_mut()
         .insert("content-type", HeaderValue::from_static(content_type));
@@ -229,8 +229,8 @@ struct AddResultMultipartData {
     id: Option<String>,
     signature: Option<String>,
     timestamp: Option<String>,
-    validator_hotkey: Option<String>,
-    miner_hotkey: Option<String>,
+    validator_hotkey: Option<Hotkey>,
+    miner_hotkey: Option<Hotkey>,
     status: Option<String>,
     asset: Option<Vec<u8>>,
     score: Option<f32>,
@@ -268,9 +268,19 @@ async fn parse_add_result_multipart(
             "signature" => signature = Some(read_text_field(field, "signature").await?),
             "timestamp" => timestamp = Some(read_text_field(field, "timestamp").await?),
             "validator_hotkey" => {
-                validator_hotkey = Some(read_text_field(field, "validator_hotkey").await?)
+                let hotkey_str = read_text_field(field, "validator_hotkey").await?;
+                let hotkey = hotkey_str.parse::<Hotkey>().map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid validator_hotkey: {}", e))
+                })?;
+                validator_hotkey = Some(hotkey);
             }
-            "miner_hotkey" => miner_hotkey = Some(read_text_field(field, "miner_hotkey").await?),
+            "miner_hotkey" => {
+                let hotkey_str = read_text_field(field, "miner_hotkey").await?;
+                let hotkey = hotkey_str
+                    .parse::<Hotkey>()
+                    .map_err(|e| ServerError::BadRequest(format!("Invalid miner_hotkey: {}", e)))?;
+                miner_hotkey = Some(hotkey);
+            }
             "status" => status = Some(read_text_field(field, "status").await?),
             "asset" => {
                 let mut content = Vec::new();
@@ -339,12 +349,12 @@ async fn parse_add_result_request(
         .headers()
         .get("content-type")
         .and_then(|ct| ct.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or(ServerError::BadRequest("Missing content-type".into()))?;
+        .ok_or(ServerError::BadRequest("Missing content-type".into()))?
+        .to_owned();
 
     if !content_type
-        .to_lowercase()
-        .starts_with("multipart/form-data")
+        .get(..MULTIPART_PREFIX.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(MULTIPART_PREFIX))
     {
         return Err(ServerError::BadRequest(
             "Invalid content-type, expected multipart/form-data".into(),
@@ -354,7 +364,10 @@ async fn parse_add_result_request(
     let boundary = content_type
         .split(';')
         .map(|s| s.trim())
-        .find(|part| part.to_lowercase().starts_with("boundary="))
+        .find(|part| {
+            part.get(..BOUNDARY_PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(BOUNDARY_PREFIX))
+        })
         .and_then(|part| part.split('=').nth(1))
         .ok_or(ServerError::BadRequest(
             "Missing boundary in content-type".into(),
@@ -490,9 +503,8 @@ pub async fn add_result_handler(
 
     subnet_state
         .validate_hotkey(&task_result.validator_hotkey)
-        .map_err(|e| {
-            ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
-        })?;
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("Invalid hotkey: {}", e)))?;
 
     verify_hotkey(
         &timestamp,
@@ -506,39 +518,46 @@ pub async fn add_result_handler(
     let manager = gateway_state.task_manager();
     let metrics = depot.require::<Metrics>()?;
 
+    let task_description = if let Some(prompt) = manager.get_prompt(task_id).await {
+        format!("prompt: '{}'", prompt)
+    } else if let Some(_image_data) = manager.get_image(task_id).await {
+        "image task".to_string()
+    } else {
+        return Err(ServerError::Internal(
+            "Logic error: task has neither prompt nor image data".to_string(),
+        ));
+    };
+
     if task_result.is_success() {
         info!(
-            "Task {}, prompt: '{}', succeeded from validator {}, miner {}, miner_uid {:?}, miner_rating {:?}, score {}",
+            "Task {}, {}, succeeded from validator {}, miner {}, miner_uid {:?}, miner_rating {:?}, score {}",
             task_id,
-            manager
-                .get_prompt(task_id)
-                .as_deref()
-                .unwrap_or("<unknown>"),
+            task_description,
             &task_result.validator_hotkey,
             &task_result.miner_hotkey.as_ref().map_or("Unknown", |v| v),
             task_result.miner_uid,
             task_result.miner_rating,
             task_result.score.unwrap_or(0.0),
         );
-        metrics.inc_task_completed(&task_result.validator_hotkey);
+        metrics
+            .inc_task_completed(&task_result.validator_hotkey)
+            .await;
     } else {
         let reason = task_result.reason.as_deref().unwrap_or("Unknown failure");
         warn!(
-            "Task {}, prompt: '{}', failed from validator {}, reason: {}",
-            task_id,
-            manager
-                .get_prompt(task_id)
-                .as_deref()
-                .unwrap_or("<unknown>"),
-            &task_result.validator_hotkey,
-            reason
+            "Task {}, {}, failed from validator {}, reason: {}",
+            task_id, task_description, &task_result.validator_hotkey, reason
         );
-        metrics.inc_task_failed(&task_result.validator_hotkey);
+        metrics.inc_task_failed(&task_result.validator_hotkey).await;
     }
 
-    metrics.record_completion_time(&task_result.validator_hotkey, manager.get_time(task_id));
+    if let Some(elapsed) = manager.get_time(task_id).await {
+        metrics
+            .record_completion_time(&task_result.validator_hotkey, elapsed)
+            .await;
+    }
     manager.add_result(task_id, task_result).await;
-    manager.remove_time(task_id);
+    manager.remove_time(task_id).await;
 
     res.status_code(StatusCode::OK);
     res.render(Text::Plain("Ok"));

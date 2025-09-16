@@ -1,4 +1,5 @@
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use crate::raft::client::RClientBuilder;
     use crate::raft::init_crypto_provider;
@@ -21,7 +22,7 @@ mod tests {
         sync::Arc,
         sync::Once,
     };
-    use tokio::{sync::RwLock, time::Duration};
+    use tokio::time::Duration;
     use tracing::info;
 
     static TRACING: Once = Once::new();
@@ -40,21 +41,19 @@ mod tests {
         addr: &str,
         config: Arc<openraft::Config>,
         node_clients: Arc<scc::HashMap<String, RClient, RandomState>>,
-    ) -> Result<(Arc<RwLock<Raft>>, Arc<StateMachineStore>, RServer)> {
+    ) -> Result<(Raft, Arc<StateMachineStore>, RServer)> {
         let network = Network::new(node_clients.clone());
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
         let pcfg = RServerConfig::default();
-        let raft = Arc::new(RwLock::new(
-            openraft::Raft::new(
-                node_id,
-                Arc::clone(&config),
-                network,
-                log_store,
-                state_machine_store.clone(),
-            )
-            .await?,
-        ));
+        let raft = openraft::Raft::new(
+            node_id,
+            Arc::clone(&config),
+            network,
+            log_store,
+            state_machine_store.clone(),
+        )
+        .await?;
         let server = RServer::new(addr, None, raft.clone(), pcfg).await?;
         Ok((raft, state_machine_store, server))
     }
@@ -65,7 +64,7 @@ mod tests {
     ) -> Result<(
         Arc<Config>,
         RServerConfig,
-        Vec<Arc<RwLock<Raft>>>,
+        Vec<Raft>,
         Vec<Arc<StateMachineStore>>,
         Vec<RServer>,
     )> {
@@ -95,10 +94,7 @@ mod tests {
         Ok((config, pcfg, raft_nodes, state_machines, server_handles))
     }
 
-    async fn wait_for_log_commit(
-        nodes: &[Arc<RwLock<Raft>>],
-        target_log_id: LogId<NodeId>,
-    ) -> Result<()> {
+    async fn wait_for_log_commit(nodes: &[Raft], target_log_id: LogId<NodeId>) -> Result<()> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(10);
 
@@ -107,7 +103,6 @@ mod tests {
             let mut status = String::new();
 
             for (i, node) in nodes.iter().enumerate() {
-                let node = node.read().await;
                 let metrics_ref = node.metrics();
                 let metrics = metrics_ref.borrow();
                 let last_applied = metrics.last_applied;
@@ -123,7 +118,7 @@ mod tests {
                     target_log_id
                 ));
 
-                if last_applied.map_or(true, |id| id < target_log_id) {
+                if last_applied.is_none_or(|id| id < target_log_id) {
                     all_synced = false;
                 }
             }
@@ -147,12 +142,11 @@ mod tests {
         }
     }
 
-    async fn wait_for_leader(nodes: &[Arc<RwLock<Raft>>], timeout: Duration) -> Result<u64> {
+    async fn wait_for_leader(nodes: &[Raft], timeout: Duration) -> Result<u64> {
         let start = std::time::Instant::now();
 
         loop {
             for node in nodes {
-                let node = node.read().await;
                 match node.metrics().borrow().current_leader {
                     Some(leader_id) => return Ok(leader_id),
                     None => continue,
@@ -167,10 +161,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_leader_consistent(
-        nodes: &[Arc<RwLock<Raft>>],
-        timeout: Duration,
-    ) -> anyhow::Result<u64> {
+    async fn wait_for_leader_consistent(nodes: &[Raft], timeout: Duration) -> anyhow::Result<u64> {
         let start = std::time::Instant::now();
 
         while start.elapsed() <= timeout {
@@ -178,8 +169,7 @@ mod tests {
             let mut all_agree = true;
 
             for node in nodes {
-                let node_guard = node.read().await;
-                if let Some(current_leader) = node_guard.metrics().borrow().current_leader {
+                if let Some(current_leader) = node.metrics().borrow().current_leader {
                     match maybe_leader {
                         Some(existing_leader) if existing_leader != current_leader => {
                             all_agree = false;
@@ -207,7 +197,7 @@ mod tests {
     }
 
     async fn wait_for_leader_consistent_excluding(
-        nodes: &[Arc<RwLock<Raft>>],
+        nodes: &[Raft],
         exclude_node: u64,
         timeout: Duration,
     ) -> anyhow::Result<u64> {
@@ -218,8 +208,7 @@ mod tests {
             let mut all_agree = true;
 
             for node in nodes {
-                let node_guard = node.read().await;
-                if let Some(current_leader) = node_guard.metrics().borrow().current_leader {
+                if let Some(current_leader) = node.metrics().borrow().current_leader {
                     // Skip if the current leader is the excluded node
                     if current_leader == exclude_node {
                         all_agree = false;
@@ -283,7 +272,7 @@ mod tests {
                 .build()
                 .await?;
             node_clients
-                .insert(server_addr.to_string(), client)
+                .insert_sync(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
@@ -296,11 +285,7 @@ mod tests {
             },
         );
 
-        raft_nodes[0]
-            .write()
-            .await
-            .initialize(initial_nodes)
-            .await?;
+        raft_nodes[0].initialize(initial_nodes).await?;
 
         wait_for_leader(&raft_nodes, Duration::from_secs(10)).await?;
 
@@ -311,11 +296,7 @@ mod tests {
                 let node = BasicNode {
                     addr: addr.to_string(),
                 };
-                let add_learner_result = raft_nodes[0]
-                    .write()
-                    .await
-                    .add_learner(*node_id, node, false)
-                    .await?;
+                let add_learner_result = raft_nodes[0].add_learner(*node_id, node, false).await?;
                 last_log_id = Some(add_learner_result.log_id);
             }
             last_log_id
@@ -330,18 +311,16 @@ mod tests {
         // Write and verify test data
         let test_request = Request::Set {
             key: "test_key".to_string(),
-            value: "test_value".to_string(),
+            value: rmp_serde::to_vec("test_value").unwrap(),
         };
-        let write_result = raft_nodes[0]
-            .write()
-            .await
-            .client_write(test_request)
-            .await?;
+        let write_result = raft_nodes[0].client_write(test_request).await?;
         wait_for_log_commit(&raft_nodes, write_result.log_id).await?;
 
         for state_machine in &state_machines {
             let sm = state_machine.state_machine.read().await;
-            assert_eq!(sm.data.get("test_key").unwrap(), "test_value");
+            let value = sm.data.get("test_key").unwrap();
+            let value_str: String = rmp_serde::from_slice(value).unwrap();
+            assert_eq!(value_str, "test_value");
         }
 
         Ok(())
@@ -378,7 +357,7 @@ mod tests {
                 .build()
                 .await?;
             node_clients
-                .insert(server_addr.to_string(), client)
+                .insert_sync(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
@@ -398,13 +377,11 @@ mod tests {
                 node_configs[i].0, membership
             );
 
-            let init_members: BTreeMap<_, _> = membership
-                .nodes()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let init_members: BTreeMap<_, _> =
+                membership.nodes().map(|(k, v)| (*k, v.clone())).collect();
 
             tokio::spawn(async move {
-                raft.write().await.initialize(init_members).await.unwrap();
+                raft.initialize(init_members).await.unwrap();
             });
         }
 
@@ -413,7 +390,7 @@ mod tests {
 
         info!("Leader elected: {:?}", leader_id);
         for (i, raft) in raft_nodes.iter().enumerate() {
-            let observed_leader = raft.read().await.metrics().borrow().current_leader;
+            let observed_leader = raft.metrics().borrow().current_leader;
             assert_eq!(
                 observed_leader,
                 Some(leader_id),
@@ -428,21 +405,18 @@ mod tests {
             .expect("Leader must be one of the nodes");
         let test_request = Request::Set {
             key: "vote_mode_key".into(),
-            value: "vote_mode_value".into(),
+            value: rmp_serde::to_vec("vote_mode_value").unwrap(),
         };
-        let write_result = raft_nodes[leader_index]
-            .write()
-            .await
-            .client_write(test_request)
-            .await?;
+        let write_result = raft_nodes[leader_index].client_write(test_request).await?;
         wait_for_log_commit(&raft_nodes, write_result.log_id).await?;
 
         // Verify that the write has propagated to the state machines of all nodes.
         for state_machine in state_machines.iter() {
             let sm = state_machine.state_machine.read().await;
+            let value = sm.data.get("vote_mode_key").unwrap();
+            let value_str: String = rmp_serde::from_slice(value).unwrap();
             assert_eq!(
-                sm.data.get("vote_mode_key").unwrap(),
-                "vote_mode_value",
+                value_str, "vote_mode_value",
                 "State machine did not record the correct value"
             );
         }
@@ -485,7 +459,7 @@ mod tests {
                 .build()
                 .await?;
             node_clients
-                .insert(server_addr.to_string(), client)
+                .insert_sync(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
@@ -506,19 +480,12 @@ mod tests {
                 node_configs[i].0, membership
             );
 
-            let init_members: BTreeMap<_, _> = membership
-                .nodes()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let init_members: BTreeMap<_, _> =
+                membership.nodes().map(|(k, v)| (*k, v.clone())).collect();
 
             let raft_clone = raft.clone();
             tokio::spawn(async move {
-                raft_clone
-                    .write()
-                    .await
-                    .initialize(init_members)
-                    .await
-                    .unwrap();
+                raft_clone.initialize(init_members).await.unwrap();
             });
         }
 
@@ -528,7 +495,7 @@ mod tests {
 
         // Verify that all nodes see the elected leader.
         for (i, raft) in raft_nodes.iter().enumerate() {
-            let observed_leader = raft.read().await.metrics().borrow().current_leader;
+            let observed_leader = raft.metrics().borrow().current_leader;
             assert_eq!(
                 observed_leader,
                 Some(old_leader),
@@ -548,15 +515,11 @@ mod tests {
             old_leader, node_configs[leader_index].1
         );
         // Dropping the server handle simulates a crash.
-        let node = server_handles.remove(leader_index);
-        node.abort();
-        drop(node);
-
-        let raft = raft_nodes.remove(leader_index);
-        drop(raft);
-
-        let state_machine = state_machines.remove(leader_index);
-        drop(state_machine);
+        server_handles.remove(leader_index).abort();
+        {
+            let _ = raft_nodes.remove(leader_index);
+            let _ = state_machines.remove(leader_index);
+        }
 
         // Wait for a new leader to be elected and for all nodes to agree.
         let new_leader =
@@ -603,7 +566,7 @@ mod tests {
                 .build()
                 .await?;
             node_clients
-                .insert(server_addr.to_string(), client)
+                .insert_sync(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
@@ -617,11 +580,7 @@ mod tests {
                 },
             );
         }
-        raft_nodes[0]
-            .write()
-            .await
-            .initialize(initial_members)
-            .await?;
+        raft_nodes[0].initialize(initial_members).await?;
 
         // Wait for the leader to be elected.
         let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
@@ -633,19 +592,17 @@ mod tests {
         // Issue a client write to set a key/value pair.
         let test_request = Request::Set {
             key: "test_key".to_string(),
-            value: "test_value".to_string(),
+            value: rmp_serde::to_vec("test_value").unwrap(),
         };
-        let write_result = raft_nodes[leader_index]
-            .write()
-            .await
-            .client_write(test_request)
-            .await?;
+        let write_result = raft_nodes[leader_index].client_write(test_request).await?;
         wait_for_log_commit(&raft_nodes, write_result.log_id).await?;
 
         // Verify that all initial nodes applied the command.
         for state_machine in &state_machines {
             let sm = state_machine.state_machine.read().await;
-            assert_eq!(sm.data.get("test_key").unwrap(), "test_value");
+            let value = sm.data.get("test_key").unwrap();
+            let value_str: String = rmp_serde::from_slice(value).unwrap();
+            assert_eq!(value_str, "test_value");
         }
 
         // Now, add a new node (node 4) to the existing three-node cluster.
@@ -673,13 +630,11 @@ mod tests {
             .build()
             .await?;
         node_clients
-            .insert(new_node_addr.to_string(), new_client)
+            .insert_sync(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         // Add the new node as a learner using the current leader.
         let add_learner_result = raft_nodes[leader_index]
-            .write()
-            .await
             .add_learner(
                 new_node_id,
                 BasicNode {
@@ -693,7 +648,9 @@ mod tests {
         // Verify that the new node's state machine caught up with the previously applied log.
         let new_node_sm = state_machines.last().unwrap();
         let sm = new_node_sm.state_machine.read().await;
-        assert_eq!(sm.data.get("test_key").unwrap(), "test_value");
+        let value = sm.data.get("test_key").unwrap();
+        let value_str: String = rmp_serde::from_slice(value).unwrap();
+        assert_eq!(value_str, "test_value");
 
         Ok(())
     }
@@ -733,7 +690,7 @@ mod tests {
                 .build()
                 .await?;
             node_clients
-                .insert(server_addr.to_string(), client)
+                .insert_sync(server_addr.to_string(), client)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
 
@@ -747,11 +704,7 @@ mod tests {
                 },
             );
         }
-        raft_nodes[0]
-            .write()
-            .await
-            .initialize(initial_members)
-            .await?;
+        raft_nodes[0].initialize(initial_members).await?;
 
         // Wait until a leader is elected.
         let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
@@ -786,13 +739,11 @@ mod tests {
             .await?;
 
         node_clients
-            .insert(new_node_addr.to_string(), new_client)
+            .insert_sync(new_node_addr.to_string(), new_client)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
         // Add the new node as a learner before promoting it to a voter.
         let add_learner_resp = raft_nodes[leader_index]
-            .write()
-            .await
             .add_learner(
                 new_node_id,
                 BasicNode {
@@ -813,8 +764,6 @@ mod tests {
 
         // Issue the membership change to promote the learner to a voter.
         let change_resp = raft_nodes[leader_index]
-            .write()
-            .await
             .change_membership(new_members, false)
             .await?;
         wait_for_log_commit(&raft_nodes, change_resp.log_id).await?;
@@ -822,19 +771,17 @@ mod tests {
         // Issue a client write after the membership change.
         let test_request = Request::Set {
             key: "test_key".to_string(),
-            value: "test_value".to_string(),
+            value: rmp_serde::to_vec("test_value").unwrap(),
         };
-        let write_result = raft_nodes[leader_index]
-            .write()
-            .await
-            .client_write(test_request)
-            .await?;
+        let write_result = raft_nodes[leader_index].client_write(test_request).await?;
         wait_for_log_commit(&raft_nodes, write_result.log_id).await?;
 
         // Verify that every node in the cluster, including the newly promoted voter, has applied the command.
         for stores in &state_machines {
             let sm = stores.state_machine.read().await;
-            assert_eq!(sm.data.get("test_key").unwrap(), "test_value");
+            let value = sm.data.get("test_key").unwrap();
+            let value_str: String = rmp_serde::from_slice(value).unwrap();
+            assert_eq!(value_str, "test_value");
         }
 
         Ok(())

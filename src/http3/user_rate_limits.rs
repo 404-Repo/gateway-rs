@@ -105,7 +105,7 @@ impl RateIssuer for GlobalUserIDIssuer {
         let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
         let gs = depot.obtain::<GatewayState>().ok()?;
 
-        if gs.get_user_id(key_header).is_some() {
+        if gs.get_user_id(key_header).await.is_some() {
             return Some("g_uid".to_string());
         }
 
@@ -122,7 +122,7 @@ impl RateIssuer for UserIDLimitIssuer {
         let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
         let gs = depot.obtain::<GatewayState>().ok()?;
 
-        if let Some(user_id) = gs.get_user_id(key_header) {
+        if let Some(user_id) = gs.get_user_id(key_header).await {
             return Some(format!("u_{}", user_id));
         }
 
@@ -147,9 +147,9 @@ impl RateIssuer for UnauthorizedOnlyIssuer {
 
         if let Some(key_str) = req.headers().get("x-api-key").and_then(|h| h.to_str().ok()) {
             if let Ok(uuid) = Uuid::parse_str(key_str) {
-                let is_authorized = gs.is_valid_api_key(key_str)
+                let is_authorized = gs.is_valid_api_key(key_str).await
                     || gs.is_generic_key(&uuid).await
-                    || gs.is_company_key(key_str);
+                    || gs.is_company_key(key_str).await;
 
                 if is_authorized {
                     // Authorized, bypass rate limiting

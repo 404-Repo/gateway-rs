@@ -1,22 +1,14 @@
-use std::convert::TryFrom;
-use std::error::Error;
-use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
-
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
 use quinn::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
+use std::{fmt, time::Duration};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
 
-use crate::raft::NodeId;
-use crate::raft::Raft;
-use crate::raft::TypeConfig;
+use crate::raft::{NodeId, Raft, TypeConfig};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "msg_type", content = "data")]
@@ -31,163 +23,129 @@ pub enum RaftMessageType {
 
 impl fmt::Display for RaftMessageType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RaftMessageType::AppendEntriesRequest(_) => write!(f, "AppendEntriesRequest"),
-            RaftMessageType::InstallSnapshotRequest(_) => write!(f, "InstallSnapshotRequest"),
-            RaftMessageType::VoteRequest(_) => write!(f, "VoteRequest"),
-            RaftMessageType::AppendEntriesResponse(_) => write!(f, "AppendEntriesResponse"),
-            RaftMessageType::InstallSnapshotResponse(_) => write!(f, "InstallSnapshotResponse"),
-            RaftMessageType::VoteResponse(_) => write!(f, "VoteResponse"),
-        }
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::AppendEntriesRequest(_) => "AppendEntriesRequest",
+                Self::InstallSnapshotRequest(_) => "InstallSnapshotRequest",
+                Self::VoteRequest(_) => "VoteRequest",
+                Self::AppendEntriesResponse(_) => "AppendEntriesResponse",
+                Self::InstallSnapshotResponse(_) => "InstallSnapshotResponse",
+                Self::VoteResponse(_) => "VoteResponse",
+            }
+        )
     }
 }
 
 #[derive(Debug)]
-pub struct ConversionError(String);
+pub struct ConversionError(&'static str);
 
 impl fmt::Display for ConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        f.write_str(self.0)
     }
 }
+impl std::error::Error for ConversionError {}
 
-impl Error for ConversionError {}
-
-impl TryFrom<RaftMessageType> for AppendEntriesResponse<u64> {
-    type Error = ConversionError;
-
-    fn try_from(message: RaftMessageType) -> Result<Self, Self::Error> {
-        match message {
-            RaftMessageType::AppendEntriesResponse(resp) => Ok(resp),
-            other => Err(ConversionError(format!(
-                "Expected AppendEntriesResponse, got: {:?}",
-                other
-            ))),
+macro_rules! impl_try_from {
+    ($variant:ident, $ty:ty) => {
+        impl TryFrom<RaftMessageType> for $ty {
+            type Error = ConversionError;
+            fn try_from(msg: RaftMessageType) -> Result<Self, Self::Error> {
+                if let RaftMessageType::$variant(v) = msg {
+                    Ok(v)
+                } else {
+                    Err(ConversionError(concat!("Expected ", stringify!($variant))))
+                }
+            }
         }
-    }
+    };
 }
 
-impl TryFrom<RaftMessageType> for InstallSnapshotResponse<u64> {
-    type Error = ConversionError;
-
-    fn try_from(message: RaftMessageType) -> Result<Self, Self::Error> {
-        match message {
-            RaftMessageType::InstallSnapshotResponse(resp) => Ok(resp),
-            other => Err(ConversionError(format!(
-                "Expected InstallSnapshotResponse, got: {:?}",
-                other
-            ))),
-        }
-    }
-}
-
-impl TryFrom<RaftMessageType> for VoteResponse<u64> {
-    type Error = ConversionError;
-
-    fn try_from(message: RaftMessageType) -> Result<Self, Self::Error> {
-        match message {
-            RaftMessageType::VoteResponse(resp) => Ok(resp),
-            other => Err(ConversionError(format!(
-                "Expected VoteResponse, got: {:?}",
-                other
-            ))),
-        }
-    }
-}
+impl_try_from!(AppendEntriesResponse, AppendEntriesResponse<NodeId>);
+impl_try_from!(InstallSnapshotResponse, InstallSnapshotResponse<NodeId>);
+impl_try_from!(VoteResponse, VoteResponse<NodeId>);
 
 #[derive(Debug, Clone)]
 pub struct Protocol {
     _connection: Connection,
     max_message_size: usize,
+    max_recv_buffer_size: usize,
     receive_message_timeout_ms: Duration,
 }
 
 impl Protocol {
     pub fn new(
-        connection: Connection,
+        conn: Connection,
         max_message_size: usize,
+        max_recv_buffer_size: usize,
         receive_message_timeout_ms: Duration,
     ) -> Self {
         Self {
-            _connection: connection,
+            _connection: conn,
             max_message_size,
+            max_recv_buffer_size,
             receive_message_timeout_ms,
         }
     }
 
     pub async fn send_message(&self, mut send: SendStream, message: RaftMessageType) -> Result<()> {
-        let serialized = rmp_serde::to_vec_named(&message)?;
-
-        if serialized.len() > self.max_message_size {
-            return Err(anyhow::anyhow!(
-                "Message size {} exceeds maximum allowed size of {}",
-                serialized.len(),
+        let data = rmp_serde::to_vec_named(&message)?;
+        if data.len() > self.max_message_size {
+            return Err(anyhow!(
+                "Message size {} exceeds max {}",
+                data.len(),
                 self.max_message_size
             ));
         }
-
-        send.write_all(&serialized).await?;
+        send.write_all(&data).await?;
         send.flush().await?;
         send.finish()?;
         let _ = send.stopped().await;
-
         Ok(())
     }
 
     pub async fn receive_message(&self, mut recv_stream: RecvStream) -> Result<RaftMessageType> {
-        let mut message_data = Vec::new();
-        let mut buffer = vec![0; 8192];
+        let mut message_data = Vec::with_capacity(self.max_message_size);
+        let mut buffer = vec![0; self.max_recv_buffer_size];
 
-        let read_result = tokio::time::timeout(self.receive_message_timeout_ms, async {
+        let data = tokio::time::timeout(self.receive_message_timeout_ms, async {
             while let Some(n) = recv_stream.read(&mut buffer).await? {
                 message_data.extend_from_slice(&buffer[..n]);
                 if message_data.len() > self.max_message_size {
-                    return Err(anyhow::anyhow!(
-                        "Message exceeded maximum size limit of {} bytes",
+                    return Err(anyhow!(
+                        "Message exceeded maximum size of {} bytes",
                         self.max_message_size
                     ));
                 }
             }
             Ok(message_data)
         })
-        .await?;
+        .await??;
 
-        let message_data = read_result?;
-        if message_data.is_empty() {
-            return Err(anyhow::anyhow!("Received empty message"));
+        if data.is_empty() {
+            return Err(anyhow!("Received empty message"));
         }
-
-        let message: RaftMessageType = rmp_serde::from_slice(&message_data)
-            .map_err(|e| anyhow::anyhow!("Deserialization error: {:?}", e))?;
-
-        Ok(message)
+        rmp_serde::from_slice(&data).map_err(|e| anyhow!("Deserialization error: {:?}", e))
     }
 
     pub async fn handle_message(
         &self,
         message: RaftMessageType,
-        raft: Arc<RwLock<Raft>>,
+        raft: Raft,
     ) -> Result<RaftMessageType> {
-        match message {
-            RaftMessageType::AppendEntriesRequest(req) => Ok(raft
-                .write()
-                .await
-                .append_entries(req)
-                .await
-                .map(RaftMessageType::AppendEntriesResponse)?),
-            RaftMessageType::InstallSnapshotRequest(req) => Ok(raft
-                .write()
-                .await
-                .install_snapshot(req)
-                .await
-                .map(RaftMessageType::InstallSnapshotResponse)?),
-            RaftMessageType::VoteRequest(req) => Ok(raft
-                .write()
-                .await
-                .vote(req)
-                .await
-                .map(RaftMessageType::VoteResponse)?),
-            _ => Err(anyhow::anyhow!("Unexpected message type")),
-        }
+        Ok(match message {
+            RaftMessageType::AppendEntriesRequest(req) => {
+                RaftMessageType::AppendEntriesResponse(raft.append_entries(req).await?)
+            }
+            RaftMessageType::InstallSnapshotRequest(req) => {
+                RaftMessageType::InstallSnapshotResponse(raft.install_snapshot(req).await?)
+            }
+            RaftMessageType::VoteRequest(req) => {
+                RaftMessageType::VoteResponse(raft.vote(req).await?)
+            }
+            _ => return Err(anyhow!("Unexpected message type")),
+        })
     }
 }

@@ -8,6 +8,17 @@ const BAD_REQUEST_HTML: &str = include_str!("responses/400.html");
 const INTERNAL_SERVER_ERROR_HTML: &str = include_str!("responses/500.html");
 const NOT_FOUND_HTML: &str = include_str!("responses/404.html");
 
+fn error_page_for(status: StatusCode) -> Option<&'static str> {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some(TOO_MANY_REQUESTS_HTML),
+        StatusCode::METHOD_NOT_ALLOWED => Some(METHOD_NOT_ALLOWED_HTML),
+        StatusCode::BAD_REQUEST => Some(BAD_REQUEST_HTML),
+        StatusCode::INTERNAL_SERVER_ERROR => Some(INTERNAL_SERVER_ERROR_HTML),
+        StatusCode::NOT_FOUND => Some(NOT_FOUND_HTML),
+        _ => None,
+    }
+}
+
 #[handler]
 pub async fn custom_response(
     req: &Request,
@@ -36,36 +47,12 @@ pub async fn custom_response(
                 reason
             );
         }
-    }
 
-    if let Some(StatusCode::TOO_MANY_REQUESTS) = res.status_code {
-        res.render(Text::Html(TOO_MANY_REQUESTS_HTML));
-        res.status_code(StatusCode::TOO_MANY_REQUESTS);
-        ctrl.skip_rest();
-        return;
-    }
-    if let Some(StatusCode::METHOD_NOT_ALLOWED) = res.status_code {
-        res.render(Text::Html(METHOD_NOT_ALLOWED_HTML));
-        res.status_code(StatusCode::METHOD_NOT_ALLOWED);
-        ctrl.skip_rest();
-        return;
-    }
-    if let Some(StatusCode::BAD_REQUEST) = res.status_code {
-        res.render(Text::Html(BAD_REQUEST_HTML));
-        res.status_code(StatusCode::BAD_REQUEST);
-        ctrl.skip_rest();
-        return;
-    }
-    if let Some(StatusCode::INTERNAL_SERVER_ERROR) = res.status_code {
-        res.render(Text::Html(INTERNAL_SERVER_ERROR_HTML));
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        ctrl.skip_rest();
-        return;
-    }
-    if let Some(StatusCode::NOT_FOUND) = res.status_code {
-        res.render(Text::Html(NOT_FOUND_HTML));
-        res.status_code(StatusCode::NOT_FOUND);
-        ctrl.skip_rest();
-        return;
+        if let Some(html) = error_page_for(status) {
+            res.render(Text::Html(html));
+            res.status_code(status);
+            ctrl.skip_rest();
+            return;
+        }
     }
 }

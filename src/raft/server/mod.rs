@@ -2,13 +2,13 @@ use crate::{common::cert::generate_self_signed_config, config::RServerConfig, pr
 use anyhow::Result;
 use quinn::{
     crypto::rustls::QuicServerConfig, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream,
-    ServerConfig, TransportConfig,
+    ServerConfig, TransportConfig, WriteError,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use super::Raft;
 
@@ -23,7 +23,7 @@ impl RServer {
     pub async fn new(
         bind_addr: &str,
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-        raft: Arc<RwLock<Raft>>,
+        raft: Raft,
         rserver_cfg: RServerConfig,
     ) -> Result<Self> {
         let mut server_config = match cert {
@@ -54,26 +54,39 @@ impl RServer {
         info!("RServer QUIC server listening on {}", bind_addr);
 
         let cancel_token = CancellationToken::new();
-        let endpoint_clone = endpoint.clone();
-        let raft_clone = raft.clone();
-        let accept_token = cancel_token.clone();
+        let accept_task =
+            Self::spawn_accept_task(endpoint.clone(), raft, rserver_cfg, cancel_token.clone());
 
-        let accept_task: JoinHandle<()> = tokio::spawn(async move {
+        Ok(Self {
+            _endpoint: endpoint,
+            _server_config: server_config,
+            accept_task,
+            cancel_token,
+        })
+    }
+
+    fn spawn_accept_task(
+        endpoint: Endpoint,
+        raft: Raft,
+        rserver_cfg: RServerConfig,
+        cancel_token: CancellationToken,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = accept_token.cancelled() => {
+                    _ = cancel_token.cancelled() => {
                         info!("Cancellation requested: stopping accept loop");
                         break;
                     }
-                    maybe_incoming = endpoint_clone.accept() => {
+                    maybe_incoming = endpoint.accept() => {
                         match maybe_incoming {
                             Some(incoming) => {
-                                let connection_token = accept_token.clone();
-                                let raft_inner = raft_clone.clone();
+                                let connection_token = cancel_token.clone();
+                                let raft_inner = raft.clone();
                                 let p_cfg = rserver_cfg.clone();
                                 tokio::spawn(async move {
                                     tokio::select! {
-                                        res = Self::handle_incoming(incoming, raft_inner, p_cfg.clone()) => {
+                                        res = RServer::handle_incoming(incoming, raft_inner, p_cfg.clone()) => {
                                             if let Err(e) = res {
                                                 error!("Connection error: {}", e);
                                             }
@@ -92,19 +105,12 @@ impl RServer {
                     }
                 }
             }
-        });
-
-        Ok(Self {
-            _endpoint: endpoint,
-            _server_config: server_config,
-            accept_task,
-            cancel_token,
         })
     }
 
     async fn handle_incoming(
         incoming: Incoming,
-        raft: Arc<RwLock<Raft>>,
+        raft: Raft,
         rserver_cfg: RServerConfig,
     ) -> Result<()> {
         let connection = incoming.await?;
@@ -117,10 +123,16 @@ impl RServer {
                     let protocol = Protocol::new(
                         connection.clone(),
                         rserver_cfg.max_message_size,
+                        rserver_cfg.max_recv_buffer_size,
                         Duration::from_millis(rserver_cfg.receive_message_timeout_ms),
                     );
                     if let Err(e) = Self::handle_request(protocol, send, recv, raft.clone()).await {
-                        error!("Error handling request: {}", e);
+                        match e.downcast_ref::<WriteError>() {
+                            Some(WriteError::Stopped(_)) => {}
+                            _ => {
+                                error!("Error handling request: {}", e);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -137,24 +149,19 @@ impl RServer {
         protocol: Protocol,
         send: SendStream,
         recv: RecvStream,
-        raft: Arc<RwLock<Raft>>,
+        raft: Raft,
     ) -> Result<()> {
         let message = protocol.receive_message(recv).await?;
-        debug!("==> Received message: {:?}", message);
 
         let response = match protocol.handle_message(message, raft).await {
-            Ok(resp) => {
-                debug!("==> Client got response: {:?}", resp);
-                resp
-            }
+            Ok(resp) => resp,
             Err(e) => {
                 error!("==> Error handling message: {}", e);
                 return Err(e);
             }
         };
 
-        let result = protocol.send_message(send, response).await;
-        debug!("==> Send result: {:?}", result);
+        protocol.send_message(send, response).await?;
 
         Ok(())
     }
@@ -168,17 +175,23 @@ impl RServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{network::Network, LogStore, StateMachineStore, TypeConfig};
+    use crate::raft::{network::Network, LogStore, StateMachineStore};
     use anyhow::Result;
     use foldhash::fast::RandomState;
     use openraft::Config;
     use std::net::UdpSocket;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use std::sync::{Arc, Once};
 
-    async fn create_test_raft_node(
-        node_id: u64,
-    ) -> Result<Arc<RwLock<openraft::Raft<TypeConfig>>>> {
+    static CRYPTO_INIT: Once = Once::new();
+
+    fn init_crypto_provider() {
+        CRYPTO_INIT.call_once(|| {
+            crate::raft::init_crypto_provider().unwrap();
+        });
+    }
+
+    async fn create_test_raft_node(node_id: u64) -> Result<Raft> {
+        init_crypto_provider();
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
@@ -204,7 +217,7 @@ mod tests {
         )
         .await?;
 
-        Ok(Arc::new(RwLock::new(raft)))
+        Ok(raft)
     }
 
     #[tokio::test]

@@ -36,12 +36,11 @@ impl Writer for ServerError {
         let msg = match self {
             ServerError::BadRequest(msg) => format!("Bad request: {}", msg),
             ServerError::Internal(details) => {
-                let mut m = "Internal Server Error".to_string();
-                if !details.is_empty() {
-                    m.push_str(": ");
-                    m.push_str(&details);
+                if details.is_empty() {
+                    "Internal Server Error".to_string()
+                } else {
+                    format!("Internal Server Error: {}", details)
                 }
-                m
             }
             ServerError::Unauthorized(msg) => format!("Unauthorized request: {}", msg),
             ServerError::NotFound(msg) => msg,

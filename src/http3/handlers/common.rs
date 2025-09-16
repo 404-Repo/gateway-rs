@@ -1,14 +1,17 @@
 use crate::api::request::GatewayInfoExt;
 use crate::api::response::LeaderResponse;
 use crate::common::log::get_build_information;
+use crate::config::HTTPConfig;
 use crate::http3::error::ServerError;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
-use anyhow::Result;
 use http::HeaderValue;
 use prometheus::Encoder;
 use salvo::prelude::*;
 use uuid::Uuid;
+
+pub const MULTIPART_PREFIX: &str = "multipart/form-data";
+pub const BOUNDARY_PREFIX: &str = "boundary=";
 
 pub(crate) trait DepotExt {
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
@@ -32,10 +35,12 @@ pub async fn write_handler(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gi = req
-        .parse_json::<GatewayInfoExt>()
+    let body = req
+        .payload_with_max_size(depot.require::<HTTPConfig>()?.raft_write_size_limit as usize)
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let gi: GatewayInfoExt = rmp_serde::from_slice(body.as_ref())
+        .map_err(|e| ServerError::BadRequest(format!("Failed to parse msgpack: {}", e)))?;
 
     let gateway_state = depot.require::<GatewayState>()?;
 
@@ -120,9 +125,9 @@ pub async fn api_or_generic_key_check(
     let uuid = Uuid::parse_str(key_str)
         .map_err(|_| ServerError::BadRequest("API key must be a valid UUID format".to_string()))?;
 
-    if gateway_state.is_valid_api_key(key_str)
+    if gateway_state.is_valid_api_key(key_str).await
         || gateway_state.is_generic_key(&uuid).await
-        || gateway_state.is_company_key(key_str)
+        || gateway_state.is_company_key(key_str).await
     {
         Ok(())
     } else {

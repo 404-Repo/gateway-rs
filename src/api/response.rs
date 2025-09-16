@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::bittensor::hotkey::Hotkey;
 use crate::common::task::TaskStatus;
 
 use super::Task;
@@ -41,7 +42,7 @@ pub struct GetTaskStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub miner_hotkey: Option<String>,
+    pub miner_hotkey: Option<Hotkey>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub miner_uid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,7 +67,7 @@ impl From<TaskStatus> for GetTaskStatusResponse {
             } => Self {
                 status: status_str,
                 reason: None,
-                miner_hotkey: Some(miner_hotkey),
+                miner_hotkey,
                 miner_uid,
                 miner_rating,
             },
@@ -106,21 +107,28 @@ mod tests {
     #[test]
     fn converts_success() {
         let resp: GetTaskStatusResponse = TaskStatus::Success {
-            miner_hotkey: "some_hotkey".to_string(),
+            miner_hotkey: Some(
+                "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7"
+                    .parse()
+                    .unwrap(),
+            ),
             miner_uid: Some(123),
             miner_rating: Some(1500.50),
         }
         .into();
         assert_eq!(resp.status, "Success");
         assert!(resp.reason.is_none());
-        assert_eq!(resp.miner_hotkey.as_deref(), Some("some_hotkey"));
+        assert_eq!(
+            resp.miner_hotkey.as_deref(),
+            Some("5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7")
+        );
         assert_eq!(resp.miner_uid, Some(123));
         assert_eq!(resp.miner_rating, Some(1500.50));
 
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            r#"{"status":"Success","miner_hotkey":"some_hotkey","miner_uid":123,"miner_rating":1500.5}"#
+            r#"{"status":"Success","miner_hotkey":"5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7","miner_uid":123,"miner_rating":1500.5}"#
         );
     }
 
@@ -143,5 +151,47 @@ mod tests {
         assert_eq!(resp.reason.as_deref(), Some("boom"));
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(json, "{\"status\":\"Failure\",\"reason\":\"boom\"}");
+    }
+
+    #[test]
+    fn serializes_gettasks_with_prompt() {
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let id = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let task = Task {
+            id,
+            prompt: Some(Arc::new("mechanic robot".to_string())),
+            image: None,
+        };
+
+        let resp = GetTasksResponse {
+            tasks: vec![task],
+            gateways: vec![],
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"prompt\":\"mechanic robot\"}],\"gateways\":[]}");
+    }
+
+    #[test]
+    fn serializes_gettasks_with_image() {
+        use bytes::Bytes;
+        use uuid::Uuid;
+
+        let id = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174001").unwrap();
+        let task = Task {
+            id,
+            prompt: None,
+            image: Some(Bytes::from(vec![1u8, 2u8, 3u8])),
+        };
+
+        let resp = GetTasksResponse {
+            tasks: vec![task],
+            gateways: vec![],
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174001\",\"image\":\"AQID\"}],\"gateways\":[]}");
     }
 }
