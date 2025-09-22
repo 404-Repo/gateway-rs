@@ -30,7 +30,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::error;
@@ -54,6 +53,7 @@ use crate::db::DatabaseBuilder;
 use crate::http3::client::Http3Client;
 use crate::http3::client::Http3ClientBuilder;
 use crate::http3::server::Http3Server;
+use crate::metrics::Metrics;
 use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
 use crate::raft::store::Request;
@@ -96,7 +96,7 @@ pub struct Gateway {
     pub gateway_info_updater: JoinHandle<()>,
     pub gateway_leader_change: JoinHandle<()>,
     pub api_key_validator_updater: JoinHandle<()>,
-    pub task_manager: Arc<TaskManager>,
+    pub task_manager: TaskManager,
     pub _log_store: LogStore,
     pub http_server: Http3Server,
     pub _task_queue: DupQueue<Task>,
@@ -228,15 +228,16 @@ impl Gateway {
                 continue;
             }
 
+            let leader_info = match gateway_state.gateway(leader).await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Failed to get leader info: {:?}", e);
+                    continue;
+                }
+            };
+
             if last_leader != Some(leader) || client.is_none() {
                 client = None;
-                let leader_info = match gateway_state.gateway(leader).await {
-                    Ok(info) => info,
-                    Err(e) => {
-                        warn!("Failed to get leader info: {:?}", e);
-                        continue;
-                    }
-                };
 
                 let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
                 match Http3ClientBuilder::new()
@@ -274,7 +275,7 @@ impl Gateway {
                 last_update: info.last_update,
             };
 
-            let payload = match serde_json::to_vec(&info_ext) {
+            let payload = match rmp_serde::to_vec(&info_ext) {
                 Ok(p) => p,
                 Err(e) => {
                     error!("Serialization error: {:?}", e);
@@ -282,13 +283,6 @@ impl Gateway {
                 }
             };
 
-            let leader_info = match gateway_state.gateway(leader).await {
-                Ok(info) => info,
-                Err(e) => {
-                    warn!("Failed to get leader info: {:?}", e);
-                    continue;
-                }
-            };
             let url = format!(
                 "https://{}:{}/write",
                 leader_info.domain, leader_info.http_port
@@ -422,7 +416,8 @@ async fn setup_remote_clients(
                     .build()
                     .await?;
                 clients_map
-                    .insert(endpoint, client)
+                    .insert_async(endpoint, client)
+                    .await
                     .map_err(|e| anyhow::anyhow!("{:?}", e))?;
                 Ok::<(), anyhow::Error>(())
             }
@@ -438,21 +433,19 @@ async fn init_membership(
     node_ids: &[u64],
     node_ips: &[IpAddr],
     cfg: &NodeConfig,
-    raft: &Arc<RwLock<Raft>>,
+    raft: &Raft,
     server_addr: &str,
 ) -> Result<()> {
     match mode {
         GatewayMode::Bootstrap if node_id == 1 => {
             info!("Initializing the cluster with node {}", node_id);
-            raft.write()
-                .await
-                .initialize(BTreeMap::from([(
-                    1,
-                    BasicNode {
-                        addr: server_addr.to_string(),
-                    },
-                )]))
-                .await?;
+            raft.initialize(BTreeMap::from([(
+                1,
+                BasicNode {
+                    addr: server_addr.to_string(),
+                },
+            )]))
+            .await?;
 
             let base_raft = raft.clone();
             let futs = node_ids.iter().zip(node_ips.iter()).map(|(id, ip)| {
@@ -463,16 +456,14 @@ async fn init_membership(
                         "Adding node {} as a learner with endpoint: {}",
                         id, endpoint
                     );
-                    raft.write()
-                        .await
-                        .add_learner(
-                            *id,
-                            BasicNode {
-                                addr: endpoint.to_string(),
-                            },
-                            true,
-                        )
-                        .await?;
+                    raft.add_learner(
+                        *id,
+                        BasicNode {
+                            addr: endpoint.to_string(),
+                        },
+                        true,
+                    )
+                    .await?;
                     Ok::<(), anyhow::Error>(())
                 }
             });
@@ -502,7 +493,7 @@ async fn init_membership(
                 }));
             }
 
-            match raft.write().await.initialize(members).await {
+            match raft.initialize(members).await {
                 Ok(_) => info!(
                     "Node {} successfully initialized in {} mode",
                     node_id,
@@ -535,16 +526,14 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         config.network.node_dns_names.len(),
         RandomState::default(),
     ));
-    let raft = Arc::new(RwLock::new(
-        Raft::new(
-            config.network.node_id,
-            Arc::clone(&raft_config),
-            Network::new(clients_map.clone()),
-            log_store.clone(),
-            Arc::clone(&state_machine_store),
-        )
-        .await?,
-    ));
+    let raft = Raft::new(
+        config.network.node_id,
+        Arc::clone(&raft_config),
+        Network::new(clients_map.clone()),
+        log_store.clone(),
+        Arc::clone(&state_machine_store),
+    )
+    .await?;
     let server_addr = format!("{}:{}", config.network.bind_ip, config.network.server_port);
 
     let use_cert_files =
@@ -599,11 +588,14 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
 
     let api_key_validator_updater =
         tokio::spawn(ApiKeyValidator::run(Arc::clone(&api_key_validator)));
+    let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
+
     let task_manager = TaskManager::new(
         config.basic.taskmanager_initial_capacity,
         config.basic.unique_validators_per_task,
         Duration::from_secs(config.basic.taskmanager_cleanup_interval),
         Duration::from_secs(config.basic.taskmanager_result_lifetime),
+        metrics.clone(),
     )
     .await;
 
@@ -612,7 +604,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         raft.clone(),
         last_task_acquisition.clone(),
         api_key_validator,
-        Arc::clone(&task_manager),
+        task_manager.clone(),
         Arc::clone(&config),
     );
 
@@ -629,6 +621,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         RustlsConfig::new(key_cert),
         gateway_state.clone(),
         task_queue.clone(),
+        metrics.clone(),
     )
     .await
     {

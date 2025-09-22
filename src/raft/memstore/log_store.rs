@@ -54,29 +54,25 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
     {
         let response = self
             .log
-            .range(range.clone())
+            .range(range)
             .map(|(_, val)| val.clone())
             .collect::<Vec<_>>();
         Ok(response)
     }
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
-        let last = self
-            .log
-            .iter()
-            .next_back()
-            .map(|(_, ent)| ent.get_log_id().clone());
+        let last = self.log.iter().next_back().map(|(_, ent)| ent.get_log_id());
 
-        let last_purged = self.last_purged_log_id.clone();
+        let last_purged = &self.last_purged_log_id;
 
         let last = match last {
-            None => last_purged.clone(),
+            None => last_purged.as_ref(),
             Some(x) => Some(x),
         };
 
         Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last,
+            last_purged_log_id: last_purged.clone(),
+            last_log_id: last.cloned(),
         })
     }
 

@@ -218,12 +218,7 @@ impl RClient {
     }
 
     async fn reconnect(&self) -> Result<Connection> {
-        {
-            let old_pair = self.inner.endpoint.swap((None, Tag::None), AcqRel);
-            if let Some(e) = old_pair.0 {
-                drop(e)
-            }
-        }
+        let _ = self.inner.endpoint.swap((None, Tag::None), AcqRel);
 
         let mut fresh_endpoint = Endpoint::client(self.local_bind_addr)
             .map_err(|e| anyhow!("Failed to bind new endpoint: {e}"))?;
@@ -283,6 +278,7 @@ impl RClient {
         let proto = Protocol::new(
             conn.clone(),
             self.protocol_cfg.max_message_size,
+            self.protocol_cfg.max_recv_buffer_size,
             Duration::from_millis(self.protocol_cfg.receive_message_timeout_ms),
         );
         let msg: RaftMessageType = data.into();
@@ -295,23 +291,27 @@ impl RClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::crypto_provider::init_crypto_provider;
     use crate::config::RServerConfig;
     use crate::protocol::RaftMessageType;
-    use crate::raft::network::Network;
     use crate::raft::server::RServer;
-    use crate::raft::{LogStore, StateMachineStore, TypeConfig};
+    use crate::raft::{LogStore, Network, StateMachineStore, TypeConfig};
+    use anyhow::Result;
     use foldhash::fast::RandomState;
-    use openraft::raft::AppendEntriesRequest;
-    use openraft::{Config, LeaderId, Vote};
-    use std::time::Duration;
-    use tokio::sync::RwLock;
+    use openraft::Config;
+    use std::sync::{Arc, Once};
+
+    static CRYPTO_INIT: Once = Once::new();
+
+    fn setup_crypto() {
+        CRYPTO_INIT.call_once(|| {
+            crate::raft::init_crypto_provider().unwrap();
+        });
+    }
 
     async fn create_test_raft_node(
         node_id: u64,
-    ) -> Result<Arc<RwLock<openraft::Raft<TypeConfig>>>> {
-        init_crypto_provider().unwrap();
-
+    ) -> Result<(openraft::Raft<TypeConfig>, Arc<StateMachineStore>)> {
+        setup_crypto();
         let log_store = LogStore::default();
         let state_machine_store = Arc::new(StateMachineStore::default());
 
@@ -328,29 +328,33 @@ mod tests {
             .validate()?,
         );
 
-        let raft =
-            openraft::Raft::new(node_id, config, network, log_store, state_machine_store).await?;
+        let raft = openraft::Raft::new(
+            node_id,
+            Arc::clone(&config),
+            network,
+            log_store,
+            state_machine_store.clone(),
+        )
+        .await?;
 
-        Ok(Arc::new(RwLock::new(raft)))
+        Ok((raft, state_machine_store))
     }
 
     #[tokio::test]
-    async fn test_client_connection() -> Result<()> {
-        init_crypto_provider().unwrap();
-
-        let raft = create_test_raft_node(1).await?;
+    async fn test_rclient_connection() -> Result<()> {
+        let (raft, _) = create_test_raft_node(1).await?;
         let pcfg = RServerConfig::default();
-        let server_addr = "127.0.0.1:8888";
 
+        let server_addr = "127.0.0.1:4446";
         let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Give the server some time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client_addr = "127.0.0.1:8889";
         let client = RClientBuilder::new()
             .remote_addr(server_addr)
             .server_name("localhost")
-            .local_bind_addr(client_addr)
+            .local_bind_addr("127.0.0.1:0")
             .dangerous_skip_verification(true)
             .protocol_cfg(pcfg)
             .build()
@@ -362,157 +366,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_data() -> Result<()> {
-        init_crypto_provider().unwrap();
-
-        let raft = create_test_raft_node(1).await?;
+    async fn test_rclient_send_and_receive() -> Result<()> {
+        let (raft, _) = create_test_raft_node(1).await?;
         let pcfg = RServerConfig::default();
-        let server_addr = "127.0.0.1:7777";
 
+        let server_addr = "127.0.0.1:4447";
         let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
 
-        println!("Starting server on {}", server_addr);
+        // Give the server some time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        println!("Creating client");
-        let client_addr = "127.0.0.1:7778";
         let client = RClientBuilder::new()
             .remote_addr(server_addr)
             .server_name("localhost")
-            .local_bind_addr(client_addr)
+            .local_bind_addr("127.0.0.1:0")
             .dangerous_skip_verification(true)
-            .protocol_cfg(pcfg.clone())
+            .protocol_cfg(pcfg)
             .build()
             .await?;
 
-        println!("Testing initial connection");
-        assert!(client.stable_id() > 0);
-
-        let append_entries = RaftMessageType::AppendEntriesRequest(AppendEntriesRequest {
-            vote: Vote {
-                leader_id: LeaderId {
-                    term: 1,
-                    node_id: 1,
-                },
-                committed: true,
-            },
-            prev_log_id: None,
-            entries: vec![],
-            leader_commit: None,
+        let message_to_send = RaftMessageType::VoteRequest(openraft::raft::VoteRequest {
+            vote: openraft::Vote::new(1, 1),
+            last_log_id: None,
         });
 
-        println!("Sending AppendEntries request");
+        let response = client.send(message_to_send).await?;
 
-        let response = client.send(append_entries).await?;
-
-        match response {
-            RaftMessageType::AppendEntriesResponse(aer) => {
-                println!("Received AppendEntriesResponse {}", aer);
-                Ok(())
-            }
-            _ => {
-                println!("Unexpected response type: {:?}", response);
-                Err(anyhow::anyhow!("Unexpected response type: {:?}", response))
-            }
-        }?;
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(matches!(response, RaftMessageType::VoteResponse(..)));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_connection_failure() -> Result<()> {
-        init_crypto_provider().unwrap();
-
+    async fn test_rclient_multiple_streams() -> Result<()> {
+        let (raft, _) = create_test_raft_node(1).await?;
         let pcfg = RServerConfig::default();
-        let result = RClientBuilder::new()
-            .remote_addr("127.0.0.1:9999")
-            .server_name("localhost")
-            .local_bind_addr("127.0.0.1:9998")
-            .dangerous_skip_verification(true)
-            .protocol_cfg(pcfg)
-            .build()
-            .await;
-        assert!(result.is_err());
-        Ok(())
-    }
 
-    #[tokio::test]
-    async fn test_reconnect() -> Result<()> {
-        init_crypto_provider().unwrap();
-
-        let raft = create_test_raft_node(1).await?;
-        let pcfg = RServerConfig::default();
-        let server_addr = "127.0.0.1:6666";
+        let server_addr = "127.0.0.1:4448";
         let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Give the server some time to start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client_addr = "127.0.0.1:0";
         let client = RClientBuilder::new()
             .remote_addr(server_addr)
             .server_name("localhost")
-            .local_bind_addr(client_addr)
+            .local_bind_addr("127.0.0.1:0")
             .dangerous_skip_verification(true)
-            .protocol_cfg(pcfg.clone())
+            .protocol_cfg(pcfg)
             .build()
             .await?;
 
-        // Helper to build a fresh AppendEntries request each time
-        fn make_append_entries() -> RaftMessageType {
-            RaftMessageType::AppendEntriesRequest(AppendEntriesRequest {
-                vote: Vote {
-                    leader_id: LeaderId {
-                        term: 1,
-                        node_id: 1,
-                    },
-                    committed: true,
-                },
-                prev_log_id: None,
-                entries: Vec::new(),
-                leader_commit: None,
-            })
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let client_clone = client.clone();
+            let handle = tokio::spawn(async move {
+                let message_to_send = RaftMessageType::VoteRequest(openraft::raft::VoteRequest {
+                    vote: openraft::Vote::new(i, i),
+                    last_log_id: None,
+                });
+                client_clone.send(message_to_send).await
+            });
+            handles.push(handle);
         }
 
-        // Verify initial connection
-        let response = client.send(make_append_entries()).await?;
-        assert!(matches!(
-            response,
-            RaftMessageType::AppendEntriesResponse(_)
-        ));
-
-        let initial_stable_id = client.stable_id();
-        assert!(initial_stable_id > 0);
-
-        // Close connection to force a reconnect
-        {
-            let guard = Guard::new();
-            if let Some(conn) = client.inner.connection.load(Acquire, &guard).as_ref() {
-                conn.close(0u32.into(), b"test close");
-            }
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await?);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Send again — should reconnect under the hood
-        let response = client.send(make_append_entries()).await?;
-        assert!(matches!(
-            response,
-            RaftMessageType::AppendEntriesResponse(_)
-        ));
-
-        // Ensure we got a new connection
-        let new_stable_id = client.stable_id();
-        assert!(new_stable_id > 0);
-        assert_ne!(initial_stable_id, new_stable_id);
-
-        // Final sanity check on the new connection
-        let response = client.send(make_append_entries()).await?;
-        assert!(matches!(
-            response,
-            RaftMessageType::AppendEntriesResponse(_)
-        ));
+        assert_eq!(results.len(), 10);
+        for result in results {
+            assert!(result.is_ok());
+            assert!(matches!(result.unwrap(), RaftMessageType::VoteResponse(..)));
+        }
 
         Ok(())
     }

@@ -41,6 +41,7 @@ impl Http3Server {
         tls_config: RustlsConfig,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
+        metrics: Metrics,
     ) -> Result<Self> {
         let addr_str = format!("{}:{}", config.network.bind_ip, config.http.port);
         let addr: SocketAddr = addr_str
@@ -55,7 +56,8 @@ impl Http3Server {
             config.http.wss_max_message_size,
         );
 
-        let router = Self::setup_router(config, &subnet_state, &gateway_state, &task_queue)?;
+        let router =
+            Self::setup_router(config, &subnet_state, &gateway_state, &task_queue, &metrics)?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
@@ -82,9 +84,11 @@ impl Http3Server {
         subnet_state: &SubnetState,
         gateway_state: &GatewayState,
         task_queue: &DupQueue<Task>,
+        metrics: &Metrics,
     ) -> Result<Router> {
         let http_config = &config.http;
         let prompt_config = &config.prompt;
+        let image_config = &config.image;
 
         let prompt_regex = Regex::new(&prompt_config.allowed_pattern)
             .map_err(|e| anyhow!("Invalid prompt regex: {}", e))?;
@@ -93,12 +97,13 @@ impl Http3Server {
 
         let request_size_limit = http_config.request_size_limit as usize;
         let size_limit_handler = || SecureMaxSize(request_size_limit);
+        let add_task_size_limit = http_config.add_task_size_limit as usize;
+        let add_task_size_limit_handler = || SecureMaxSize(add_task_size_limit);
         let request_file_size_limit = http_config.request_file_size_limit as usize;
         let file_size_limit_handler = || SecureMaxSize(request_file_size_limit);
         let raft_write_size_limit = http_config.raft_write_size_limit as usize;
         let raft_write_size_limit_handler = || SecureMaxSize(raft_write_size_limit);
 
-        let metrics = Metrics::new(0.05).map_err(|e| anyhow!(e))?;
         let company_store = CompanyRateLimiterStore::new();
 
         let router = if http_config.compression {
@@ -117,13 +122,14 @@ impl Http3Server {
             .hoop(affix_state::inject(subnet_state.clone()))
             .hoop(affix_state::inject(http_config.clone()))
             .hoop(affix_state::inject(config.network.node_id as usize))
-            .hoop(affix_state::inject(metrics))
+            .hoop(affix_state::inject(metrics.clone()))
             .hoop(affix_state::inject(company_store))
             .hoop(affix_state::inject(prompt_config.clone()))
+            .hoop(affix_state::inject(image_config.clone()))
             .hoop(affix_state::inject(prompt_regex))
             .push(
                 Router::with_path("/add_task")
-                    .hoop(size_limit_handler())
+                    .hoop(add_task_size_limit_handler())
                     .hoop(rate_limits.unauthorized_only_limiter)
                     .hoop(api_or_generic_key_check)
                     .hoop(rate_limits.generic_global_limiter)

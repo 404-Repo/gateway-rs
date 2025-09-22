@@ -26,8 +26,7 @@ pub async fn generic_key_update_handler(
     let admin_key = req
         .headers()
         .get("x-admin-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| v.to_str().ok());
 
     gateway_state
         .update_gateway_generic_key(current_node_id, Some(ugk.generic_key), admin_key)

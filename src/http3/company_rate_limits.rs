@@ -46,9 +46,9 @@ pub async fn company_rate_limit(depot: &mut Depot, req: &mut Request) -> Result<
         .obtain::<GatewayState>()
         .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
 
-    if gs.is_company_key(key_header) {
+    if gs.is_company_key(key_header).await {
         if let Some((cid, (company_name, hourly_limit, daily_limit))) =
-            gs.get_company_rate_limits(key_header)
+            gs.get_company_info_from_key(key_header).await
         {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

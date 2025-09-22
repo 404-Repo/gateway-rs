@@ -35,6 +35,7 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RServerConfig {
     pub max_message_size: usize,
+    pub max_recv_buffer_size: usize,
     pub receive_message_timeout_ms: u64,
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
@@ -43,7 +44,8 @@ pub struct RServerConfig {
 impl Default for RServerConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 64 * 1024,
+            max_message_size: 256 * 1024,
+            max_recv_buffer_size: 8 * 1024,
             receive_message_timeout_ms: 2000,
             max_idle_timeout_sec: 4,
             keep_alive_interval_sec: 1,
@@ -96,6 +98,7 @@ pub struct HTTPConfig {
     pub metric_rate_limit: usize,
     pub get_status_rate_limit: usize,
     // Size limit for the request
+    pub add_task_size_limit: u64,
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,
     pub raft_write_size_limit: u64,
@@ -121,6 +124,14 @@ pub struct PromptConfig {
     pub min_len: usize,
     pub max_len: usize,
     pub allowed_pattern: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ImageConfig {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_size_bytes: u64,
+    pub allowed_formats: foldhash::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -153,6 +164,7 @@ pub struct NodeConfig {
     pub rclient: RClientConfig,
     pub http: HTTPConfig,
     pub prompt: PromptConfig,
+    pub image: ImageConfig,
     pub db: DbConfig,
     pub cert: Certificate,
     pub log: LogConfig,

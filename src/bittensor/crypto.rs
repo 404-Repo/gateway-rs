@@ -1,15 +1,19 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine};
 use blake2::{Blake2b512, Digest};
+use parity_scale_codec::{Decode, Encode};
 use schnorrkel::{context::signing_context, PublicKey, Signature};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::hotkey::Hotkey;
 
 const GATEWAY: &str = "404_GATEWAY_";
 const SIGNING_CTX: &[u8] = b"substrate";
 
-pub struct AccountId(pub [u8; 32]);
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encode, Decode)]
+pub struct AccountId32(pub [u8; 32]);
 
-impl TryFrom<&[u8]> for AccountId {
+impl TryFrom<&[u8]> for AccountId32 {
     type Error = anyhow::Error;
 
     fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
@@ -21,13 +25,13 @@ impl TryFrom<&[u8]> for AccountId {
         } else {
             let arr = slice
                 .try_into()
-                .map_err(|_| anyhow!("Failed to convert slice into AccountId"))?;
-            Ok(AccountId(arr))
+                .map_err(|_| anyhow!("Failed to convert slice into AccountId32"))?;
+            Ok(AccountId32(arr))
         }
     }
 }
 
-impl AsRef<[u8; 32]> for AccountId {
+impl AsRef<[u8; 32]> for AccountId32 {
     fn as_ref(&self) -> &[u8; 32] {
         &self.0
     }
@@ -35,22 +39,31 @@ impl AsRef<[u8; 32]> for AccountId {
 
 pub struct KeypairSignature(pub [u8; 64]);
 
-pub fn _ss58_encode(pubkey: &[u8; 32]) -> String {
+pub fn ss58_encode(pubkey: &[u8; 32]) -> String {
     const SS58_PREFIX: &[u8] = b"SS58PRE";
-    let version: u8 = 42;
-    let mut payload = Vec::with_capacity(1 + 32);
-    payload.push(version);
-    payload.extend_from_slice(pubkey);
-    let mut checksum_input = Vec::with_capacity(SS58_PREFIX.len() + payload.len());
-    checksum_input.extend_from_slice(SS58_PREFIX);
-    checksum_input.extend_from_slice(&payload);
-    let hash = Blake2b512::digest(&checksum_input);
+    const VERSION: u8 = 42;
+    const PREFIX_LEN: usize = SS58_PREFIX.len();
+    const CHECKSUM_INPUT_SIZE: usize = PREFIX_LEN + 1 + 32;
+    const PAYLOAD_SIZE: usize = 1 + 32 + 2;
+
+    let mut payload = [0u8; PAYLOAD_SIZE];
+    payload[0] = VERSION;
+    payload[1..33].copy_from_slice(pubkey);
+
+    let mut checksum_input = [0u8; CHECKSUM_INPUT_SIZE];
+    checksum_input[..PREFIX_LEN].copy_from_slice(SS58_PREFIX);
+    checksum_input[PREFIX_LEN] = VERSION;
+    checksum_input[PREFIX_LEN + 1..].copy_from_slice(pubkey);
+
+    let hash = Blake2b512::digest(checksum_input);
     let checksum = &hash[..2];
-    payload.extend_from_slice(checksum);
-    bs58::encode(payload).into_string()
+
+    payload[33..].copy_from_slice(checksum);
+
+    bs58::encode(&payload).into_string()
 }
 
-pub fn ss58_decode(address: &str) -> Result<AccountId> {
+pub fn ss58_decode(address: &str) -> Result<AccountId32> {
     let decoded = bs58::decode(address).into_vec()?;
     if decoded.len() != 35 {
         return Err(anyhow::anyhow!(
@@ -76,19 +89,19 @@ pub fn ss58_decode(address: &str) -> Result<AccountId> {
         return Err(anyhow::anyhow!("Checksum mismatch in SS58 address"));
     }
 
-    let pubkey: AccountId = decoded[1..33]
+    let pubkey: AccountId32 = decoded[1..33]
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Failed to convert pubkey slice into AccountId"))?;
+        .map_err(|_| anyhow::anyhow!("Failed to convert pubkey slice into AccountId32"))?;
     Ok(pubkey)
 }
 
 pub fn verify_signature(
-    account_id: &AccountId,
+    public_key: &AccountId32,
     signature: &KeypairSignature,
     message: impl AsRef<[u8]>,
 ) -> Result<()> {
     let pk =
-        PublicKey::from_bytes(&account_id.0).map_err(|e| anyhow!("Invalid public key: {:?}", e))?;
+        PublicKey::from_bytes(&public_key.0).map_err(|e| anyhow!("Invalid public key: {:?}", e))?;
     let sig =
         Signature::from_bytes(&signature.0).map_err(|e| anyhow!("Invalid signature: {:?}", e))?;
 
@@ -99,7 +112,7 @@ pub fn verify_signature(
 
 pub fn verify_hotkey(
     timestamp: &str,
-    validator_hotkey: &str,
+    validator_hotkey: &Hotkey,
     signature: &str,
     freshness_threshold_sec: u64,
 ) -> Result<()> {
@@ -135,31 +148,28 @@ pub fn verify_hotkey(
     let hotkey =
         ss58_decode(validator_hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
 
-    let signature_bytes = general_purpose::STANDARD
-        .decode(signature)
+    let mut signature_bytes = [0u8; 64];
+    let decoded_len = general_purpose::STANDARD
+        .decode_slice(signature, &mut signature_bytes)
         .map_err(|e| anyhow!("Failed to decode signature: {}", e))?;
-    if signature_bytes.len() != 64 {
+    if decoded_len != 64 {
         return Err(anyhow!("Invalid signature length"));
     }
 
-    let mut hotkey_arr = [0u8; 32];
-    hotkey_arr.copy_from_slice(hotkey.as_ref());
-
-    let mut sig_arr = [0u8; 64];
-    sig_arr.copy_from_slice(&signature_bytes);
-
     // Use the entire timestamp string (including "404_GATEWAY_") as the message.
     verify_signature(
-        &AccountId(hotkey_arr),
-        &KeypairSignature(sig_arr),
+        &hotkey,
+        &KeypairSignature(signature_bytes),
         timestamp.as_bytes(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use schnorrkel::{ExpansionMode, MiniSecretKey};
+    use super::ss58_encode;
+    use crate::bittensor::crypto::{verify_hotkey, GATEWAY, SIGNING_CTX};
+    use base64::{engine::general_purpose, Engine};
+    use schnorrkel::{context::signing_context, ExpansionMode, MiniSecretKey};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn current_timestamp() -> u64 {
@@ -181,7 +191,7 @@ mod tests {
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         assert!(verify_hotkey(
             &timestamp_string,
-            &_ss58_encode(&keypair.public.to_bytes()),
+            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
             &general_purpose::STANDARD.encode(signature.to_bytes()),
             300
         )
@@ -201,7 +211,7 @@ mod tests {
         sig_bytes[0] ^= 0x01; // Tamper with the signature.
         assert!(verify_hotkey(
             &timestamp_string,
-            &_ss58_encode(&keypair.public.to_bytes()),
+            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
             &general_purpose::STANDARD.encode(sig_bytes),
             300
         )
@@ -220,7 +230,7 @@ mod tests {
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         assert!(verify_hotkey(
             &timestamp_string,
-            &_ss58_encode(&keypair.public.to_bytes()),
+            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
             &general_purpose::STANDARD.encode(signature.to_bytes()),
             300
         )
@@ -233,7 +243,7 @@ mod tests {
         let bad_timestamp = "dead_code_123456".to_string();
         assert!(verify_hotkey(
             &bad_timestamp,
-            &_ss58_encode(&[0u8; 32]),
+            &ss58_encode(&[0u8; 32]).parse().unwrap(),
             &general_purpose::STANDARD.encode([0u8; 64]),
             300
         )

@@ -9,6 +9,7 @@ use tokio::task::{self, JoinHandle};
 use uuid::Uuid;
 
 use crate::api::HasUuid;
+use crate::bittensor::hotkey::Hotkey;
 
 const SENTMAP_START_CAPACITY: usize = 1024;
 const EXPIREDMAP_START_CAPACITY: usize = 8;
@@ -18,7 +19,7 @@ const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 1;
 
 #[derive(Clone)]
 struct QueueEntry<T> {
-    item: Arc<T>,
+    item: T,
     count: usize,
     timestamp: Instant,
 }
@@ -26,7 +27,7 @@ struct QueueEntry<T> {
 struct Inner<T> {
     dup: usize,
     q: Queue<QueueEntry<T>>,
-    sent: HashMap<(Uuid, String), (), RandomState>,
+    sent: HashMap<(Uuid, Hotkey), (), RandomState>,
     ttl: Duration,
     len: AtomicUsize,
 }
@@ -94,7 +95,8 @@ impl DupQueueBuilder {
                 if !expired_ids.is_empty() {
                     inner
                         .sent
-                        .retain(|(uuid, _hotkey), _| !expired_ids.contains(uuid));
+                        .retain_async(|(uuid, _hotkey), _| !expired_ids.contains(uuid))
+                        .await;
                 }
             }
         });
@@ -119,7 +121,7 @@ where
 
     pub fn push(&self, item: T) {
         let entry = QueueEntry {
-            item: Arc::new(item),
+            item,
             count: self.inner.dup,
             timestamp: Instant::now(),
         };
@@ -127,7 +129,7 @@ where
         self.inner.len.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn pop(&self, num: usize, hotkey: &str) -> Vec<(T, Option<Duration>)> {
+    pub fn pop(&self, num: usize, hotkey: &Hotkey) -> Vec<(T, Option<Duration>)> {
         let mut result = Vec::with_capacity(num);
 
         // Capture the current queue length once so we don't iterate indefinitely
@@ -146,16 +148,16 @@ where
             self.inner.len.fetch_sub(1, Ordering::Relaxed);
 
             let mut entry = (*shared).clone();
-            let key = (*entry.item.id(), hotkey.to_owned());
+            let key = (*entry.item.id(), hotkey.clone());
 
             // Deliver to this hotkey only once
-            if !self.inner.sent.contains(&key) {
-                let _ = self.inner.sent.insert(key, ());
+            if !self.inner.sent.contains_sync(&key) {
+                let _ = self.inner.sent.insert_sync(key, ());
                 entry.count -= 1;
 
                 let dur = (entry.count == 0).then(|| Instant::now() - entry.timestamp);
 
-                result.push(((*entry.item).clone(), dur));
+                result.push((entry.item.clone(), dur));
             }
 
             // Re-queue if there are more duplicates left
@@ -182,6 +184,7 @@ where
 mod tests {
     use super::DupQueue;
     use crate::api::Task;
+    use crate::bittensor::hotkey::Hotkey;
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -194,7 +197,8 @@ mod tests {
     fn create_task(prompt: &str) -> Task {
         Task {
             id: Uuid::new_v4(),
-            prompt: prompt.to_string(),
+            prompt: Some(Arc::new(prompt.to_string())),
+            image: None,
         }
     }
 
@@ -212,32 +216,36 @@ mod tests {
         queue.push(task.clone());
 
         // Hotkey "a" receives the task. (count goes 3→2; duration should be None)
-        let res_a = queue.pop(3, "a");
+        let hk_a: Hotkey = Hotkey::from_bytes(&[1u8; 32]);
+        let res_a = queue.pop(3, &hk_a);
         assert_eq!(res_a.len(), 1);
         let (item_a, dur_a) = &res_a[0];
         assert_eq!(item_a, &task);
         assert!(dur_a.is_none());
 
         // Subsequent calls with the same hotkey "a" yield nothing.
-        assert!(queue.pop(3, "a").is_empty());
+        assert!(queue.pop(3, &hk_a).is_empty());
 
         // New hotkeys "b" and "c" obtain the task.
         //  - for "b": count goes 2→1; duration None
         //  - for "c": count goes 1→0; duration Some(_) (final delivery)
-        let res_b = queue.pop(3, "b");
+        let hk_b: Hotkey = Hotkey::from_bytes(&[2u8; 32]);
+        let res_b = queue.pop(3, &hk_b);
         assert_eq!(res_b.len(), 1);
         let (item_b, dur_b) = &res_b[0];
         assert_eq!(item_b, &task);
         assert!(dur_b.is_none());
 
-        let res_c = queue.pop(3, "c");
+        let hk_c: Hotkey = Hotkey::from_bytes(&[3u8; 32]);
+        let res_c = queue.pop(3, &hk_c);
         assert_eq!(res_c.len(), 1);
         let (item_c, dur_c) = &res_c[0];
         assert_eq!(item_c, &task);
         assert!(dur_c.is_some(), "expected a duration on the final delivery");
 
         // Duplication allowance exhausted; new hotkey "d" gets nothing.
-        assert!(queue.pop(3, "d").is_empty());
+        let hk_d: Hotkey = Hotkey::from_bytes(&[4u8; 32]);
+        assert!(queue.pop(3, &hk_d).is_empty());
     }
 
     #[tokio::test]
@@ -255,7 +263,8 @@ mod tests {
         queue.push(task2.clone());
         queue.push(task1.clone());
 
-        let res = queue.pop(2, "key1");
+        let hk_1: Hotkey = Hotkey::from_bytes(&[5u8; 32]);
+        let res = queue.pop(2, &hk_1);
         let mut res_tasks: Vec<Task> = res.iter().map(|(task, _)| task.clone()).collect();
         res_tasks.sort_by(|a, b| a.prompt.cmp(&b.prompt));
         let mut expected = vec![task1, task2];
@@ -280,7 +289,8 @@ mod tests {
             let task2 = create_task("Task B");
             queue.push(task1.clone());
             queue.push(task2.clone());
-            let res = queue.pop(50, "alpha");
+            let hk_alpha: Hotkey = Hotkey::from_bytes(&[6u8; 32]);
+            let res = queue.pop(50, &hk_alpha);
             let mut res_tasks: Vec<Task> = res.iter().map(|(task, _)| task.clone()).collect();
             res_tasks.sort_by(|a, b| a.prompt.cmp(&b.prompt));
             let mut expected = vec![task1.clone(), task2.clone()];
@@ -294,10 +304,11 @@ mod tests {
                 }
             }
             if dup == 1 {
-                assert!(queue.pop(3, "beta").is_empty());
+                let hk_beta: Hotkey = Hotkey::from_bytes(&[7u8; 32]);
+                assert!(queue.pop(3, &hk_beta).is_empty());
             }
 
-            let res = queue.pop(50, "alpha");
+            let res = queue.pop(50, &hk_alpha);
             assert!(res.is_empty());
         }
     }
@@ -341,7 +352,8 @@ mod tests {
                     if counter.load(Ordering::Relaxed) == producers * number_of_tasks {
                         break;
                     }
-                    let got = q_consumer.pop(7, "hot");
+                    let hk_a = Hotkey::from_bytes(&[8u8; 32]);
+                    let got = q_consumer.pop(7, &hk_a);
                     if !got.is_empty() {
                         counter.fetch_add(got.len(), Ordering::Relaxed);
                         idle_start = None;
@@ -392,7 +404,8 @@ mod tests {
         queue.push(task1.clone());
         queue.push(task2.clone());
         // For hotkey "key1", both tasks are delivered initially.
-        let res1 = queue.pop(2, "key1");
+        let hk_1: Hotkey = Hotkey::from_bytes(&[9u8; 32]);
+        let res1 = queue.pop(2, &hk_1);
         let mut res1_tasks: Vec<Task> = res1.iter().map(|(task, _)| task.clone()).collect();
         res1_tasks.sort_by(|a, b| a.prompt.cmp(&b.prompt));
         let mut expected = vec![task1.clone(), task2.clone()];
@@ -402,9 +415,10 @@ mod tests {
             assert!(duration.is_none());
         }
         // A subsequent pop with "key1" returns nothing.
-        assert!(queue.pop(2, "key1").is_empty());
+        assert!(queue.pop(2, &hk_1).is_empty());
         // A new hotkey "key2" can receive them again.
-        let res3 = queue.pop(2, "key2");
+        let hk_2: Hotkey = Hotkey::from_bytes(&[10u8; 32]);
+        let res3 = queue.pop(2, &hk_2);
         let mut res3_tasks: Vec<Task> = res3.iter().map(|(task, _)| task.clone()).collect();
         res3_tasks.sort_by(|a, b| a.prompt.cmp(&b.prompt));
         assert_eq!(res3_tasks, expected);
@@ -433,11 +447,15 @@ mod tests {
         let mut handles = Vec::new();
         for idx in 0..3 {
             let q = Arc::clone(&queue);
-            let hotkey = format!("h{}", idx);
+            let hotkey: Hotkey = match idx {
+                0 => Hotkey::from_bytes(&[11u8; 32]),
+                1 => Hotkey::from_bytes(&[12u8; 32]),
+                _ => Hotkey::from_bytes(&[13u8; 32]),
+            };
             handles.push(task::spawn(async move {
                 let res = q.pop(5, &hotkey);
                 // Each pop call returns distinct tasks for that hotkey.
-                let set: HashSet<_> = res.iter().map(|(task, _)| task.id.clone()).collect();
+                let set: HashSet<_> = res.iter().map(|(task, _)| task.id).collect();
                 assert_eq!(set.len(), res.len());
                 for (_, duration) in &res {
                     assert!(duration.is_none());
@@ -460,6 +478,7 @@ mod tests {
         let task = create_task("Old Task");
         queue.push(task);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(queue.pop(1, "any").is_empty());
+        let hk: Hotkey = Hotkey::from_bytes(&[14u8; 32]);
+        assert!(queue.pop(1, &hk).is_empty());
     }
 }

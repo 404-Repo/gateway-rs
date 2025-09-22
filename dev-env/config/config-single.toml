@@ -21,6 +21,7 @@ add_task_generic_global_hourly_rate_limit = 40
 add_task_generic_per_ip_hourly_rate_limit = 5
 add_task_user_id_global_hourly_rate_limit = 60
 add_task_user_id_per_user_hourly_rate_limit = 5
+add_task_size_limit = 2097152
 load_rate_limit = 60
 leader_rate_limit = 10
 metric_rate_limit = 5
@@ -82,6 +83,7 @@ keep_alive_interval_sec = 1
 
 [rserver]
 max_message_size = 262144
+max_recv_buffer_size = 8192
 receive_message_timeout_ms = 5000
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
@@ -100,4 +102,10 @@ max_in_snapshot_log_to_keep = 1000
 [prompt]
 min_len = 3
 max_len = 384
-allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$" 
+allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
+
+[image]
+max_width = 1024
+max_height = 1024
+max_size_bytes = 2097152  # 2MB
+allowed_formats = ["png", "jpg", "webp"] 

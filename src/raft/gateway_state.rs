@@ -8,19 +8,19 @@ use crate::http3::client::Http3ClientBuilder;
 use anyhow::Result;
 use bytes::Bytes;
 use openraft::{BasicNode, RaftMetrics};
-use serde_json;
+use rmp_serde;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::watch;
 use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug)]
 pub enum GatewayStateError {
     NotFound(String),
-    DeserializeError(serde_json::Error),
+    DeserializeError(rmp_serde::decode::Error),
 }
 
 impl fmt::Display for GatewayStateError {
@@ -48,20 +48,24 @@ impl std::error::Error for GatewayStateError {
 #[derive(Clone)]
 pub struct GatewayState {
     state: Arc<StateMachineStore>,
-    raft: Arc<RwLock<Raft>>,
+    raft: Raft,
     last_task_acquisition: Arc<AtomicU64>,
     key_validator: Arc<ApiKeyValidator>,
-    task_manager: Arc<TaskManager>,
+    task_manager: TaskManager,
     config: Arc<NodeConfig>,
 }
 
 impl GatewayState {
+    fn key_prefix(key: &Uuid) -> String {
+        key.to_string().chars().take(6).collect()
+    }
+
     pub fn new(
         state: Arc<StateMachineStore>,
-        raft: Arc<RwLock<Raft>>,
+        raft: Raft,
         last_task_acquisition: Arc<AtomicU64>,
         key_validator_updater: Arc<ApiKeyValidator>,
-        task_manager: Arc<TaskManager>,
+        task_manager: TaskManager,
         config: Arc<NodeConfig>,
     ) -> Self {
         Self {
@@ -82,18 +86,15 @@ impl GatewayState {
     }
 
     pub async fn leader(&self) -> Option<u64> {
-        self.raft.read().await.metrics().borrow().current_leader
+        self.raft.metrics().borrow().current_leader
     }
 
     pub async fn metrics(&self) -> watch::Receiver<RaftMetrics<NodeId, BasicNode>> {
-        self.raft.read().await.metrics()
+        self.raft.metrics()
     }
 
     pub async fn membership(&self) -> Vec<u64> {
-        let membership_config = {
-            let raft_guard = self.raft.read().await;
-            raft_guard.metrics().borrow().membership_config.clone()
-        };
+        let membership_config = { self.raft.metrics().borrow().membership_config.clone() };
 
         membership_config
             .membership()
@@ -104,49 +105,36 @@ impl GatewayState {
 
     pub async fn gateway(&self, n: u64) -> Result<GatewayInfo, GatewayStateError> {
         let key = n.to_string();
-        let json_str = {
+        let value = {
             self.state
-                .get(&key)
+                .get_raw(&key)
                 .await
                 .ok_or_else(|| GatewayStateError::NotFound(key.clone()))?
         };
 
-        serde_json::from_str::<GatewayInfo>(&json_str).map_err(GatewayStateError::DeserializeError)
+        rmp_serde::from_slice::<GatewayInfo>(&value).map_err(GatewayStateError::DeserializeError)
     }
 
     pub async fn gateways(&self) -> Result<Vec<GatewayInfo>, GatewayStateError> {
-        let (nodes, nodes_map) = {
-            let nodes = self.membership().await;
-
-            let nodes_map = { self.state.clone_map().await };
-
-            (nodes, nodes_map)
-        };
-
-        nodes
-            .into_iter()
-            .map(|n| {
-                let json_str = nodes_map
-                    .get(&n.to_string())
-                    .ok_or_else(|| GatewayStateError::NotFound(n.to_string()))?;
-                serde_json::from_str::<GatewayInfo>(json_str)
-                    .map_err(GatewayStateError::DeserializeError)
-            })
-            .collect()
+        let nodes = self.membership().await;
+        let mut infos = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            infos.push(self.gateway(n).await?);
+        }
+        Ok(infos)
     }
 
     pub async fn set_gateway_info(&self, info: GatewayInfo) -> Result<()> {
-        let gateway_info_str = serde_json::to_string(&info)?;
+        let gateway_info_bytes = rmp_serde::to_vec(&info)?;
         let key = info.node_id.to_string();
 
         let request = Request::Set {
             key,
-            value: gateway_info_str,
+            value: gateway_info_bytes,
         };
 
         {
-            let raft_guard = self.raft.write().await;
-            raft_guard.client_write(request).await?;
+            self.raft.client_write(request).await?;
         }
 
         Ok(())
@@ -156,9 +144,9 @@ impl GatewayState {
         &self,
         current_node_id: u64,
         new_key: Option<Uuid>,
-        admin_key: Option<String>,
+        admin_key: Option<&str>,
     ) -> Result<()> {
-        let key_to_set = if self.state.get("generic_key").await.is_none() {
+        let key_to_set = if self.generic_key().await.is_none() {
             new_key.unwrap_or_else(Uuid::new_v4)
         } else if let Some(key) = new_key {
             key
@@ -166,8 +154,8 @@ impl GatewayState {
             return Ok(());
         };
 
-        let serialized_key = serde_json::to_string(&key_to_set)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to JSON: {}", e))?;
+        let serialized_key = rmp_serde::to_vec(&key_to_set)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to rmp: {}", e))?;
 
         let leader_id = self.leader().await;
 
@@ -194,16 +182,10 @@ impl GatewayState {
 
             let payload = serde_json::to_vec(&serde_json::json!({ "generic_key": key_to_set }))
                 .map_err(|e| anyhow::anyhow!("Failed to serialize payload: {}", e))?;
-
-            let mut headers_vec = Vec::new();
-            if let Some(k) = admin_key {
-                headers_vec.push(("x-admin-key".to_string(), k));
-            }
-            let extra_headers = if !headers_vec.is_empty() {
-                Some(&headers_vec[..])
-            } else {
-                None
-            };
+            let headers_vec: Vec<(&str, &str)> = admin_key
+                .map(|k| vec![("x-admin-key", k)])
+                .unwrap_or_default();
+            let extra_headers = (!headers_vec.is_empty()).then_some(headers_vec.as_slice());
 
             match client
                 .post_with_headers(
@@ -215,11 +197,9 @@ impl GatewayState {
                 .await
             {
                 Ok((status, _body)) if status.is_success() => {
-                    let key_str = key_to_set.to_string();
-                    let prefix: String = key_str.chars().take(6).collect();
                     info!(
                         "Gateway generic key updated (forwarded), prefix: {}",
-                        prefix
+                        Self::key_prefix(&key_to_set)
                     );
                     return Ok(());
                 }
@@ -234,67 +214,60 @@ impl GatewayState {
             }
         }
 
-        let write_result = {
-            let raft_guard = self.raft.write().await;
-            raft_guard
+        {
+            self.raft
                 .client_write(Request::Set {
                     key: "generic_key".to_string(),
                     value: serialized_key,
                 })
                 .await
-        };
-
-        match write_result {
-            Ok(_) => {
-                let key_str = key_to_set.to_string();
-                let prefix: String = key_str.chars().take(6).collect();
-                info!("Gateway generic key updated (leader), prefix: {}", prefix);
-                Ok(())
-            }
-            Err(e) => Err(anyhow::anyhow!("Failed to complete client_write: {}", e)),
+                .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))?;
         }
+
+        info!(
+            "Gateway generic key updated (leader), prefix: {}",
+            Self::key_prefix(&key_to_set)
+        );
+        Ok(())
     }
 
     pub async fn generic_key(&self) -> Option<Uuid> {
         self.state
-            .get("generic_key")
+            .get_raw("generic_key")
             .await
-            .and_then(|s: String| serde_json::from_str::<Uuid>(&s).ok())
+            .and_then(|v| rmp_serde::from_slice::<Uuid>(&v).ok())
     }
 
     pub async fn is_generic_key(&self, api_key: &Uuid) -> bool {
-        match self
-            .state
-            .get("generic_key")
+        self.generic_key()
             .await
-            .and_then(|s: String| serde_json::from_str::<Uuid>(&s).ok())
-        {
-            Some(generic_key) => &generic_key == api_key,
-            None => false,
-        }
+            .is_some_and(|generic_key| &generic_key == api_key)
     }
 
-    pub fn is_valid_api_key(&self, api_key: &str) -> bool {
-        self.key_validator.is_valid_api_key(api_key)
+    pub async fn is_valid_api_key(&self, api_key: &str) -> bool {
+        self.key_validator.is_valid_api_key(api_key).await
     }
 
-    pub fn is_company_key(&self, api_key: &str) -> bool {
-        self.key_validator.is_company_key(api_key)
+    pub async fn is_company_key(&self, api_key: &str) -> bool {
+        self.key_validator.is_company_key(api_key).await
     }
 
-    pub fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
-        self.key_validator.get_user_id(api_key)
+    pub async fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
+        self.key_validator.get_user_id(api_key).await
     }
 
-    pub fn get_company_rate_limits(&self, api_key: &str) -> Option<(Uuid, (String, u64, u64))> {
-        self.key_validator.get_company_info_from_key(api_key)
+    pub async fn get_company_info_from_key(
+        &self,
+        api_key: &str,
+    ) -> Option<(Uuid, (String, u64, u64))> {
+        self.key_validator.get_company_info_from_key(api_key).await
     }
 
     pub fn cluster_name(&self) -> &str {
         &self.config.raft.cluster_name
     }
 
-    pub fn task_manager(&self) -> Arc<TaskManager> {
+    pub fn task_manager(&self) -> TaskManager {
         self.task_manager.clone()
     }
 

@@ -4,15 +4,16 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use super::response::GatewayInfo;
+use crate::bittensor::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
-    pub prompt: String,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetTasksRequest {
-    pub validator_hotkey: String,
+    pub validator_hotkey: Hotkey,
     pub signature: String,
     pub timestamp: String,
     pub requested_task_count: usize,
@@ -33,8 +34,8 @@ pub struct GetTaskStatus {
 
 #[derive(Deserialize)]
 pub struct AddTaskResultRequest {
-    pub validator_hotkey: String,
-    pub miner_hotkey: Option<String>,
+    pub validator_hotkey: Hotkey,
+    pub miner_hotkey: Option<Hotkey>,
     pub miner_uid: Option<u32>,
     pub miner_rating: Option<f32>,
     pub asset: Option<Vec<u8>>,

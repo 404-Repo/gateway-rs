@@ -1,6 +1,6 @@
 use anyhow::Result;
 use quinn::{crypto::rustls::QuicServerConfig, ServerConfig};
-use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use salvo::conn::rustls::Keycert;
 use std::{path::Path, sync::Arc};
 
@@ -81,9 +81,12 @@ where
     P: AsRef<Path>,
 {
     let pem_bytes = tokio::fs::read(path).await?;
-    let key = PrivateKeyDer::from_pem_slice(&pem_bytes)?;
+    let mut reader = pem_bytes.as_slice();
 
-    Ok(key.clone_key())
+    let key = rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in PEM file"))?;
+
+    Ok(key)
 }
 
 pub fn generate_self_signed_config() -> Result<ServerConfig> {
@@ -108,12 +111,9 @@ pub fn generate_and_create_keycert(domain_names: Vec<String>) -> Result<Keycert>
     let certified_key = rcgen::generate_simple_self_signed(domain_names)?;
 
     let cert_pem = certified_key.cert.pem();
-    let cert_bytes: Vec<u8> = cert_pem.as_bytes().to_vec();
-
     let key_pem = certified_key.signing_key.serialize_pem();
-    let key_bytes: Vec<u8> = key_pem.as_bytes().to_vec();
 
-    let keycert = Keycert::new().cert(cert_bytes).key(key_bytes);
+    let keycert = Keycert::new().cert(cert_pem).key(key_pem);
 
     Ok(keycert)
 }

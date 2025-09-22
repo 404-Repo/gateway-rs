@@ -50,19 +50,18 @@ impl Network {
 
     fn get_client(&self, target_node: &BasicNode) -> Option<RClient> {
         self.clients
-            .get(&target_node.addr)
+            .get_sync(&target_node.addr)
             .map(|ref_| (*ref_).clone())
     }
 
-    pub async fn send_rpc<Resp, Err>(
+    pub async fn send_rpc<Err>(
         &self,
         _target: NodeId,
         target_node: &BasicNode,
         message: RaftMessageType,
-    ) -> Result<Resp, openraft::error::RPCError<NodeId, BasicNode, Err>>
+    ) -> Result<RaftMessageType, openraft::error::RPCError<NodeId, BasicNode, Err>>
     where
         Err: StdError + DeserializeOwned,
-        Resp: DeserializeOwned,
     {
         let client = self.get_client(target_node).ok_or_else(|| {
             let err = NetworkStringError(format!(
@@ -80,17 +79,7 @@ impl Network {
                 openraft::error::RPCError::Network(NetworkError::new(&err))
             }
         })?;
-
-        match serde_json::from_value::<Resp>(serde_json::to_value(r).map_err(|e| {
-            let err = NetworkStringError(format!("Serialization error: {}", e));
-            openraft::error::RPCError::Network(NetworkError::new(&err))
-        })?) {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                let err = NetworkStringError(format!("Deserialization error: {}", e));
-                Err(openraft::error::RPCError::Network(NetworkError::new(&err)))
-            }
-        }
+        Ok(r)
     }
 }
 
