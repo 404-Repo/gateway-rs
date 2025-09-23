@@ -26,6 +26,7 @@ pub struct CompanyRateLimiterStore {
 impl CompanyRateLimiterStore {
     pub fn new() -> Self {
         CompanyRateLimiterStore {
+            // TODO: Should be LRU with fixed size
             inner: Arc::new(SccHashMap::with_capacity_and_hasher(
                 4096,
                 RandomState::default(),
