@@ -39,6 +39,7 @@ subnet_poll_interval_sec = 3600
 max_task_queue_len = 500
 admin_key = "b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 generic_key = "518d5860-589f-4625-be7c-285d5b669ee2"
+api_key_secret = "CHANGE_ME_IN_PRODUCTION_58392047"
 post_timeout_sec = 2
 forward_timeout_sec = 3
 get_timeout_sec = 2
@@ -56,7 +57,9 @@ sslkey = "/certs/client.key"
 sslrootcert = "/certs/ca.crt"
 api_keys_update_interval = 120
 keys_cache_ttl_sec = 43200
-keys_cache_max_capacity = 10000
+keys_cache_initial_capacity = 16000
+keys_cache_max_capacity = 32000
+deleted_keys_ttl_minutes = 60
 
 [cert]
 dangerous_skip_verification = true

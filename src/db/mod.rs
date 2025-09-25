@@ -1,23 +1,37 @@
+mod key_validator;
+
 use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
 use foldhash::fast::RandomState;
-use moka::sync::Cache;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
+use scc::HashMap as SccHashMap;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::error::Error as _;
 use std::io;
 use std::io::BufReader;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs;
-use tokio_postgres::{Client, Config, Error, Row};
+use tokio_postgres::{types::ToSql, Client, Config, Error, Row, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
-use uuid::Uuid;
 
 use crate::common::cert::{load_certificates, load_private_key};
-use crate::common::crypto_provider::ApiKeyHasher;
+pub use key_validator::ApiKeyValidator;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StmtKey {
+    ServerTimeUtc,
+    FullUsersKeys,
+    DeltaUsersKeys,
+    FullCompaniesMeta,
+    DeltaCompaniesMeta,
+    FullCompanyKeys,
+    DeltaCompanyKeys,
+    CompanyKeysForIds,
+    CleanupDeletedKeysBoth,
+}
 
 #[derive(Debug, Clone)]
 pub struct PostgresConnectionConfig<'a> {
@@ -61,6 +75,7 @@ impl PostgresConnectionConfigOwned {
 pub struct Database {
     client: AtomicOwned<Arc<Client>>,
     config: PostgresConnectionConfigOwned,
+    prepared: SccHashMap<StmtKey, Statement, RandomState>,
 }
 
 pub struct DatabaseBuilder {
@@ -219,7 +234,7 @@ impl DatabaseBuilder {
         })
         .await?;
 
-        Ok(Database {
+        let db = Database {
             client: AtomicOwned::new(client),
             config: PostgresConnectionConfigOwned {
                 host,
@@ -231,11 +246,188 @@ impl DatabaseBuilder {
                 sslkey_path,
                 sslrootcert_path,
             },
-        })
+            prepared: SccHashMap::with_capacity_and_hasher(16, RandomState::default()),
+        };
+
+        db.prepare_all().await?;
+        Ok(db)
     }
 }
 
 impl Database {
+    async fn load_client(&self) -> Result<Arc<Client>> {
+        let guard = Guard::new();
+        let shared = self.client.load(Ordering::Acquire, &guard);
+        shared
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("Database client is not initialized"))
+    }
+
+    async fn upsert_stmt(&self, key: StmtKey, stmt: Statement) {
+        match self.prepared.insert_async(key, stmt.clone()).await {
+            Ok(()) => {}
+            Err((_k, _v)) => match self.prepared.entry_async(key).await {
+                scc::hash_map::Entry::Occupied(mut entry) => {
+                    *entry.get_mut() = stmt;
+                }
+                scc::hash_map::Entry::Vacant(entry) => {
+                    entry.insert_entry(stmt);
+                }
+            },
+        }
+    }
+
+    async fn prepare_all(&self) -> Result<()> {
+        let client = self.load_client().await?;
+        self.prepared.clear_async().await;
+        self.upsert_stmt(
+            StmtKey::ServerTimeUtc,
+            client.prepare(Self::Q_SERVER_TIME_UTC).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::FullUsersKeys,
+            client.prepare(Self::Q_FULL_USERS_KEYS).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::DeltaUsersKeys,
+            client.prepare(Self::Q_DELTA_USERS_KEYS).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::FullCompaniesMeta,
+            client.prepare(Self::Q_FULL_COMPANIES_META).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::DeltaCompaniesMeta,
+            client.prepare(Self::Q_DELTA_COMPANIES_META).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::FullCompanyKeys,
+            client.prepare(Self::Q_FULL_COMPANY_KEYS).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::DeltaCompanyKeys,
+            client.prepare(Self::Q_DELTA_COMPANY_KEYS).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::CompanyKeysForIds,
+            client.prepare(Self::Q_COMPANY_KEYS_FOR_IDS).await?,
+        )
+        .await;
+        self.upsert_stmt(
+            StmtKey::CleanupDeletedKeysBoth,
+            client.prepare(Self::Q_CLEANUP_DELETED_KEYS_BOTH).await?,
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn get_statement(&self, key: StmtKey) -> Result<Statement> {
+        if let Some(entry) = self.prepared.get_async(&key).await {
+            return Ok(entry.get().clone());
+        }
+        let client = self.load_client().await?;
+        let sql = match key {
+            StmtKey::ServerTimeUtc => Self::Q_SERVER_TIME_UTC,
+            StmtKey::FullUsersKeys => Self::Q_FULL_USERS_KEYS,
+            StmtKey::DeltaUsersKeys => Self::Q_DELTA_USERS_KEYS,
+            StmtKey::FullCompaniesMeta => Self::Q_FULL_COMPANIES_META,
+            StmtKey::DeltaCompaniesMeta => Self::Q_DELTA_COMPANIES_META,
+            StmtKey::FullCompanyKeys => Self::Q_FULL_COMPANY_KEYS,
+            StmtKey::DeltaCompanyKeys => Self::Q_DELTA_COMPANY_KEYS,
+            StmtKey::CompanyKeysForIds => Self::Q_COMPANY_KEYS_FOR_IDS,
+            StmtKey::CleanupDeletedKeysBoth => Self::Q_CLEANUP_DELETED_KEYS_BOTH,
+        };
+        let stmt = client.prepare(sql).await?;
+        self.upsert_stmt(key, stmt.clone()).await;
+        Ok(stmt)
+    }
+
+    const Q_SERVER_TIME_UTC: &'static str = r#"
+SELECT NOW()::timestamptz AS server_time_utc;
+"#;
+
+    const Q_FULL_USERS_KEYS: &'static str = r#"
+SELECT u.id,
+       COALESCE(array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL), '{}') AS api_key_hashes
+FROM users u
+LEFT JOIN api_keys a ON u.id = a.user_id
+GROUP BY u.id;
+"#;
+
+    const Q_DELTA_USERS_KEYS: &'static str = r#"
+WITH changed AS (
+  SELECT DISTINCT user_id
+  FROM api_keys
+    WHERE (created_at > $1 AND created_at <= $2)
+         OR (updated_at > $1 AND updated_at <= $2)
+         OR (deleted_at IS NOT NULL AND deleted_at > $1 AND deleted_at <= $2)
+)
+SELECT c.user_id AS id,
+       COALESCE(array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL), '{}') AS api_key_hashes
+FROM changed c
+LEFT JOIN api_keys a ON a.user_id = c.user_id
+GROUP BY c.user_id;
+"#;
+
+    const Q_FULL_COMPANIES_META: &'static str = r#"
+SELECT id, name, rate_limit_hourly, rate_limit_daily FROM companies;
+"#;
+
+    const Q_DELTA_COMPANIES_META: &'static str = r#"
+SELECT id, name, rate_limit_hourly, rate_limit_daily
+FROM companies
+WHERE (updated_at > $1 AND updated_at <= $2)
+   OR (updated_at IS NULL AND created_at > $1 AND created_at <= $2);
+"#;
+
+    const Q_FULL_COMPANY_KEYS: &'static str = r#"
+SELECT company_id, api_key_hash FROM company_api_keys WHERE deleted_at IS NULL;
+"#;
+
+    const Q_COMPANY_KEYS_FOR_IDS: &'static str = r#"
+SELECT company_id, api_key_hash
+FROM company_api_keys
+WHERE deleted_at IS NULL AND company_id = ANY($1);
+"#;
+
+    const Q_DELTA_COMPANY_KEYS: &'static str = r#"
+WITH changed AS (
+  SELECT DISTINCT company_id
+  FROM company_api_keys
+  WHERE (created_at > $1 AND created_at <= $2)
+     OR (updated_at > $1 AND updated_at <= $2)
+     OR (deleted_at IS NOT NULL AND deleted_at > $1 AND deleted_at <= $2)
+)
+SELECT c.company_id,
+       COALESCE(array_agg(k.api_key_hash) FILTER (WHERE k.deleted_at IS NULL), '{}') AS api_key_hashes
+FROM changed c
+LEFT JOIN company_api_keys k ON k.company_id = c.company_id
+GROUP BY c.company_id;
+"#;
+
+    const Q_CLEANUP_DELETED_KEYS_BOTH: &'static str = r#"
+WITH del_user AS (
+  DELETE FROM api_keys
+  WHERE deleted_at IS NOT NULL AND deleted_at < $1
+  RETURNING 1
+), del_company AS (
+  DELETE FROM company_api_keys
+  WHERE deleted_at IS NOT NULL AND deleted_at < $1
+  RETURNING 1
+)
+SELECT
+  (SELECT COUNT(*) FROM del_user) AS n1,
+  (SELECT COUNT(*) FROM del_company) AS n2;
+"#;
+
     fn should_reconnect(&self, e: &Error) -> bool {
         if e.is_closed() {
             return true;
@@ -262,331 +454,158 @@ impl Database {
         let _old = self
             .client
             .swap((Some(Owned::new(new_client)), Tag::None), Ordering::AcqRel);
-
+        // Re-prepare statements on the new connection
+        self.prepare_all().await?;
         Ok(())
     }
 
-    pub async fn query(
+    async fn query_prepared(
         &self,
-        sql: &str,
+        key: StmtKey,
         params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     ) -> Result<Vec<Row>> {
-        let client_handle: Arc<Client> = {
-            let guard = Guard::new();
-            let shared = self.client.load(Ordering::Acquire, &guard);
-            shared
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| anyhow!("Database client is not initialized"))?
-        };
-
-        match client_handle.query(sql, params).await {
+        let stmt = self.get_statement(key).await?;
+        let client = self.load_client().await?;
+        match client.query(&stmt, params).await {
             Ok(rows) => Ok(rows),
             Err(e) => {
                 info!("Database query failed: {}. Trying to reconnect...", e);
                 if self.should_reconnect(&e) {
                     self.reconnect().await?;
+                    let stmt = self.get_statement(key).await?;
+                    let client = self.load_client().await?;
+                    Ok(client.query(&stmt, params).await?)
+                } else {
+                    Err(anyhow!(e))
                 }
-
-                let retry_handle: Arc<Client> = {
-                    let guard = Guard::new();
-                    let shared = self.client.load(Ordering::Acquire, &guard);
-                    shared.as_ref().cloned().ok_or_else(|| {
-                        anyhow!("Database client is not initialized after reconnect")
-                    })?
-                };
-
-                Ok(retry_handle.query(sql, params).await?)
             }
         }
     }
-}
 
-pub struct ApiKeyValidator {
-    db: Arc<Database>,
-    // mapping from user_id -> list of api_key_hashes
-    users: scc::HashMap<Uuid, Vec<String>, RandomState>,
-    // reverse mapping: api_key_hash -> user_id
-    api_key_hashes: scc::HashMap<String, Uuid, RandomState>,
-    // mapping from company_id -> (name, hourly, daily) rate limits
-    companies: scc::HashMap<Uuid, (String, u64, u64), RandomState>,
-    // reverse mapping: company_api_key_hash -> company_id
-    company_api_key_hashes: scc::HashMap<String, Uuid, RandomState>,
-    // Argon2 hasher for API key verification
-    hasher: ApiKeyHasher,
-    // For validated API keys (api_key -> user_id) with TTL
-    validation_cache: Cache<String, Uuid, RandomState>,
-    // For validated company API keys (api_key -> company_id) with TTL
-    company_validation_cache: Cache<String, Uuid, RandomState>,
-    update_interval: Duration,
-}
-
-impl ApiKeyValidator {
-    pub fn new(
-        db: Arc<Database>,
-        update_interval: Duration,
-        cache_ttl_sec: u64,
-        cache_max_capacity: u64,
-    ) -> Result<Self> {
-        let validation_cache = Cache::builder()
-            .max_capacity(cache_max_capacity)
-            .time_to_live(Duration::from_secs(cache_ttl_sec))
-            .build_with_hasher(RandomState::default());
-
-        let company_validation_cache = Cache::builder()
-            .max_capacity(cache_max_capacity)
-            .time_to_live(Duration::from_secs(cache_ttl_sec))
-            .build_with_hasher(RandomState::default());
-
-        let companies = scc::HashMap::with_capacity_and_hasher(4096, RandomState::default());
-        let company_api_key_hashes =
-            scc::HashMap::with_capacity_and_hasher(4096, RandomState::default());
-        Ok(Self {
-            db,
-            users: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
-            api_key_hashes: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
-            companies,
-            company_api_key_hashes,
-            hasher: ApiKeyHasher::new()?,
-            validation_cache,
-            company_validation_cache,
-            update_interval,
-        })
-    }
-
-    pub async fn run(self: Arc<Self>) {
-        let mut interval = tokio::time::interval(self.update_interval);
-        loop {
-            if let Err(e) = self.update_hashes().await {
-                error!("Error updating keys: {:?}", e);
-            }
-            interval.tick().await;
-        }
-    }
-
-    async fn update_hashes(&self) -> Result<()> {
-        self.update_users_data().await?;
-        self.update_companies_data().await
-    }
-
-    async fn update_users_data(&self) -> Result<()> {
-        let query = r#"
-    SELECT
-        u.id,
-        COALESCE(array_agg(a.api_key_hash) FILTER (WHERE a.api_key_hash IS NOT NULL), '{}') AS api_key_hashes
-    FROM users u
-    LEFT JOIN api_keys a ON u.id = a.user_id
-    GROUP BY u.id;
-"#;
-        let rows = self.db.query(query, &[]).await?;
-
-        let new_keys: foldhash::HashMap<Uuid, Vec<String>> = rows
+    pub async fn fetch_full_users_keys(&self) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
+        let rows = self.query_prepared(StmtKey::FullUsersKeys, &[]).await?;
+        let result = rows
             .into_iter()
             .map(|row| {
-                let user_id: Uuid = row.get("id");
-                let api_key_hashes: Vec<String> = row.get("api_key_hashes");
+                let user_id: uuid::Uuid = row.get("id");
+                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
                 (user_id, api_key_hashes)
             })
             .collect();
-
-        let total_api_keys: usize = new_keys.values().map(|v| v.len()).sum();
-        info!(
-            "Retrieved {} API key hashes for {} users from the database",
-            total_api_keys,
-            new_keys.len()
-        );
-
-        let mut new_api_key_to_user =
-            foldhash::HashMap::with_capacity_and_hasher(total_api_keys, RandomState::default());
-        for (user_id, hashes) in &new_keys {
-            for hash in hashes {
-                new_api_key_to_user.insert(hash.clone(), *user_id);
-            }
-        }
-
-        self.api_key_hashes
-            .retain_async(|k, _| new_api_key_to_user.contains_key(k))
-            .await;
-        for (hash, user_id) in new_api_key_to_user {
-            let _ = self.api_key_hashes.insert_async(hash, user_id).await;
-        }
-
-        let new_user_ids: foldhash::HashSet<_> = new_keys.keys().copied().collect();
-        self.users
-            .retain_async(|k, _| new_user_ids.contains(k))
-            .await;
-
-        for (user_id, new_api_key_hashes) in new_keys {
-            match self.users.entry_async(user_id).await {
-                scc::hash_map::Entry::Occupied(mut entry) => {
-                    if entry.get() != &new_api_key_hashes {
-                        *entry.get_mut() = new_api_key_hashes;
-                    }
-                }
-                scc::hash_map::Entry::Vacant(entry) => {
-                    entry.insert_entry(new_api_key_hashes);
-                }
-            }
-        }
-        Ok(())
+        Ok(result)
     }
 
-    async fn update_companies_data(&self) -> Result<()> {
-        let comp_rows = self
-            .db
-            .query(
-                "SELECT id, name, rate_limit_hourly, rate_limit_daily FROM companies",
-                &[],
-            )
+    pub async fn fetch_delta_users_keys(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
+        let params: [&(dyn ToSql + Sync); 2] = [&since, &until];
+        let rows = self
+            .query_prepared(StmtKey::DeltaUsersKeys, &params)
             .await?;
-
-        let new_companies: foldhash::HashMap<Uuid, (String, u64, u64)> = comp_rows
+        let result = rows
             .into_iter()
             .map(|row| {
-                let company_id: Uuid = row.get("id");
+                let user_id: uuid::Uuid = row.get("id");
+                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
+                (user_id, api_key_hashes)
+            })
+            .collect();
+        Ok(result)
+    }
+
+    pub async fn fetch_full_companies_meta(&self) -> Result<Vec<(uuid::Uuid, (String, u64, u64))>> {
+        let rows = self.query_prepared(StmtKey::FullCompaniesMeta, &[]).await?;
+        let result = rows
+            .into_iter()
+            .map(|row| {
+                let id: uuid::Uuid = row.get("id");
                 let name: String = row.get("name");
                 let hourly: i32 = row.get("rate_limit_hourly");
                 let daily: i32 = row.get("rate_limit_daily");
-                (company_id, (name, hourly as u64, daily as u64))
+                (id, (name, hourly as u64, daily as u64))
             })
             .collect();
+        Ok(result)
+    }
 
-        let company_keys: foldhash::HashSet<_> = new_companies.keys().copied().collect();
-        self.companies
-            .retain_async(|k, _| company_keys.contains(k))
-            .await;
-        for (cid, limits) in new_companies {
-            match self.companies.entry_async(cid).await {
-                scc::hash_map::Entry::Occupied(mut entry) => {
-                    if entry.get() != &limits {
-                        *entry.get_mut() = limits;
-                    }
-                }
-                scc::hash_map::Entry::Vacant(entry) => {
-                    entry.insert_entry(limits);
-                }
-            }
-        }
-
-        let cak_rows = self
-            .db
-            .query("SELECT company_id, api_key_hash FROM company_api_keys", &[])
+    pub async fn fetch_delta_companies_meta(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<(uuid::Uuid, (String, u64, u64))>> {
+        let params: [&(dyn ToSql + Sync); 2] = [&since, &until];
+        let rows = self
+            .query_prepared(StmtKey::DeltaCompaniesMeta, &params)
             .await?;
-
-        let new_company_keys: foldhash::HashMap<String, Uuid> = cak_rows
+        let result = rows
             .into_iter()
             .map(|row| {
-                let company_id: Uuid = row.get("company_id");
-                let hash: String = row.get("api_key_hash");
-                (hash, company_id)
+                let id: uuid::Uuid = row.get("id");
+                let name: String = row.get("name");
+                let hourly: i32 = row.get("rate_limit_hourly");
+                let daily: i32 = row.get("rate_limit_daily");
+                (id, (name, hourly as u64, daily as u64))
             })
             .collect();
-
-        let num_companies = company_keys.len();
-        info!(
-            "Retrieved {} company API keys for {} companies from the database",
-            new_company_keys.len(),
-            num_companies
-        );
-
-        self.company_api_key_hashes
-            .retain_async(|k, _| new_company_keys.contains_key(k))
-            .await;
-
-        for (hash, cid) in new_company_keys {
-            let _ = self.company_api_key_hashes.insert_async(hash, cid).await;
-        }
-
-        Ok(())
+        Ok(result)
     }
 
-    #[inline]
-    async fn find_id_for_api_key(
+    pub async fn fetch_full_company_keys(&self) -> Result<Vec<(uuid::Uuid, Vec<u8>)>> {
+        let rows = self.query_prepared(StmtKey::FullCompanyKeys, &[]).await?;
+        let result = rows
+            .into_iter()
+            .map(|row| {
+                let company_id: uuid::Uuid = row.get("company_id");
+                let hash: Vec<u8> = row.get("api_key_hash");
+                (company_id, hash)
+            })
+            .collect();
+        Ok(result)
+    }
+
+    pub async fn fetch_delta_company_keys(
         &self,
-        api_key: &str,
-        cache: &Cache<String, Uuid, RandomState>,
-        hashes: &scc::HashMap<String, Uuid, RandomState>,
-    ) -> Option<Uuid> {
-        if let Some(id) = cache.get(api_key) {
-            return Some(id);
-        }
-
-        let collected_hashes = {
-            let mut pairs = Vec::with_capacity(hashes.len());
-            hashes
-                .iter_async(|hash, id| {
-                    pairs.push((hash.clone(), *id));
-                    true
-                })
-                .await;
-            pairs
-        };
-
-        if collected_hashes.is_empty() {
-            return None;
-        }
-
-        let api_key_owned = api_key.to_string();
-        let hasher = self.hasher.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            for (hash, id) in collected_hashes {
-                if hasher
-                    .verify_api_key(&api_key_owned, &hash)
-                    .unwrap_or(false)
-                {
-                    return Some(id);
-                }
-            }
-            None
-        })
-        .await
-        .unwrap_or(None);
-
-        if let Some(id) = result {
-            cache.insert(api_key.to_string(), id);
-        }
-
-        result
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
+        let params: [&(dyn ToSql + Sync); 2] = [&since, &until];
+        let rows = self
+            .query_prepared(StmtKey::DeltaCompanyKeys, &params)
+            .await?;
+        let result = rows
+            .into_iter()
+            .map(|row| {
+                let company_id: uuid::Uuid = row.get("company_id");
+                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
+                (company_id, api_key_hashes)
+            })
+            .collect();
+        Ok(result)
     }
 
-    async fn find_user_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        self.find_id_for_api_key(api_key, &self.validation_cache, &self.api_key_hashes)
-            .await
+    pub async fn cleanup_deleted_keys_before(&self, cutoff: DateTime<Utc>) -> Result<(u64, u64)> {
+        let params: [&(dyn ToSql + Sync); 1] = [&cutoff];
+        let rows = self
+            .query_prepared(StmtKey::CleanupDeletedKeysBoth, &params)
+            .await?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Cleanup query returned no rows"))?;
+        let n1: i64 = row.get("n1");
+        let n2: i64 = row.get("n2");
+        Ok((n1 as u64, n2 as u64))
     }
 
-    async fn find_company_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        self.find_id_for_api_key(
-            api_key,
-            &self.company_validation_cache,
-            &self.company_api_key_hashes,
-        )
-        .await
-    }
-
-    pub async fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
-        self.find_user_for_api_key(api_key).await
-    }
-
-    pub async fn is_valid_api_key(&self, api_key: &str) -> bool {
-        self.find_user_for_api_key(api_key).await.is_some()
-    }
-
-    pub async fn is_company_key(&self, api_key: &str) -> bool {
-        self.find_company_for_api_key(api_key).await.is_some()
-    }
-
-    pub async fn get_company_info_from_key(
-        &self,
-        api_key: &str,
-    ) -> Option<(Uuid, (String, u64, u64))> {
-        if let Some(cid) = self.find_company_for_api_key(api_key).await {
-            self.companies
-                .get_async(&cid)
-                .await
-                .map(|company_info| (cid, company_info.get().clone()))
-        } else {
-            None
-        }
+    pub async fn server_time_utc(&self) -> Result<DateTime<Utc>> {
+        let rows = self.query_prepared(StmtKey::ServerTimeUtc, &[]).await?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Server time query returned no rows"))?;
+        let dt: DateTime<Utc> = row.get("server_time_utc");
+        Ok(dt)
     }
 }

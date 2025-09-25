@@ -111,6 +111,8 @@ pub struct HTTPConfig {
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
     pub generic_key: Option<Uuid>,
+    // Secret used to key BLAKE3 for API key verification
+    pub api_key_secret: String,
     // HTTP/3 client timeouts
     pub post_timeout_sec: u64,
     pub forward_timeout_sec: u64,
@@ -146,7 +148,14 @@ pub struct DbConfig {
     pub sslrootcert: String,
     pub api_keys_update_interval: u64,
     pub keys_cache_ttl_sec: u64,
+    pub keys_cache_initial_capacity: usize,
     pub keys_cache_max_capacity: u64,
+    #[serde(default = "default_deleted_keys_ttl_minutes")]
+    pub deleted_keys_ttl_minutes: u64,
+}
+
+fn default_deleted_keys_ttl_minutes() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -267,6 +276,8 @@ impl fmt::Display for NodeConfig {
             let generic_key_str = key.to_string();
             mask_key_in_toml(&mut toml_str, &generic_key_str, 6);
         }
+
+        mask_key_in_toml(&mut toml_str, &self.http.api_key_secret, 3);
 
         write!(f, "{}", toml_str)
     }

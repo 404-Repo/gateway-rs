@@ -582,7 +582,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         Arc::new(db),
         Duration::from_secs(config.db.api_keys_update_interval),
         config.db.keys_cache_ttl_sec,
+        config.db.keys_cache_initial_capacity,
         config.db.keys_cache_max_capacity,
+        &config.http.api_key_secret,
+        config.db.deleted_keys_ttl_minutes,
     )?;
     let api_key_validator = Arc::new(api_key_validator);
 
