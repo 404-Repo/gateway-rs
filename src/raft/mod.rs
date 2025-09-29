@@ -37,8 +37,8 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::api::request::GatewayInfoExt;
-use crate::api::response::GatewayInfo;
+use crate::api::request::GatewayInfoExtRef;
+use crate::api::response::GatewayInfoRef;
 use crate::api::Task;
 use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificates;
@@ -188,9 +188,12 @@ impl Gateway {
         let mut client: Option<Http3Client> = None;
         let max_idle_timeout_sec = config.http.max_idle_timeout_sec;
         let keep_alive_interval_sec = config.http.keep_alive_interval_sec;
+        let post_timeout = Duration::from_secs(config.http.post_timeout_sec);
+        let update_interval = Duration::from_millis(config.basic.update_gateway_info_ms);
+        let admin_key = config.http.admin_key.to_string();
 
         loop {
-            sleep(Duration::from_millis(config.basic.update_gateway_info_ms)).await;
+            sleep(update_interval).await;
 
             let leader = match gateway_state.leader().await {
                 Some(leader) => leader,
@@ -207,19 +210,20 @@ impl Gateway {
                     0
                 }
             };
-
-            let info = GatewayInfo {
-                node_id: config.network.node_id,
-                domain: config.network.domain.clone(),
-                ip: config.network.external_ip.clone(),
-                name: config.network.name.clone(),
-                http_port: config.http.port,
-                available_tasks: task_queue.len(),
-                last_task_acquisition: last_task_acquisition.load(Ordering::Relaxed),
-                last_update,
-            };
+            let available_tasks = task_queue.len();
+            let last_task_acquisition = last_task_acquisition.load(Ordering::Relaxed);
 
             if leader == config.network.node_id {
+                let info = GatewayInfoRef {
+                    node_id: config.network.node_id,
+                    domain: &config.network.domain,
+                    ip: &config.network.external_ip,
+                    name: &config.network.name,
+                    http_port: config.http.port,
+                    available_tasks,
+                    last_task_acquisition,
+                    last_update,
+                };
                 if let Err(e) = gateway_state.set_gateway_info(info).await {
                     error!("set_gateway_info update error: {:?}", e);
                 }
@@ -263,16 +267,16 @@ impl Gateway {
                 }
             }
 
-            let info_ext = GatewayInfoExt {
-                node_id: info.node_id,
-                domain: info.domain,
-                ip: info.ip,
-                name: info.name,
-                http_port: info.http_port,
-                available_tasks: info.available_tasks,
-                cluster_name: config.raft.cluster_name.clone(),
-                last_task_acquisition: info.last_task_acquisition,
-                last_update: info.last_update,
+            let info_ext = GatewayInfoExtRef {
+                node_id: config.network.node_id,
+                domain: &config.network.domain,
+                ip: &config.network.external_ip,
+                name: &config.network.name,
+                http_port: config.http.port,
+                available_tasks,
+                cluster_name: &config.raft.cluster_name,
+                last_task_acquisition,
+                last_update,
             };
 
             let payload = match rmp_serde::to_vec(&info_ext) {
@@ -289,11 +293,13 @@ impl Gateway {
             );
 
             if let Some(client) = client.as_ref() {
+                let headers = [("x-admin-key", admin_key.as_str())];
                 match client
                     .post(
                         &url,
                         Bytes::from(payload),
-                        Some(Duration::from_secs(config.http.post_timeout_sec)),
+                        Some(&headers),
+                        Some(post_timeout),
                     )
                     .await
                 {

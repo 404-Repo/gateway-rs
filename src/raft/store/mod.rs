@@ -1,6 +1,3 @@
-// TODO: Remove this after the code is finalized
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;

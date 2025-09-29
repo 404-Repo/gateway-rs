@@ -19,6 +19,18 @@ pub struct GatewayInfo {
     pub last_update: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct GatewayInfoRef<'a> {
+    pub node_id: u64,
+    pub domain: &'a str,
+    pub ip: &'a str,
+    pub name: &'a str,
+    pub http_port: u16,
+    pub available_tasks: usize,
+    pub last_task_acquisition: u64,
+    pub last_update: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadResponse {
     pub gateways: Vec<GatewayInfo>,

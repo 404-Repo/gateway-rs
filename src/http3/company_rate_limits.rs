@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use foldhash::fast::RandomState;
 use salvo::{handler, Depot, Request};
-use scc::HashMap as SccHashMap;
+use scc::HashCache;
 use tracing::info;
 use uuid::Uuid;
 
@@ -20,15 +20,18 @@ struct RateLimitInfo {
 
 #[derive(Clone)]
 pub struct CompanyRateLimiterStore {
-    inner: Arc<SccHashMap<Uuid, RateLimitInfo, RandomState>>,
+    inner: Arc<HashCache<Uuid, RateLimitInfo, RandomState>>,
 }
 
 impl CompanyRateLimiterStore {
-    pub fn new() -> Self {
+    pub fn new(max_capacity: usize) -> Self {
+        let max_capacity = max_capacity.max(1);
+        let min_capacity = max_capacity.min(1024);
+
         CompanyRateLimiterStore {
-            // TODO: Should be LRU with fixed size
-            inner: Arc::new(SccHashMap::with_capacity_and_hasher(
-                4096,
+            inner: Arc::new(HashCache::with_capacity_and_hasher(
+                min_capacity,
+                max_capacity,
                 RandomState::default(),
             )),
         }
@@ -88,7 +91,7 @@ pub async fn company_rate_limit(depot: &mut Depot, req: &mut Request) -> Result<
                     rate_info.hourly_requests += 1;
                     rate_info.daily_requests += 1;
                 })
-                .or_insert_with(|| RateLimitInfo {
+                .or_put_with(|| RateLimitInfo {
                     hourly_requests: 1,
                     daily_requests: 1,
                     hour_epoch,

@@ -82,6 +82,19 @@ pub struct GatewayInfoExt {
     pub last_update: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct GatewayInfoExtRef<'a> {
+    pub node_id: u64,
+    pub domain: &'a str,
+    pub ip: &'a str,
+    pub name: &'a str,
+    pub http_port: u16,
+    pub available_tasks: usize,
+    pub cluster_name: &'a str,
+    pub last_task_acquisition: u64,
+    pub last_update: u64,
+}
+
 impl From<GatewayInfoExt> for GatewayInfo {
     fn from(info: GatewayInfoExt) -> Self {
         GatewayInfo {

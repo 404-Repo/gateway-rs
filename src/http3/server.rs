@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::api::Task;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::queue::DupQueue;
+use crate::common::resolve::lookup_hosts_ips;
 use crate::config::NodeConfig;
 use crate::http3::company_rate_limits::{company_rate_limit, CompanyRateLimiterStore};
 use crate::http3::handlers::admin::{
@@ -26,9 +27,12 @@ use crate::http3::handlers::common::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::response::custom_response;
-use crate::http3::user_rate_limits::RateLimits;
+use crate::http3::user_rate_limits::{prepare_rate_limit_context, RateLimits};
+use crate::http3::whitelist::AddTaskWhitelist;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
+use std::collections::HashSet;
+use std::net::IpAddr;
 
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
@@ -56,8 +60,39 @@ impl Http3Server {
             config.http.wss_max_message_size,
         );
 
-        let router =
-            Self::setup_router(config, &subnet_state, &gateway_state, &task_queue, &metrics)?;
+        let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
+        let mut domains: Vec<&str> = Vec::new();
+        for entry in &config.http.add_task_whitelist {
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                whitelist_ips.insert(ip);
+            } else {
+                domains.push(entry.as_str());
+            }
+        }
+        if !domains.is_empty() {
+            match lookup_hosts_ips(&domains).await {
+                Ok(resolved) => {
+                    for ip in resolved {
+                        whitelist_ips.insert(ip);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to resolve some add_task_whitelist domains: {:?}", e);
+                }
+            }
+        }
+        let add_task_whitelist = AddTaskWhitelist {
+            ips: Arc::new(whitelist_ips),
+        };
+
+        let router = Self::setup_router(
+            config,
+            &subnet_state,
+            &gateway_state,
+            &task_queue,
+            &metrics,
+            add_task_whitelist,
+        )?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
@@ -85,6 +120,7 @@ impl Http3Server {
         gateway_state: &GatewayState,
         task_queue: &DupQueue<Task>,
         metrics: &Metrics,
+        add_task_whitelist: AddTaskWhitelist,
     ) -> Result<Router> {
         let http_config = &config.http;
         let prompt_config = &config.prompt;
@@ -104,7 +140,8 @@ impl Http3Server {
         let raft_write_size_limit = http_config.raft_write_size_limit as usize;
         let raft_write_size_limit_handler = || SecureMaxSize(raft_write_size_limit);
 
-        let company_store = CompanyRateLimiterStore::new();
+        let company_store =
+            CompanyRateLimiterStore::new(http_config.company_rate_limiter_max_capacity);
 
         let router = if http_config.compression {
             Router::new().hoop(
@@ -121,12 +158,14 @@ impl Http3Server {
             .hoop(affix_state::inject(gateway_state.clone()))
             .hoop(affix_state::inject(subnet_state.clone()))
             .hoop(affix_state::inject(http_config.clone()))
+            .hoop(affix_state::inject(add_task_whitelist))
             .hoop(affix_state::inject(config.network.node_id as usize))
             .hoop(affix_state::inject(metrics.clone()))
             .hoop(affix_state::inject(company_store))
             .hoop(affix_state::inject(prompt_config.clone()))
             .hoop(affix_state::inject(image_config.clone()))
             .hoop(affix_state::inject(prompt_regex))
+            .hoop(prepare_rate_limit_context)
             .push(
                 Router::with_path("/add_task")
                     .hoop(add_task_size_limit_handler())
@@ -165,6 +204,7 @@ impl Http3Server {
             .push(
                 Router::with_path("/write")
                     .hoop(raft_write_size_limit_handler())
+                    .hoop(admin_key_check)
                     .hoop(rate_limits.write_limiter)
                     .post(write_handler),
             )

@@ -2,15 +2,16 @@ use anyhow::{anyhow, Result};
 use async_tungstenite::tokio::connect_async_with_config;
 use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
+use foldhash::fast::RandomState;
 use futures_util::StreamExt;
 use hex;
 use itertools::izip;
 use parity_scale_codec::{Compact, Decode, Encode};
 use scc::HashMap;
 use serde_json::{json, Value};
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::hash_map::RandomState, fmt};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 

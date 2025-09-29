@@ -109,6 +109,8 @@ impl TaskManager {
         let inner_clone = Arc::clone(&inner);
         let result_lifetime_clone = result_lifetime;
         task::spawn(async move {
+            let mut expired_ids: Vec<Uuid> = Vec::new();
+            let mut timeouts_to_count: Vec<Hotkey> = Vec::new();
             loop {
                 tokio::select! {
                     _ = token_child.cancelled() => break,
@@ -121,7 +123,7 @@ impl TaskManager {
                         }).await;
 
                         // Determine expired task ids based on execution_time and drop them
-                        let mut expired_ids: Vec<Uuid> = Vec::new();
+                        expired_ids.clear();
                         inner_clone
                             .execution_time
                             .retain_async(|task_id, start| {
@@ -133,8 +135,8 @@ impl TaskManager {
                             }).await;
 
                         // For expired tasks, increment timeout failures for validators that did not submit any result
-                        let mut timeouts_to_count: Vec<Hotkey> = Vec::new();
-                        for task_id in expired_ids {
+                        timeouts_to_count.clear();
+                        for &task_id in &expired_ids {
                             if let Some((_k, validators)) = inner_clone.assigned_validators.remove_async(&task_id).await {
                                 let had_results = inner_clone.completed.get_async(&task_id).await;
                                 for validator in validators.iter() {
@@ -148,7 +150,7 @@ impl TaskManager {
                             }
                         }
 
-                        for hk in timeouts_to_count {
+                        for hk in timeouts_to_count.drain(..) {
                             inner_clone.metrics.inc_timeout_failed(hk.as_ref()).await;
                         }
 

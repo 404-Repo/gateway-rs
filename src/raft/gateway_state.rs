@@ -1,6 +1,7 @@
 use super::store::Request;
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
+use crate::api::response::GatewayInfoRef;
 use crate::common::task::TaskManager;
 use crate::config::NodeConfig;
 use crate::db::ApiKeyValidator;
@@ -124,18 +125,15 @@ impl GatewayState {
         Ok(infos)
     }
 
-    pub async fn set_gateway_info(&self, info: GatewayInfo) -> Result<()> {
+    pub async fn set_gateway_info(&self, info: GatewayInfoRef<'_>) -> Result<()> {
         let gateway_info_bytes = rmp_serde::to_vec(&info)?;
-        let key = info.node_id.to_string();
 
         let request = Request::Set {
-            key,
+            key: info.node_id.to_string(),
             value: gateway_info_bytes,
         };
 
-        {
-            self.raft.client_write(request).await?;
-        }
+        self.raft.client_write(request).await?;
 
         Ok(())
     }
@@ -188,7 +186,7 @@ impl GatewayState {
             let extra_headers = (!headers_vec.is_empty()).then_some(headers_vec.as_slice());
 
             match client
-                .post_with_headers(
+                .post(
                     &url,
                     Bytes::from(payload),
                     extra_headers,

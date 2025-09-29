@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 use multer::{Constraints, Multipart, SizeLimit};
 use salvo::prelude::*;
 use std::sync::Arc;
@@ -59,11 +59,12 @@ async fn parse_add_task_multipart(
 
     let image_cfg = depot.require::<ImageConfig>()?;
     let prompt_cfg = depot.require::<PromptConfig>()?;
+
     let constraints = Constraints::new()
         .allowed_fields(vec!["prompt", "image"])
         .size_limit(
             SizeLimit::new()
-                .for_field("image", image_cfg.max_size_bytes)
+                .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64),
         );
 
@@ -85,10 +86,33 @@ async fn parse_add_task_multipart(
                 prompt = Some(read_text_field(field, "prompt").await?);
             }
             "image" => {
-                let mut content = BytesMut::new();
+                let (lower, upper) = field.size_hint();
+                let hinted = upper.or(Some(lower)).filter(|&bytes| bytes > 0);
+                let capacity = hinted.unwrap_or(64 * 1024).min(image_cfg.max_size_bytes);
+
+                let mut content = BytesMut::with_capacity(capacity);
+                let mut total = 0usize;
                 while let Some(chunk) = field.chunk().await.map_err(|e| {
-                    ServerError::BadRequest(format!("Failed to read image chunk: {}", e))
+                    if let multer::Error::FieldSizeExceeded { limit, .. } = e {
+                        ServerError::BadRequest(format!(
+                            "Image exceeds maximum allowed size ({} bytes)",
+                            limit
+                        ))
+                    } else {
+                        ServerError::BadRequest(format!("Failed to read image chunk: {}", e))
+                    }
                 })? {
+                    total = total.checked_add(chunk.len()).ok_or_else(|| {
+                        ServerError::BadRequest("Image size overflowed usize".to_string())
+                    })?;
+
+                    if total > image_cfg.max_size_bytes {
+                        return Err(ServerError::BadRequest(format!(
+                            "Image exceeds maximum allowed size ({} bytes)",
+                            image_cfg.max_size_bytes
+                        )));
+                    }
+
                     content.extend_from_slice(&chunk);
                 }
                 image = Some(content.freeze());

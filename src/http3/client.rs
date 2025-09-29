@@ -268,16 +268,6 @@ impl Http3Client {
         &self,
         url: &str,
         data: Bytes,
-        timeout_duration: Option<Duration>,
-    ) -> Result<(StatusCode, Bytes)> {
-        self.post_with_headers(url, data, None::<&[(&str, &str)]>, timeout_duration)
-            .await
-    }
-
-    pub async fn post_with_headers(
-        &self,
-        url: &str,
-        data: Bytes,
         extra_headers: Option<&[(&str, &str)]>,
         timeout_duration: Option<Duration>,
     ) -> Result<(StatusCode, Bytes)> {
