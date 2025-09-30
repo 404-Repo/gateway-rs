@@ -1,6 +1,4 @@
-use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use itoa::Buffer;
 use salvo::prelude::*;
 use salvo::rate_limiter::{
     BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
@@ -8,9 +6,79 @@ use salvo::rate_limiter::{
 use uuid::Uuid;
 
 use crate::config::HTTPConfig;
+use crate::http3::error::ServerError;
+use crate::http3::whitelist::is_whitelisted_ip;
 use crate::raft::gateway_state::GatewayState;
 
-static BYPASS_COUNTER: AtomicU64 = AtomicU64::new(0);
+const USER_ID_PREFIX: &str = "u_";
+const USER_ID_PREFIX_LEN: usize = 2;
+const U128_DECIMAL_MAX_LEN: usize = 39; // Max decimal digits for u128
+const USER_ID_KEY_CAPACITY: usize = USER_ID_PREFIX_LEN + U128_DECIMAL_MAX_LEN;
+
+#[derive(Clone, Debug, Default)]
+pub struct RateLimitContext {
+    pub is_whitelisted_ip: bool,
+    pub has_valid_api_key: bool,
+    pub is_generic_key: bool,
+    pub is_company_key: bool,
+    pub user_id: Option<Uuid>,
+    pub key_is_uuid: bool,
+}
+
+fn decimal_ip_from_req(req: &mut Request) -> Option<String> {
+    match req.remote_addr() {
+        salvo::conn::SocketAddr::IPv4(addr) => {
+            let bits = addr.ip().to_bits();
+            let mut buf = itoa::Buffer::new();
+            Some(buf.format(bits).to_owned())
+        }
+        salvo::conn::SocketAddr::IPv6(addr) => {
+            let bits = addr.ip().to_bits();
+            let mut buf = itoa::Buffer::new();
+            Some(buf.format(bits).to_owned())
+        }
+        _ => None,
+    }
+}
+
+impl RateLimitContext {
+    pub fn has_authorized_key(&self) -> bool {
+        self.is_generic_key
+            || self.is_company_key
+            || self.has_valid_api_key
+            || self.user_id.is_some()
+    }
+}
+
+#[handler]
+pub async fn prepare_rate_limit_context(
+    depot: &mut Depot,
+    req: &mut Request,
+) -> Result<(), ServerError> {
+    let gs = depot
+        .obtain::<GatewayState>()
+        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+
+    let mut context = RateLimitContext {
+        is_whitelisted_ip: is_whitelisted_ip(req, depot),
+        ..RateLimitContext::default()
+    };
+
+    if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if key_str.len() == uuid::fmt::Hyphenated::LENGTH {
+            if let Ok(uuid) = Uuid::parse_str(key_str) {
+                context.key_is_uuid = true;
+                context.has_valid_api_key = gs.is_valid_api_key(key_str).await;
+                context.is_company_key = gs.is_company_key(key_str).await;
+                context.user_id = gs.get_user_id(key_str).await;
+                context.is_generic_key = gs.is_generic_key(&uuid).await;
+            }
+        }
+    }
+
+    depot.inject(context);
+    Ok(())
+}
 
 pub type PerIPRateLimiter = RateLimiter<
     FixedGuard,
@@ -59,23 +127,12 @@ pub struct GenericKeyPerIpIssuer;
 impl RateIssuer for GenericKeyPerIpIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-        let uuid = Uuid::parse_str(key_header).ok()?;
-
-        let ip_str = match req.remote_addr() {
-            salvo::conn::SocketAddr::IPv4(addr) => addr.ip().to_string(),
-            salvo::conn::SocketAddr::IPv6(addr) => addr.ip().to_string(),
-            _ => return None,
-        };
-
-        if gs.is_generic_key(&uuid).await {
-            return Some(format!("g_{}", ip_str));
-        }
-
-        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Some(counter.to_string())
+    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        let ip_dec = decimal_ip_from_req(req)?;
+        let mut key = String::with_capacity(2 + ip_dec.len());
+        key.push_str("g_");
+        key.push_str(&ip_dec);
+        Some(key)
     }
 }
 
@@ -83,17 +140,8 @@ pub struct GlobalGenericKeyIssuer;
 impl RateIssuer for GlobalGenericKeyIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-        let uuid = Uuid::from_str(key_header).ok()?;
-
-        if gs.is_generic_key(&uuid).await {
-            return Some("g_gk".to_string());
-        }
-
-        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Some(counter.to_string())
+    async fn issue(&self, _req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        Some("g_gk".to_string())
     }
 }
 
@@ -101,16 +149,8 @@ pub struct GlobalUserIDIssuer;
 impl RateIssuer for GlobalUserIDIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-
-        if gs.get_user_id(key_header).await.is_some() {
-            return Some("g_uid".to_string());
-        }
-
-        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Some(counter.to_string())
+    async fn issue(&self, _req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        Some("g_uid".to_string())
     }
 }
 
@@ -118,16 +158,14 @@ pub struct UserIDLimitIssuer;
 impl RateIssuer for UserIDLimitIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let key_header = req.headers().get("x-api-key")?.to_str().ok()?;
-        let gs = depot.obtain::<GatewayState>().ok()?;
-
-        if let Some(user_id) = gs.get_user_id(key_header).await {
-            return Some(format!("u_{}", user_id));
-        }
-
-        let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Some(counter.to_string())
+    async fn issue(&self, _req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        let ctx = depot.obtain::<RateLimitContext>().ok()?;
+        let user_id = ctx.user_id?;
+        let mut key = String::with_capacity(USER_ID_KEY_CAPACITY);
+        key.push_str(USER_ID_PREFIX);
+        let mut buf = Buffer::new();
+        key.push_str(buf.format(user_id.as_u128()));
+        Some(key)
     }
 }
 
@@ -136,31 +174,9 @@ pub struct UnauthorizedOnlyIssuer;
 impl RateIssuer for UnauthorizedOnlyIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let ip_str = || match req.remote_addr() {
-            salvo::conn::SocketAddr::IPv4(addr) => Some(addr.ip().to_string()),
-            salvo::conn::SocketAddr::IPv6(addr) => Some(addr.ip().to_string()),
-            _ => None,
-        };
-
-        let gs = depot.obtain::<GatewayState>().ok()?;
-
-        if let Some(key_str) = req.headers().get("x-api-key").and_then(|h| h.to_str().ok()) {
-            if let Ok(uuid) = Uuid::parse_str(key_str) {
-                let is_authorized = gs.is_valid_api_key(key_str).await
-                    || gs.is_generic_key(&uuid).await
-                    || gs.is_company_key(key_str).await;
-
-                if is_authorized {
-                    // Authorized, bypass rate limiting
-                    let counter = BYPASS_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    return Some(counter.to_string());
-                }
-            }
-        }
-
-        // For any case that is not a valid, authorized key, we rate limit by IP
-        ip_str()
+    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        let ip = decimal_ip_from_req(req)?;
+        Some(ip)
     }
 }
 
@@ -192,32 +208,62 @@ impl RateLimits {
             MokaStore::new(),
             UnauthorizedOnlyIssuer,
             BasicQuota::per_hour(http_config.add_task_basic_per_ip_rate_limit),
-        );
+        )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| ctx.has_authorized_key())
+                .unwrap_or(false)
+        });
 
         let generic_global_limiter = GlobalGenericKeyRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
             GlobalGenericKeyIssuer,
             BasicQuota::per_hour(http_config.add_task_generic_global_hourly_rate_limit),
-        );
+        )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| !ctx.is_generic_key)
+                .unwrap_or(false)
+        });
         let generic_per_ip_limiter = GenericKeyPerIpRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
             GenericKeyPerIpIssuer,
             BasicQuota::per_hour(http_config.add_task_generic_per_ip_hourly_rate_limit),
-        );
+        )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| !ctx.is_generic_key)
+                .unwrap_or(false)
+        });
         let user_id_global_limiter = GlobalUserIDRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
             GlobalUserIDIssuer,
             BasicQuota::per_hour(http_config.add_task_user_id_global_hourly_rate_limit),
-        );
+        )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| ctx.user_id.is_none() || ctx.is_whitelisted_ip)
+                .unwrap_or(false)
+        });
         let user_id_per_user_limiter = UserIDLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
             UserIDLimitIssuer,
             BasicQuota::per_hour(http_config.add_task_user_id_per_user_hourly_rate_limit),
-        );
+        )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| ctx.user_id.is_none() || ctx.is_whitelisted_ip)
+                .unwrap_or(false)
+        });
 
         let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
         let read_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);

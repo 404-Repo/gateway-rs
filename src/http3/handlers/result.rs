@@ -23,6 +23,7 @@ use async_zip::base::write::ZipFileWriter;
 use async_zip::ZipEntryBuilder;
 use futures::io::Cursor;
 use http::HeaderValue;
+use itoa::Buffer;
 use multer::SizeLimit;
 
 const MAX_REASON_LENGTH: u64 = u8::MAX as u64;
@@ -97,8 +98,8 @@ pub async fn get_result_handler(
         )));
     }
 
-    let mut successful_results: Vec<AddTaskResultRequest> =
-        results_vec.drain(..).filter(|r| r.is_success()).collect();
+    results_vec.retain(|r| r.is_success());
+    let mut successful_results = results_vec;
 
     let metrics = depot.require::<Metrics>()?;
 
@@ -195,9 +196,11 @@ pub async fn get_result_handler(
         HeaderValue::from_str(&content_disposition)
             .map_err(|e| ServerError::Internal(format!("Invalid header value: {:?}", e)))?,
     );
+    let mut len_buf = Buffer::new();
+    let len_str = len_buf.format(body.len());
     res.headers_mut().insert(
         "content-length",
-        HeaderValue::from_str(&body.len().to_string())
+        HeaderValue::from_str(len_str)
             .map_err(|e| ServerError::Internal(format!("Invalid header value: {:?}", e)))?,
     );
     res.body(body);
@@ -473,6 +476,7 @@ async fn parse_add_result_request(
     Ok((task_id, task_result, timestamp, signature))
 }
 
+// Add successful result
 // curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
 //   -F id=123e4567-e89b-12d3-a456-426614174001 \
 //   -F signature=signature \
@@ -480,11 +484,14 @@ async fn parse_add_result_request(
 //   -F validator_hotkey=validator_key_123 \
 //   -F miner_hotkey=miner_key_456 \
 //   -F status=success \
-//   -F asset=@/path/to/asset.spz \
-//   -F score=0.95
+//   -F asset=@/path/to/result.spz \
+//   -F score=0.95 \
+//   -F miner_uid=42 \
+//   -F miner_rating=4.5
 
-// curl -X POST https://gateway-eu.404.xyz:4443/add_result \
-//   -F id=123e4567-e89b-12d3-a456-426614174001 \
+// Add failed result
+// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
+//   -F id=987e6543-e21b-45d6-c789-123456789abc \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \
 //   -F validator_hotkey=validator_key_123 \

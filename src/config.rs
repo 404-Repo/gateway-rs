@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use anyhow::Result;
+use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 use std::{fmt, path::Path};
@@ -92,6 +93,10 @@ pub struct HTTPConfig {
     pub add_task_user_id_global_hourly_rate_limit: usize,
     pub add_task_user_id_per_user_hourly_rate_limit: usize,
     pub add_task_basic_per_ip_rate_limit: usize,
+    #[serde(default)]
+    pub add_task_whitelist: HashSet<String>,
+    #[serde(default = "default_company_rate_limiter_max_capacity")]
+    pub company_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,
     pub add_result_rate_limit: usize,
     pub leader_rate_limit: usize,
@@ -132,7 +137,7 @@ pub struct PromptConfig {
 pub struct ImageConfig {
     pub max_width: u32,
     pub max_height: u32,
-    pub max_size_bytes: u64,
+    pub max_size_bytes: usize,
     pub allowed_formats: foldhash::HashSet<String>,
 }
 
@@ -156,6 +161,10 @@ pub struct DbConfig {
 
 fn default_deleted_keys_ttl_minutes() -> u64 {
     60
+}
+
+fn default_company_rate_limiter_max_capacity() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -246,13 +255,16 @@ impl FromStr for LogLevel {
 
 fn mask_string(s: &str, visible: usize) -> String {
     let char_count = s.chars().count();
-    if char_count > visible {
-        let visible_part: String = s.chars().take(visible).collect();
-        let mask: String = "*".repeat(char_count - visible);
-        format!("{}{}", visible_part, mask)
-    } else {
-        "*".repeat(char_count)
+
+    if char_count <= visible {
+        return "*".repeat(char_count);
     }
+
+    let mut result = String::with_capacity(s.len());
+    result.extend(s.chars().take(visible));
+    result.extend(std::iter::repeat_n('*', char_count - visible));
+
+    result
 }
 
 fn mask_key_in_toml(toml_str: &mut String, key: &str, visible: usize) {

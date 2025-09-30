@@ -45,6 +45,8 @@ forward_timeout_sec = 3
 get_timeout_sec = 2
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
+add_task_whitelist = ["172.25.0.1"]
+company_rate_limiter_max_capacity = 4096
 
 [db]
 host = "db"

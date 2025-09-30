@@ -1,14 +1,15 @@
 use crate::api::request::GatewayInfoExt;
-use crate::api::response::LeaderResponse;
+use crate::api::response::{GatewayInfoRef, LeaderResponse};
 use crate::common::log::get_build_information;
 use crate::config::HTTPConfig;
 use crate::http3::error::ServerError;
+use crate::http3::user_rate_limits::RateLimitContext;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use http::HeaderValue;
+use itoa::Buffer;
 use prometheus::Encoder;
 use salvo::prelude::*;
-use uuid::Uuid;
 
 pub const MULTIPART_PREFIX: &str = "multipart/form-data";
 pub const BOUNDARY_PREFIX: &str = "boundary=";
@@ -49,7 +50,16 @@ pub async fn write_handler(
     }
 
     gateway_state
-        .set_gateway_info(gi.into())
+        .set_gateway_info(GatewayInfoRef {
+            node_id: gi.node_id,
+            domain: &gi.domain,
+            ip: &gi.ip,
+            name: &gi.name,
+            http_port: gi.http_port,
+            available_tasks: gi.available_tasks,
+            last_task_acquisition: gi.last_task_acquisition,
+            last_update: gi.last_update,
+        })
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to set gateway info: {:?}", e)))?;
     res.status_code(StatusCode::OK);
@@ -99,7 +109,8 @@ pub async fn id_handler(
 ) -> Result<(), ServerError> {
     let node_id = *depot.require::<usize>()?;
 
-    res.render(node_id.to_string());
+    let mut buffer = Buffer::new();
+    res.render(buffer.format(node_id).to_owned());
     Ok(())
 }
 
@@ -108,27 +119,19 @@ pub async fn api_or_generic_key_check(
     depot: &mut Depot,
     req: &mut Request,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot.require::<GatewayState>()?;
+    let context = depot.require::<RateLimitContext>()?;
 
-    let key_str = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::Unauthorized("Missing API key".to_string()))?;
+    if req.headers().get("x-api-key").is_none() {
+        return Err(ServerError::Unauthorized("Missing API key".to_string()));
+    }
 
-    if key_str.len() != uuid::fmt::Hyphenated::LENGTH {
+    if !context.key_is_uuid {
         return Err(ServerError::BadRequest(
-            "Invalid API key length".to_string(),
+            "Invalid API key format".to_string(),
         ));
     }
 
-    let uuid = Uuid::parse_str(key_str)
-        .map_err(|_| ServerError::BadRequest("API key must be a valid UUID format".to_string()))?;
-
-    if gateway_state.is_valid_api_key(key_str).await
-        || gateway_state.is_generic_key(&uuid).await
-        || gateway_state.is_company_key(key_str).await
-    {
+    if context.has_authorized_key() {
         Ok(())
     } else {
         Err(ServerError::Unauthorized("Invalid API key".to_string()))

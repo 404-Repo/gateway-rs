@@ -15,7 +15,7 @@ To support upcoming partnerships, public API access, and rising traffic, Subnet 
 To run the project with 3 nodes, just execute:
 
 ```bash
-./start-dev-env.sh
+./dev-env.sh
 ```
 
 ## License

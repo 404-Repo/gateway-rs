@@ -29,7 +29,7 @@ pub fn validate_image(
     data: Bytes,
     config: &ImageConfig,
 ) -> Result<ImageValidationResult, ServerError> {
-    if (data.len() as u64) > config.max_size_bytes {
+    if (data.len()) > config.max_size_bytes {
         return Err(ServerError::BadRequest(format!(
             "Image too large: {} bytes (max: {} bytes)",
             data.len(),
