@@ -103,6 +103,10 @@ replication_lag_threshold = 1200
 snapshot_logs_since_last = 1000
 snapshot_max_chunk_size = 131072
 max_in_snapshot_log_to_keep = 1000
+snapshot_dir = "/var/lib/gateway/snapshots"
+max_snapshots_to_keep = 5
+compaction_threshold_bytes = 4194304
+compaction_ops = 4096
 
 [prompt]
 min_len = 3

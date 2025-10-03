@@ -12,7 +12,7 @@ on:
 env:
   SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.89.0"
+  RUST_VERSION: "1.90.0"
 
 jobs:
   check:

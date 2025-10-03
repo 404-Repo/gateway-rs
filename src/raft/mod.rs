@@ -6,6 +6,9 @@ pub mod server;
 pub mod store;
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 use anyhow::bail;
 use anyhow::Result;
 use backon::BackoffBuilder;
@@ -24,6 +27,7 @@ use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -58,13 +62,16 @@ use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
+use tokio_util::sync::CancellationToken;
 
 pub type NodeId = u64;
 pub type LogStore = store::LogStore;
 pub type StateMachineStore = store::StateMachineStore;
 pub type Raft = openraft::Raft<TypeConfig>;
 
-#[derive(Debug, PartialEq)]
+pub(crate) const SNAPSHOT_COMPRESSION_LVL: i32 = 1;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum GatewayMode {
     Bootstrap,
     Vote,
@@ -89,92 +96,13 @@ pub mod typ {
 }
 
 pub struct Gateway {
-    pub _id: NodeId,
-    pub _config: Arc<NodeConfig>,
-    pub server: RServer,
-    pub _gateway_state: GatewayState,
-    pub gateway_info_updater: JoinHandle<()>,
-    pub gateway_leader_change: JoinHandle<()>,
-    pub api_key_validator_updater: JoinHandle<()>,
-    pub task_manager: TaskManager,
-    pub _log_store: LogStore,
-    pub http_server: Http3Server,
-    pub _task_queue: DupQueue<Task>,
-}
-
-async fn get_id_for_endpoint(
-    timeout: Duration,
-    ip: IpAddr,
-    dns_name: &str,
-    sleep_timeout: Duration,
-    skip_verification: bool,
-    retries: usize,
-) -> Result<u64> {
-    let url = format!("https://{}:4443/id", dns_name);
-    let connection_addr = format!("{}:4443", ip);
-
-    let backoff = ConstantBuilder::new()
-        .with_delay(sleep_timeout)
-        .with_max_times(retries)
-        .build();
-
-    let id = (|| async {
-        if let Ok(client) = Http3ClientBuilder::new()
-            .server_domain(dns_name)
-            .server_ip(&connection_addr)
-            .dangerous_skip_verification(skip_verification)
-            .build()
-            .await
-        {
-            if let Ok((status, body)) = client.get(&url, Some(timeout)).await {
-                if status == StatusCode::OK {
-                    let body_str = std::str::from_utf8(&body).map_err(|e| {
-                        anyhow::anyhow!("Failed to convert response body to UTF-8: {}", e)
-                    })?;
-                    let id = body_str
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse ID as u64: {}", e))?;
-                    return Ok(id);
-                }
-            }
-        }
-        Err(anyhow::anyhow!(format!(
-            "Failed to get ID from {}, {}",
-            connection_addr, dns_name
-        )))
-    })
-    .retry(backoff)
-    .await?;
-
-    Ok(id)
-}
-
-pub async fn get_node_ids(
-    timeout: Duration,
-    ips: &[IpAddr],
-    dns_names: &[impl AsRef<str>],
-    sleep_timeout: Duration,
-    skip_verification: bool,
-    retries: usize,
-) -> Result<Vec<u64>> {
-    if ips.len() != dns_names.len() {
-        return Err(anyhow::anyhow!(
-            "The number of endpoints and DNS names must be equal"
-        ));
-    }
-    let futures = ips.iter().zip(dns_names.iter()).map(|(ip, dns_name)| {
-        get_id_for_endpoint(
-            timeout,
-            *ip,
-            dns_name.as_ref(),
-            sleep_timeout,
-            skip_verification,
-            retries,
-        )
-    });
-    let ids = try_join_all(futures).await?;
-    Ok(ids)
+    server: RServer,
+    gateway_info_updater: JoinHandle<()>,
+    gateway_leader_change: JoinHandle<()>,
+    api_key_validator_updater: JoinHandle<()>,
+    task_manager: TaskManager,
+    http_server: Http3Server,
+    shutdown: CancellationToken,
 }
 
 impl Gateway {
@@ -183,6 +111,7 @@ impl Gateway {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
+        shutdown: CancellationToken,
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
@@ -193,7 +122,10 @@ impl Gateway {
         let admin_key = config.http.admin_key.to_string();
 
         loop {
-            sleep(update_interval).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = sleep(update_interval) => {}
+            }
 
             let leader = match gateway_state.leader().await {
                 Some(leader) => leader,
@@ -330,14 +262,23 @@ impl Gateway {
             .await
     }
 
-    pub async fn gateway_leader_change(gateway_state: GatewayState, current_node_id: u64) {
+    pub async fn gateway_leader_change(
+        gateway_state: GatewayState,
+        current_node_id: u64,
+        shutdown: CancellationToken,
+    ) {
         let mut metrics_rx = gateway_state.metrics().await;
         let mut last_leader = None;
         loop {
-            metrics_rx
-                .changed()
-                .await
-                .expect("Failed to listen for metric changes");
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                res = metrics_rx.changed() => {
+                    if res.is_err() {
+                        error!("Failed to listen for metric changes");
+                        break;
+                    }
+                }
+            }
             let current_leader = metrics_rx.borrow().current_leader;
             if current_leader != last_leader {
                 if let Some(leader_id) = current_leader {
@@ -357,10 +298,22 @@ impl Gateway {
             }
         }
     }
+
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.task_manager.abort();
+
+        self.server.abort();
+        self.gateway_info_updater.abort();
+        self.gateway_leader_change.abort();
+        self.api_key_validator_updater.abort();
+        self.http_server.abort();
+    }
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
+        self.shutdown.cancel();
         self.http_server.abort();
         self.gateway_info_updater.abort();
         self.gateway_leader_change.abort();
@@ -368,6 +321,81 @@ impl Drop for Gateway {
         self.server.abort();
         self.task_manager.abort();
     }
+}
+
+async fn get_id_for_endpoint(
+    timeout: Duration,
+    ip: IpAddr,
+    dns_name: &str,
+    sleep_timeout: Duration,
+    skip_verification: bool,
+    retries: usize,
+) -> Result<u64> {
+    let url = format!("https://{}:4443/id", dns_name);
+    let connection_addr = format!("{}:4443", ip);
+
+    let backoff = ConstantBuilder::new()
+        .with_delay(sleep_timeout)
+        .with_max_times(retries)
+        .build();
+
+    let id = (|| async {
+        if let Ok(client) = Http3ClientBuilder::new()
+            .server_domain(dns_name)
+            .server_ip(&connection_addr)
+            .dangerous_skip_verification(skip_verification)
+            .build()
+            .await
+        {
+            if let Ok((status, body)) = client.get(&url, Some(timeout)).await {
+                if status == StatusCode::OK {
+                    let body_str = std::str::from_utf8(&body).map_err(|e| {
+                        anyhow::anyhow!("Failed to convert response body to UTF-8: {}", e)
+                    })?;
+                    let id = body_str
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("Failed to parse ID as u64: {}", e))?;
+                    return Ok(id);
+                }
+            }
+        }
+        Err(anyhow::anyhow!(format!(
+            "Failed to get ID from {}, {}",
+            connection_addr, dns_name
+        )))
+    })
+    .retry(backoff)
+    .await?;
+
+    Ok(id)
+}
+
+pub async fn get_node_ids(
+    timeout: Duration,
+    ips: &[IpAddr],
+    dns_names: &[impl AsRef<str>],
+    sleep_timeout: Duration,
+    skip_verification: bool,
+    retries: usize,
+) -> Result<Vec<u64>> {
+    if ips.len() != dns_names.len() {
+        return Err(anyhow::anyhow!(
+            "The number of endpoints and DNS names must be equal"
+        ));
+    }
+    let futures = ips.iter().zip(dns_names.iter()).map(|(ip, dns_name)| {
+        get_id_for_endpoint(
+            timeout,
+            *ip,
+            dns_name.as_ref(),
+            sleep_timeout,
+            skip_verification,
+            retries,
+        )
+    });
+    let ids = try_join_all(futures).await?;
+    Ok(ids)
 }
 
 fn build_task_queue(cfg: &NodeConfig) -> DupQueue<Task> {
@@ -520,18 +548,34 @@ async fn init_membership(
     Ok(())
 }
 
-pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result<Gateway> {
+pub async fn start_gateway(
+    mode: GatewayMode,
+    config: Arc<NodeConfig>,
+    shutdown: CancellationToken,
+) -> Result<Gateway> {
     init_crypto_provider()?;
 
-    let task_queue = build_task_queue(&config);
-    let raft_config = build_raft_config(&config)?;
-
-    let log_store = LogStore::default();
-    let state_machine_store = Arc::new(StateMachineStore::default());
     let clients_map = Arc::new(scc::HashMap::with_capacity_and_hasher(
         config.network.node_dns_names.len(),
         RandomState::default(),
     ));
+
+    let task_queue = build_task_queue(&config);
+    let raft_config = build_raft_config(&config)?;
+    let gateway_shutdown = shutdown.child_token();
+
+    let snapshot_dir = PathBuf::from(&config.raft.snapshot_dir);
+    let log_store_path = snapshot_dir.join("log_store.bin");
+    let log_store = LogStore::with_persistence_and_thresholds(
+        &log_store_path,
+        config.raft.compaction_threshold_bytes,
+        config.raft.compaction_ops,
+    )?;
+    let state_machine_store = Arc::new(StateMachineStore::with_persistence(
+        &snapshot_dir,
+        config.raft.max_snapshots_to_keep,
+        Some(log_store_path.clone()),
+    )?);
     let raft = Raft::new(
         config.network.node_id,
         Arc::clone(&raft_config),
@@ -566,8 +610,37 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         cert_tuple,
         raft.clone(),
         config.rserver.clone(),
+        gateway_shutdown.clone(),
     )
     .await?;
+
+    let peer_dns_names: Vec<_> = {
+        let mut names = config
+            .network
+            .node_dns_names
+            .iter()
+            .filter(|&name| name != &config.network.domain)
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+
+    let node_ips = if mode == GatewayMode::Single || peer_dns_names.is_empty() {
+        Vec::new()
+    } else {
+        lookup_hosts_ips(&peer_dns_names).await?
+    };
+
+    if mode != GatewayMode::Single && !node_ips.is_empty() {
+        setup_remote_clients(
+            config.as_ref(),
+            &node_ips,
+            &peer_dns_names,
+            clients_map.clone(),
+        )
+        .await?;
+    }
 
     let last_task_acquisition = Arc::new(AtomicU64::from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -595,8 +668,10 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     )?;
     let api_key_validator = Arc::new(api_key_validator);
 
-    let api_key_validator_updater =
-        tokio::spawn(ApiKeyValidator::run(Arc::clone(&api_key_validator)));
+    let api_key_validator_updater = tokio::spawn(ApiKeyValidator::run(
+        Arc::clone(&api_key_validator),
+        gateway_shutdown.clone(),
+    ));
     let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
 
     let task_manager = TaskManager::new(
@@ -631,6 +706,7 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         gateway_state.clone(),
         task_queue.clone(),
         metrics.clone(),
+        gateway_shutdown.clone(),
     )
     .await
     {
@@ -638,38 +714,19 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
         Err(e) => bail!("Failed to start HTTP3 server: {:?}", e),
     };
 
-    let peer_dns_names: Vec<_> = {
-        let mut names = config
-            .network
-            .node_dns_names
-            .iter()
-            .filter(|&name| name != &config.network.domain)
-            .cloned()
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
-
-    let node_ips = if mode == GatewayMode::Single || peer_dns_names.is_empty() {
-        vec![]
+    let node_ids = if node_ips.is_empty() {
+        Vec::new()
     } else {
-        lookup_hosts_ips(&peer_dns_names).await?
+        get_node_ids(
+            Duration::from_secs(config.http.get_timeout_sec),
+            &node_ips,
+            &peer_dns_names,
+            Duration::from_secs(config.network.node_id_discovery_sleep),
+            config.cert.dangerous_skip_verification,
+            config.network.node_id_discovery_retries,
+        )
+        .await?
     };
-
-    let node_ids = get_node_ids(
-        Duration::from_secs(config.http.get_timeout_sec),
-        &node_ips,
-        &peer_dns_names,
-        Duration::from_secs(config.network.node_id_discovery_sleep),
-        config.cert.dangerous_skip_verification,
-        config.network.node_id_discovery_retries,
-    )
-    .await?;
-
-    // If not in single-node mode, create remote client connections.
-    if mode != GatewayMode::Single {
-        setup_remote_clients(&config, &node_ips, &peer_dns_names, clients_map.clone()).await?;
-    }
 
     let node_id = config.network.node_id;
     info!("Starting node {} with mode {:?}", node_id, mode);
@@ -689,25 +746,23 @@ pub async fn start_gateway(mode: GatewayMode, config: Arc<NodeConfig>) -> Result
     let gateway_info_updater = tokio::spawn(Gateway::gateway_info_updater(
         Arc::clone(&config),
         gateway_state.clone(),
-        task_queue.clone(),
-        last_task_acquisition.clone(),
+        task_queue,
+        last_task_acquisition,
+        gateway_shutdown.clone(),
     ));
     let gateway_leader_change = tokio::spawn(Gateway::gateway_leader_change(
-        gateway_state.clone(),
+        gateway_state,
         node_id,
+        gateway_shutdown.clone(),
     ));
 
     Ok(Gateway {
-        _config: config,
-        _id: node_id,
         server,
-        _gateway_state: gateway_state,
         gateway_info_updater,
         gateway_leader_change,
         api_key_validator_updater,
         task_manager,
-        _log_store: log_store,
         http_server,
-        _task_queue: task_queue,
+        shutdown: gateway_shutdown,
     })
 }
