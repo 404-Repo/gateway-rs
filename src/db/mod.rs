@@ -12,7 +12,7 @@ use std::io;
 use std::io::BufReader;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::fs;
+use tokio::{fs, task::JoinHandle};
 use tokio_postgres::{types::ToSql, Client, Config, Error, Row, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
@@ -76,6 +76,21 @@ pub struct Database {
     client: AtomicOwned<Arc<Client>>,
     config: PostgresConnectionConfigOwned,
     prepared: SccHashMap<StmtKey, Statement, RandomState>,
+    connection_task: AtomicOwned<AbortOnDropJoinHandle>,
+}
+
+struct AbortOnDropJoinHandle(JoinHandle<()>);
+
+impl AbortOnDropJoinHandle {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortOnDropJoinHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 pub struct DatabaseBuilder {
@@ -89,7 +104,9 @@ pub struct DatabaseBuilder {
     dbname: Option<String>,
 }
 
-async fn connect_postgres(config: &PostgresConnectionConfig<'_>) -> Result<Arc<Client>> {
+async fn connect_postgres(
+    config: &PostgresConnectionConfig<'_>,
+) -> Result<(Arc<Client>, JoinHandle<()>)> {
     let ca_cert_bytes = fs::read(config.sslrootcert_path).await.map_err(|e| {
         anyhow!(
             "Failed to read CA certificate at {}: {}",
@@ -144,13 +161,13 @@ async fn connect_postgres(config: &PostgresConnectionConfig<'_>) -> Result<Arc<C
         .await
         .map_err(|e| anyhow!("Failed to connect to PostgreSQL using rustls: {}", e))?;
 
-    tokio::spawn(async move {
+    let connection_task = tokio::spawn(async move {
         if let Err(e) = connection.await {
             error!("Database connection error: {}", e);
         }
     });
 
-    Ok(Arc::new(client))
+    Ok((Arc::new(client), connection_task))
 }
 
 impl DatabaseBuilder {
@@ -222,7 +239,7 @@ impl DatabaseBuilder {
         let dbname = Self::require_nonempty(self.dbname, "Database name")?;
         let port = self.port.ok_or_else(|| anyhow!("Port is required"))?;
 
-        let client = connect_postgres(&PostgresConnectionConfig {
+        let (client, connection_task) = connect_postgres(&PostgresConnectionConfig {
             host: &host,
             port,
             user: &user,
@@ -247,6 +264,7 @@ impl DatabaseBuilder {
                 sslrootcert_path,
             },
             prepared: SccHashMap::with_capacity_and_hasher(16, RandomState::default()),
+            connection_task: AtomicOwned::new(AbortOnDropJoinHandle::new(connection_task)),
         };
 
         db.prepare_all().await?;
@@ -449,7 +467,21 @@ SELECT
     }
 
     pub async fn reconnect(&self) -> Result<()> {
-        let new_client = connect_postgres(&self.config.borrow()).await?;
+        let (new_client, new_connection_task) = connect_postgres(&self.config.borrow()).await?;
+
+        if let Some(prev_task) = self
+            .connection_task
+            .swap(
+                (
+                    Some(Owned::new(AbortOnDropJoinHandle::new(new_connection_task))),
+                    Tag::None,
+                ),
+                Ordering::AcqRel,
+            )
+            .0
+        {
+            drop(prev_task);
+        }
 
         let _old = self
             .client
@@ -607,5 +639,17 @@ SELECT
             .ok_or_else(|| anyhow!("Server time query returned no rows"))?;
         let dt: DateTime<Utc> = row.get("server_time_utc");
         Ok(dt)
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .connection_task
+            .swap((None, Tag::None), Ordering::AcqRel)
+            .0
+        {
+            drop(handle);
+        }
     }
 }

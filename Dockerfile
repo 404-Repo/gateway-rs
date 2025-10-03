@@ -1,12 +1,15 @@
-FROM rust:1.89.0-alpine3.22 AS builder
+FROM rust:1.90.0-alpine3.22 AS builder
 
 RUN apk add --no-cache build-base alpine-sdk musl-dev openssl linux-headers
-RUN apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community --no-cache mold>=2.39.1
 
 WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+RUN --mount=type=bind,source=.git,target=/app/.git,ro \
+    sh -c "mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo fetch --locked && rm -rf src"
+
 COPY . /app
 
-RUN cargo build --release
+RUN --mount=type=bind,source=.git,target=/app/.git,ro cargo build --release
 
 RUN mkdir -p /app/certs && \
     openssl ecparam -name prime256v1 -genkey -noout -out /app/certs/key.pem && \

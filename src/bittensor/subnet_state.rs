@@ -13,6 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use super::crypto::{ss58_decode, AccountId32};
@@ -69,35 +70,42 @@ impl SubnetState {
         block: Option<u64>,
         poll_interval: Duration,
         wss_max_message_size: usize,
+        shutdown: CancellationToken,
     ) -> Self {
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
             let map = HashMap::with_capacity_and_hasher(256, RandomState::default());
             let join_handle = tokio::spawn({
                 let weak = weak.clone();
                 let wss_bittensor = wss_bittensor.clone();
+                let shutdown = shutdown.child_token();
                 async move {
                     while let Some(inner) = weak.upgrade() {
                         info!("Updating subnet state {} via WSS {}", netuid, wss_bittensor);
-                        match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size)
-                            .await
-                        {
-                            Ok(new_state) => {
-                                let map = &inner.map;
-                                map.retain_async(|k, _| new_state.contains_key(k)).await;
-                                for (hotkey, data) in new_state {
-                                    map.entry_async(hotkey)
-                                        .await
-                                        .and_modify(|v| {
-                                            if *v != data {
-                                                *v = data.clone()
-                                            }
-                                        })
-                                        .or_insert(data);
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = async {
+                                match get_subnet_state(&wss_bittensor, netuid, block, wss_max_message_size)
+                                    .await
+                                {
+                                    Ok(new_state) => {
+                                        let map = &inner.map;
+                                        map.retain_async(|k, _| new_state.contains_key(k)).await;
+                                        for (hotkey, data) in new_state {
+                                            map.entry_async(hotkey)
+                                                .await
+                                                .and_modify(|v| {
+                                                    if *v != data {
+                                                        *v = data.clone()
+                                                    }
+                                                })
+                                                .or_insert(data);
+                                        }
+                                    }
+                                    Err(e) => error!("Error updating subnet state: {:?}", e),
                                 }
-                            }
-                            Err(e) => error!("Error updating subnet state: {:?}", e),
+                                tokio::time::sleep(poll_interval).await;
+                            } => {}
                         }
-                        tokio::time::sleep(poll_interval).await;
                     }
                 }
             });
@@ -277,6 +285,7 @@ mod tests {
     use crate::bittensor::{crypto::ss58_decode, subnet_state::SubnetState};
     use rustls::crypto::CryptoProvider;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     #[ignore]
@@ -300,6 +309,7 @@ mod tests {
             block,
             poll_interval,
             2097152,
+            CancellationToken::new(),
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;

@@ -33,6 +33,7 @@ use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use std::collections::HashSet;
 use std::net::IpAddr;
+use tokio_util::sync::CancellationToken;
 
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
@@ -46,6 +47,7 @@ impl Http3Server {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         metrics: Metrics,
+        shutdown: CancellationToken,
     ) -> Result<Self> {
         let addr_str = format!("{}:{}", config.network.bind_ip, config.http.port);
         let addr: SocketAddr = addr_str
@@ -58,6 +60,7 @@ impl Http3Server {
             None,
             Duration::from_secs(config.http.subnet_poll_interval_sec),
             config.http.wss_max_message_size,
+            shutdown.child_token(),
         );
 
         let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
@@ -105,7 +108,10 @@ impl Http3Server {
                 .join(tcp_listener)
                 .bind()
                 .await;
-            Server::new(acceptor).serve(service).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {},
+                _ = Server::new(acceptor).serve(service) => {},
+            }
         });
 
         Ok(Self {

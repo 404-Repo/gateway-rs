@@ -13,7 +13,7 @@ use tracing::{error, info};
 use super::Raft;
 
 pub struct RServer {
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
     _server_config: ServerConfig,
     accept_task: JoinHandle<()>,
     cancel_token: CancellationToken,
@@ -25,6 +25,7 @@ impl RServer {
         cert: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
         raft: Raft,
         rserver_cfg: RServerConfig,
+        shutdown: CancellationToken,
     ) -> Result<Self> {
         let mut server_config = match cert {
             Some((cert_chain, key)) => {
@@ -53,12 +54,12 @@ impl RServer {
 
         info!("RServer QUIC server listening on {}", bind_addr);
 
-        let cancel_token = CancellationToken::new();
+        let cancel_token = shutdown.child_token();
         let accept_task =
             Self::spawn_accept_task(endpoint.clone(), raft, rserver_cfg, cancel_token.clone());
 
         Ok(Self {
-            _endpoint: endpoint,
+            endpoint,
             _server_config: server_config,
             accept_task,
             cancel_token,
@@ -169,6 +170,7 @@ impl RServer {
     pub fn abort(&self) {
         self.cancel_token.cancel();
         self.accept_task.abort();
+        self.endpoint.close(0u32.into(), b"shutdown");
     }
 }
 
@@ -226,7 +228,7 @@ mod tests {
         let pcfg = RServerConfig::default();
 
         let addr = "127.0.0.1:4444";
-        let _server = RServer::new(addr, None, raft, pcfg).await?;
+        let _server = RServer::new(addr, None, raft, pcfg, CancellationToken::new()).await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -244,7 +246,8 @@ mod tests {
         let pcfg = RServerConfig::default();
 
         let addr = "127.0.0.1:4445";
-        let _server = RServer::new(addr, None, raft, pcfg.clone()).await?;
+        let _server =
+            RServer::new(addr, None, raft, pcfg.clone(), CancellationToken::new()).await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
