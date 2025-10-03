@@ -11,7 +11,7 @@ use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::{task::JoinHandle, time::timeout};
 use tracing::{error, info};
 
 use crate::common::cert::SkipServerVerification;
@@ -87,11 +87,26 @@ struct Inner {
     server_ip: String,
     quinn_conn_handle: AtomicOwned<QuinnConnection>,
     connection_handle: AtomicOwned<h3::client::SendRequest<OpenStreams, Bytes>>,
+    driver_task: AtomicOwned<AbortOnDropHandle>,
 }
 
 #[derive(Clone)]
 pub struct Http3Client {
     inner: Arc<Inner>,
+}
+
+struct AbortOnDropHandle(JoinHandle<()>);
+
+impl AbortOnDropHandle {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Http3Client {
@@ -145,10 +160,11 @@ impl Http3Client {
             server_ip: server_ip.to_string(),
             quinn_conn_handle: quinn_handle,
             connection_handle: handle,
+            driver_task: AtomicOwned::null(),
         });
 
         let inner_clone = inner.clone();
-        tokio::spawn(async move {
+        let driver = tokio::spawn(async move {
             let err: ConnectionError = future::poll_fn(|cx| driver.poll_close(cx)).await;
             if !err.is_h3_no_error() {
                 error!("Http3 client driver error: {:?}", err);
@@ -157,6 +173,17 @@ impl Http3Client {
                 .connection_handle
                 .swap((None, Tag::None), AcqRel);
         });
+
+        if let Some(prev) = inner
+            .driver_task
+            .swap(
+                (Some(Owned::new(AbortOnDropHandle::new(driver))), Tag::None),
+                AcqRel,
+            )
+            .0
+        {
+            drop(prev);
+        }
 
         Ok(Http3Client { inner })
     }
@@ -206,7 +233,7 @@ impl Http3Client {
             );
 
             let inner_clone = self.inner.clone();
-            tokio::spawn(async move {
+            let driver_task = tokio::spawn(async move {
                 let err: ConnectionError = future::poll_fn(|cx| driver.poll_close(cx)).await;
                 if !err.is_h3_no_error() {
                     error!("Http3 client driver error: {:?}", err);
@@ -215,6 +242,21 @@ impl Http3Client {
                     .connection_handle
                     .swap((None, Tag::None), AcqRel);
             });
+
+            if let Some(prev) = self
+                .inner
+                .driver_task
+                .swap(
+                    (
+                        Some(Owned::new(AbortOnDropHandle::new(driver_task))),
+                        Tag::None,
+                    ),
+                    AcqRel,
+                )
+                .0
+            {
+                drop(prev);
+            }
 
             let _ = self
                 .inner
