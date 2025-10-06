@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-cd dev-env
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOCKERFILE_PATH="$SCRIPT_DIR/Dockerfile"
+
+cd "$SCRIPT_DIR/dev-env"
 
 if [ "$1" = "stop" ]; then
     echo "Stopping all containers..."
@@ -7,11 +11,11 @@ if [ "$1" = "stop" ]; then
     docker-compose down
     echo "All containers stopped."
 elif [ "$1" = "single" ] || [ "$1" = "1" ]; then
-    docker build -t gateway:latest .
+    docker build -t gateway:latest -f "$DOCKERFILE_PATH" "$SCRIPT_DIR"
     echo "Starting in single node mode..."
     docker-compose -f docker-compose-single-node.yaml up
 else
     echo "Starting in multi-node mode..."
-    docker build -t gateway:latest .
+    docker build -t gateway:latest -f "$DOCKERFILE_PATH" "$SCRIPT_DIR"
     docker-compose up
 fi

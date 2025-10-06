@@ -1,12 +1,3 @@
-use clap::Parser;
-use clap::ValueEnum;
-use common::log::{init_tracing, log_app_config, log_build_information};
-use std::{env, sync::Arc, time::Duration};
-
-use config::{read_config, NodeConfig};
-use raft::{start_gateway, GatewayMode};
-use tracing::{error, info, warn};
-
 mod api;
 mod bittensor;
 mod common;
@@ -17,10 +8,37 @@ mod metrics;
 mod protocol;
 mod raft;
 
-const RESTART_DELAY_SECS: u64 = 2;
+use clap::Parser;
+use clap::ValueEnum;
+use common::log::{init_tracing, log_app_config, log_build_information};
+use std::{env, sync::Arc, time::Duration};
+
+use config::{read_config, NodeConfig};
+use raft::{start_gateway, GatewayMode};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const RESTART_DELAY_SECS: u64 = 5;
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => res,
+        _ = sigterm.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "Gateway", version = "1.0", about = "Gateway")]
@@ -60,18 +78,36 @@ async fn main() {
     let max_attempts = node_config.basic.max_restart_attempts;
     let mut attempts = 0;
 
-    loop {
-        let gateway_mode = match cli.mode {
-            Mode::Bootstrap => GatewayMode::Bootstrap,
-            Mode::Vote => GatewayMode::Vote,
-            Mode::Single => GatewayMode::Single,
-        };
-        let result = start_gateway(gateway_mode, Arc::clone(&node_config)).await;
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
 
-        match result {
-            Ok(_gateway) => {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("Received CTRL+C, shutting down...");
+    let signal_listener = tokio::spawn(async move {
+        match wait_for_shutdown_signal().await {
+            Ok(()) => info!("Received shutdown signal, shutting down..."),
+            Err(e) => error!("Error while waiting for shutdown signal: {e}"),
+        }
+        signal_token.cancel();
+    });
+
+    let gateway_mode = match cli.mode {
+        Mode::Bootstrap => GatewayMode::Bootstrap,
+        Mode::Vote => GatewayMode::Vote,
+        Mode::Single => GatewayMode::Single,
+    };
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        match start_gateway(gateway_mode, Arc::clone(&node_config), shutdown.clone()).await {
+            Ok(gateway) => {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                }
+
+                gateway.shutdown();
+                drop(gateway);
                 break;
             }
             Err(e) => {
@@ -86,12 +122,24 @@ async fn main() {
                         "Reached maximum restart attempts ({}). Stopping.",
                         max_attempts
                     );
+                    shutdown.cancel();
                     break;
-                } else {
-                    warn!("Retrying...");
-                    tokio::time::sleep(Duration::from_secs(RESTART_DELAY_SECS)).await;
+                }
+
+                warn!("Retrying...");
+                let sleep = tokio::time::sleep(Duration::from_secs(RESTART_DELAY_SECS));
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = sleep => {}
                 }
             }
         }
+    }
+
+    if !signal_listener.is_finished() {
+        signal_listener.abort();
+    }
+    if let Err(e) = signal_listener.await {
+        error!("Shutdown listener failed: {e}");
     }
 }

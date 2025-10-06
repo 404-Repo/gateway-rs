@@ -6,6 +6,7 @@ use moka::future::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -83,13 +84,17 @@ impl ApiKeyValidator {
         })
     }
 
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let mut interval = tokio::time::interval(self.update_interval);
         loop {
-            if let Err(e) = self.update_hashes().await {
-                error!("Error updating keys: {:?}", e);
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(e) = self.update_hashes().await {
+                        error!("Error updating keys: {:?}", e);
+                    }
+                }
             }
-            interval.tick().await;
         }
     }
 

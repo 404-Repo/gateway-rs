@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use backon::{BackoffBuilder, ConstantBuilder, Retryable};
 use quinn::{Connection, Endpoint, IdleTimeout};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
@@ -16,6 +17,8 @@ use crate::{
 
 const DEFAULT_MAX_IDLE_TIMEOUT_SEC: u64 = 4;
 const DEFAULT_KEEP_ALIVE_INTERVAL_SEC: u64 = 1;
+const CONNECT_RETRY_ATTEMPTS: usize = 3;
+const CONNECT_RETRY_DELAY_MS: u64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct RClientBuilder {
@@ -26,6 +29,28 @@ pub struct RClientBuilder {
     max_idle_timeout_sec: Option<u64>,
     keep_alive_interval: Option<u64>,
     protocol_cfg: Option<RServerConfig>,
+}
+
+async fn connect_with_retry(
+    endpoint: &Endpoint,
+    remote_addr: SocketAddr,
+    server_name: &str,
+) -> Result<Connection> {
+    let backoff = ConstantBuilder::new()
+        .with_delay(Duration::from_millis(CONNECT_RETRY_DELAY_MS))
+        .with_max_times(CONNECT_RETRY_ATTEMPTS)
+        .build();
+
+    (|| async {
+        let connecting = endpoint
+            .connect(remote_addr, server_name)
+            .map_err(|e| anyhow!("Failed to start connection to {remote_addr}: {e}"))?;
+        connecting
+            .await
+            .map_err(|e| anyhow!("Failed to establish connection to {remote_addr}: {e}"))
+    })
+    .retry(backoff)
+    .await
 }
 
 impl RClientBuilder {
@@ -162,10 +187,7 @@ impl RClient {
         let mut endpoint = Endpoint::client(local_bind_addr)?;
         endpoint.set_default_client_config(client_cfg.clone());
 
-        let conn = endpoint
-            .connect(remote_addr, server_name)?
-            .await
-            .map_err(|e| anyhow!("Failed to connect: {e}"))?;
+        let conn = connect_with_retry(&endpoint, remote_addr, server_name).await?;
         info!(
             "Successfully established connection to {} with id: {}",
             remote_addr,
@@ -239,11 +261,16 @@ impl RClient {
                 .ok_or_else(|| anyhow!("Endpoint vanished unexpectedly after swap"))?
         };
 
-        let new_conn = ep_loaded
+        let connecting = ep_loaded
             .connect(self.remote_addr, &self.server_name)
-            .map_err(|e| anyhow!("Failed to connect to {}: {e}", self.remote_addr))?
-            .await
-            .map_err(|e| anyhow!("Async connect to {} failed: {e}", self.remote_addr))?;
+            .map_err(|e| anyhow!("Failed to start connection to {}: {}", self.remote_addr, e))?;
+        let new_conn = connecting.await.map_err(|e| {
+            anyhow!(
+                "Failed to establish connection to {}: {}",
+                self.remote_addr,
+                e
+            )
+        })?;
 
         info!(
             "RClient reconnected successfully to {} with id {}",
@@ -299,6 +326,7 @@ mod tests {
     use foldhash::fast::RandomState;
     use openraft::Config;
     use std::sync::{Arc, Once};
+    use tokio_util::sync::CancellationToken;
 
     static CRYPTO_INIT: Once = Once::new();
 
@@ -346,7 +374,14 @@ mod tests {
         let pcfg = RServerConfig::default();
 
         let server_addr = "127.0.0.1:4446";
-        let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
+        let _server = RServer::new(
+            server_addr,
+            None,
+            raft,
+            pcfg.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -371,7 +406,14 @@ mod tests {
         let pcfg = RServerConfig::default();
 
         let server_addr = "127.0.0.1:4447";
-        let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
+        let _server = RServer::new(
+            server_addr,
+            None,
+            raft,
+            pcfg.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -403,7 +445,14 @@ mod tests {
         let pcfg = RServerConfig::default();
 
         let server_addr = "127.0.0.1:4448";
-        let _server = RServer::new(server_addr, None, raft, pcfg.clone()).await?;
+        let _server = RServer::new(
+            server_addr,
+            None,
+            raft,
+            pcfg.clone(),
+            CancellationToken::new(),
+        )
+        .await?;
 
         // Give the server some time to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

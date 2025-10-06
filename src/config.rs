@@ -77,6 +77,14 @@ pub struct RaftConfig {
     pub snapshot_logs_since_last: u64,
     pub snapshot_max_chunk_size: u64,
     pub max_in_snapshot_log_to_keep: u64,
+    #[serde(default = "default_snapshot_dir")]
+    pub snapshot_dir: String,
+    #[serde(default = "default_max_snapshots_to_keep")]
+    pub max_snapshots_to_keep: usize,
+    #[serde(default = "default_compaction_threshold_bytes")]
+    pub compaction_threshold_bytes: u64,
+    #[serde(default = "default_compaction_ops")]
+    pub compaction_ops: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,6 +172,22 @@ fn default_deleted_keys_ttl_minutes() -> u64 {
 }
 
 fn default_company_rate_limiter_max_capacity() -> usize {
+    4096
+}
+
+fn default_snapshot_dir() -> String {
+    "data/snapshots".to_string()
+}
+
+fn default_max_snapshots_to_keep() -> usize {
+    5
+}
+
+fn default_compaction_threshold_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+fn default_compaction_ops() -> u64 {
     4096
 }
 

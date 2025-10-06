@@ -13,7 +13,7 @@ salvo = { version = "0.84.1", features = [
     "size-limiter",
     "compression",
 ] }
-spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "d1c7e6dc186450d620adeea7b64a227965df7015", features = ["async"]}
+spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "c0c1a391caacea2e1bd1725d1d4b2d6813609f38", features = ["async"]}
 multer = "3.1.0"
 tokio = { version = "1.47.1", features = [
     "rt-multi-thread",
@@ -57,8 +57,8 @@ anyhow = "1.0.100"
 bytes = "1.10.1"
 rcgen = { version = "0.14.4", features = ["pem"] }
 foldhash = "0.2.0"
-scc = "3.1.2"
-sdd = "4.1.1"
+scc = "3.3.1"
+sdd = "4.1.2"
 hex = "0.4.3"
 schnorrkel = "0.11.5"
 base64 = "0.22.1"
@@ -67,14 +67,18 @@ blake2 = "0.10.6"
 bs58 = "0.5.1"
 itertools = "0.14.0"
 prometheus = "0.14.0"
-blake3 = "1.5.3"
+blake3 = "1.8.2"
 moka = { version = "0.12.11", features = ["sync"] }
 mimalloc = { version = "0.1.48", default-features = false }
-regex = "1.11.2"
+regex = "1.11.3"
 image = "0.25.8"
 base64-simd = "0.8"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 itoa = "1.0.15"
+zstd = "0.13"
+tempfile = "3.13.0"
+
+[dev-dependencies]
 
 [build-dependencies]
 anyhow = "1.0.100"
