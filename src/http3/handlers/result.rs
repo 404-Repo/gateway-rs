@@ -525,10 +525,16 @@ pub async fn add_result_handler(
     let manager = gateway_state.task_manager();
     let metrics = depot.require::<Metrics>()?;
 
-    let task_description = if let Some(prompt) = manager.get_prompt(task_id).await {
-        format!("prompt: '{}'", prompt)
+    let (task_description, task_kind) = if let Some(prompt) = manager.get_prompt(task_id).await {
+        (
+            format!("prompt: '{}'", prompt),
+            crate::metrics::TaskKind::TextTo3D,
+        )
     } else if let Some(_image_data) = manager.get_image(task_id).await {
-        "image task".to_string()
+        (
+            "image task".to_string(),
+            crate::metrics::TaskKind::ImageTo3D,
+        )
     } else {
         return Err(ServerError::Internal(
             "Logic error: task has neither prompt nor image data".to_string(),
@@ -549,6 +555,7 @@ pub async fn add_result_handler(
         metrics
             .inc_task_completed(&task_result.validator_hotkey)
             .await;
+        metrics.inc_task_completed_kind(task_kind);
     } else {
         let reason = task_result.reason.as_deref().unwrap_or("Unknown failure");
         warn!(
