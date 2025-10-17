@@ -14,6 +14,22 @@ pub struct MetricsEntry {
     pub best_results_total: Gauge,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum TaskKind {
+    TextTo3D,
+    ImageTo3D,
+}
+
+impl TaskKind {
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            TaskKind::TextTo3D => "txt3d",
+            TaskKind::ImageTo3D => "img3d",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Metrics {
     inner: Arc<MetricsInner>,
@@ -24,8 +40,11 @@ struct MetricsInner {
 
     registry: Registry,
 
+    queue_len: Gauge,
     queue_time_avg: Gauge,
     queue_time_max: Gauge,
+
+    completed_tasks_by_kind: CounterVec,
 
     completion_time_avg: GaugeVec,
     completion_time_max: GaugeVec,
@@ -42,9 +61,10 @@ impl Metrics {
     pub fn new(alpha: f64) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
-        // Global queue‐time metrics
+        let queue_len = Gauge::with_opts(opts!("queue_len", "Current queue length"))?;
         let queue_time_avg = Gauge::with_opts(opts!("queue_time_avg", "EWMA of queue time"))?;
         let queue_time_max = Gauge::with_opts(opts!("queue_time_max", "Max seen queue time"))?;
+        registry.register(Box::new(queue_len.clone()))?;
         registry.register(Box::new(queue_time_avg.clone()))?;
         registry.register(Box::new(queue_time_max.clone()))?;
 
@@ -52,6 +72,13 @@ impl Metrics {
         let completion_time_avg = GaugeVec::new(
             Opts::new("completion_time_avg", "EWMA of completion time for task"),
             &["validator"],
+        )?;
+        let completed_tasks_by_kind = CounterVec::new(
+            Opts::new(
+                "tasks_completed_by_kind_total",
+                "Total completed tasks partitioned by kind",
+            ),
+            &["kind"],
         )?;
         let completion_time_max = GaugeVec::new(
             Opts::new("completion_time_max", "Max completion time for task"),
@@ -87,6 +114,7 @@ impl Metrics {
         registry.register(Box::new(completion_time_avg.clone()))?;
         registry.register(Box::new(completion_time_max.clone()))?;
         registry.register(Box::new(completed_tasks.clone()))?;
+        registry.register(Box::new(completed_tasks_by_kind.clone()))?;
         registry.register(Box::new(failed_tasks.clone()))?;
         registry.register(Box::new(timeout_failed_tasks.clone()))?;
         registry.register(Box::new(tasks_received.clone()))?;
@@ -95,8 +123,10 @@ impl Metrics {
         let inner = MetricsInner {
             alpha,
             registry,
+            queue_len,
             queue_time_avg,
             queue_time_max,
+            completed_tasks_by_kind,
             completion_time_avg,
             completion_time_max,
             completed_tasks,
@@ -114,6 +144,17 @@ impl Metrics {
 
     pub fn registry(&self) -> &Registry {
         &self.inner.registry
+    }
+
+    pub fn set_queue_len(&self, len: usize) {
+        self.inner.queue_len.set(len as f64);
+    }
+
+    pub fn inc_task_completed_kind(&self, kind: TaskKind) {
+        self.inner
+            .completed_tasks_by_kind
+            .with_label_values(&[kind.label()])
+            .inc();
     }
 
     async fn get_entry(&self, key: &str) -> Arc<MetricsEntry> {

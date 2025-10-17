@@ -198,6 +198,7 @@ pub async fn add_task_handler(
     }
 
     let queue = depot.require::<DupQueue<Task>>()?;
+    let metrics = depot.require::<Metrics>()?;
     let http_cfg = depot.require::<HTTPConfig>()?;
     if queue.len() >= http_cfg.max_task_queue_len {
         return Err(ServerError::Internal("Task queue is full".to_string()));
@@ -234,6 +235,7 @@ pub async fn add_task_handler(
     };
 
     queue.push(task.clone());
+    metrics.set_queue_len(queue.len());
 
     info!(
         "A new task has been pushed with ID: {}, {}",
@@ -305,6 +307,8 @@ pub async fn get_tasks_handler(
             metrics.record_queue_time(dur.as_secs_f64());
         }
     }
+
+    metrics.set_queue_len(queue.len());
 
     gateway_state.update_task_acquisition().map_err(|e| {
         ServerError::Internal(format!(
