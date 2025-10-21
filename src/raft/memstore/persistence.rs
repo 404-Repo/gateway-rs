@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use openraft::{Entry, LogId, RaftLogId, Vote};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::raft::{NodeId, TypeConfig};
 use std::fs::OpenOptions;
@@ -207,7 +208,7 @@ impl TypeConfigLogPersistence {
                     return Ok(Some(persisted));
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    warn!(
                         error = %err,
                         path = %self.path.display(),
                         "failed to load primary log store file; will probe archives"
@@ -262,7 +263,7 @@ impl TypeConfigLogPersistence {
         for archive_path in archives.into_iter() {
             match Self::read_log_store_file(&archive_path) {
                 Ok((persisted, raw_bytes)) => {
-                    tracing::warn!(
+                    warn!(
                         path = %archive_path.display(),
                         "restoring log store from archive"
                     );
@@ -272,7 +273,7 @@ impl TypeConfigLogPersistence {
                     return Ok(Some(persisted));
                 }
                 Err(err) => {
-                    tracing::warn!(
+                    warn!(
                         error = %err,
                         path = %archive_path.display(),
                         "failed to read log store archive; trying older one"

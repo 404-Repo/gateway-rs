@@ -10,15 +10,16 @@ use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::api::Task;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
 use crate::config::NodeConfig;
-use crate::http3::company_rate_limits::{company_rate_limit, CompanyRateLimiterStore};
+use crate::http3::distributed_rate_limiter::{enforce_rate_limit, DistributedRateLimiter};
 use crate::http3::handlers::admin::{
-    admin_key_check, generic_key_read_handler, generic_key_update_handler,
+    admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
 };
 use crate::http3::handlers::common::{
     api_or_generic_key_check, get_leader_handler, id_handler, metrics_handler, version_handler,
@@ -26,8 +27,8 @@ use crate::http3::handlers::common::{
 };
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
+use crate::http3::rate_limits::{prepare_rate_limit_context, RateLimits};
 use crate::http3::response::custom_response;
-use crate::http3::user_rate_limits::{prepare_rate_limit_context, RateLimits};
 use crate::http3::whitelist::AddTaskWhitelist;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
@@ -38,6 +39,11 @@ use tokio_util::sync::CancellationToken;
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: SubnetState,
+}
+
+async fn resolve_domain_ips(domains: &[&str]) -> Result<HashSet<IpAddr>> {
+    let resolved = lookup_hosts_ips(domains).await?;
+    Ok(resolved.into_iter().collect())
 }
 
 impl Http3Server {
@@ -73,20 +79,34 @@ impl Http3Server {
             }
         }
         if !domains.is_empty() {
-            match lookup_hosts_ips(&domains).await {
+            match resolve_domain_ips(&domains).await {
                 Ok(resolved) => {
-                    for ip in resolved {
-                        whitelist_ips.insert(ip);
-                    }
+                    whitelist_ips.extend(resolved);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to resolve some add_task_whitelist domains: {:?}", e);
+                    warn!("Failed to resolve some add_task_whitelist domains: {:?}", e);
                 }
             }
         }
         let add_task_whitelist = AddTaskWhitelist {
             ips: Arc::new(whitelist_ips),
         };
+
+        // Resolve peer IPs for the cluster_check hoop
+        let mut cluster_ips: HashSet<IpAddr> = HashSet::new();
+        let self_domain = &config.network.domain;
+        let peer_domains: Vec<&str> = config
+            .network
+            .node_dns_names
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|d| d != self_domain)
+            .collect();
+        if !peer_domains.is_empty() {
+            if let Ok(resolved) = resolve_domain_ips(&peer_domains).await {
+                cluster_ips.extend(resolved);
+            }
+        }
 
         let router = Self::setup_router(
             config,
@@ -95,6 +115,7 @@ impl Http3Server {
             &task_queue,
             &metrics,
             add_task_whitelist,
+            cluster_ips,
         )?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
@@ -127,6 +148,7 @@ impl Http3Server {
         task_queue: &DupQueue<Task>,
         metrics: &Metrics,
         add_task_whitelist: AddTaskWhitelist,
+        cluster_ips: HashSet<IpAddr>,
     ) -> Result<Router> {
         let http_config = &config.http;
         let prompt_config = &config.prompt;
@@ -146,8 +168,8 @@ impl Http3Server {
         let raft_write_size_limit = http_config.raft_write_size_limit as usize;
         let raft_write_size_limit_handler = || SecureMaxSize(raft_write_size_limit);
 
-        let company_store =
-            CompanyRateLimiterStore::new(http_config.company_rate_limiter_max_capacity);
+        let distributed_limiter =
+            DistributedRateLimiter::new(http_config.distributed_rate_limiter_max_capacity);
 
         let router = if http_config.compression {
             Router::new().hoop(
@@ -167,10 +189,11 @@ impl Http3Server {
             .hoop(affix_state::inject(add_task_whitelist))
             .hoop(affix_state::inject(config.network.node_id as usize))
             .hoop(affix_state::inject(metrics.clone()))
-            .hoop(affix_state::inject(company_store))
             .hoop(affix_state::inject(prompt_config.clone()))
             .hoop(affix_state::inject(image_config.clone()))
             .hoop(affix_state::inject(prompt_regex))
+            .hoop(affix_state::inject(cluster_ips))
+            .hoop(affix_state::inject(distributed_limiter))
             .hoop(prepare_rate_limit_context)
             .push(
                 Router::with_path("/add_task")
@@ -179,9 +202,7 @@ impl Http3Server {
                     .hoop(api_or_generic_key_check)
                     .hoop(rate_limits.generic_global_limiter)
                     .hoop(rate_limits.generic_per_ip_limiter)
-                    .hoop(rate_limits.user_id_global_limiter)
-                    .hoop(rate_limits.user_id_per_user_limiter)
-                    .hoop(company_rate_limit)
+                    .hoop(enforce_rate_limit)
                     .post(add_task_handler),
             )
             .push(
@@ -210,8 +231,8 @@ impl Http3Server {
             .push(
                 Router::with_path("/write")
                     .hoop(raft_write_size_limit_handler())
+                    .hoop(cluster_check)
                     .hoop(admin_key_check)
-                    .hoop(rate_limits.write_limiter)
                     .post(write_handler),
             )
             .push(

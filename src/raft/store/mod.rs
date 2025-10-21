@@ -6,6 +6,7 @@ use openraft::BasicNode;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::LogId;
+use openraft::Membership;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
 use openraft::SnapshotMeta;
@@ -23,17 +24,83 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
+use tracing::info;
 
 use crate::raft::NodeId;
 use crate::raft::TypeConfig;
 
+use foldhash::fast::RandomState;
 use persistence::SnapshotPersistence;
+use scc::{HashCache, HashMap};
 
 pub type LogStore = crate::raft::memstore::log_store::LogStore<TypeConfig>;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+pub struct RateLimitWindow {
+    pub hour_epoch: u64,
+    pub day_epoch: u64,
+    pub hour: u64,
+    pub day: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub enum Subject {
+    User,
+    Company,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct RateLimitKey {
+    pub subject: Subject,
+    pub id: u128,
+}
+
+impl RateLimitKey {
+    pub const fn new(subject: Subject, id: u128) -> Self {
+        Self { subject, id }
+    }
+}
+
+pub const fn rate_limit_key(subject: Subject, id: u128) -> RateLimitKey {
+    RateLimitKey::new(subject, id)
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct RateLimitDelta {
+    pub subject: Subject,
+    pub id: u128,
+    pub hour_epoch: u64,
+    pub day_epoch: u64,
+    pub add_hour: u16,
+    pub add_day: u16,
+}
+
+impl RateLimitDelta {
+    pub const fn key(&self) -> RateLimitKey {
+        rate_limit_key(self.subject, self.id)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
-    Set { key: String, value: Vec<u8> },
+    Set {
+        request_id: u128,
+        key: String,
+        value: Vec<u8>,
+    },
+    RateLimitDeltas {
+        request_id: u128,
+        deltas: Vec<RateLimitDelta>,
+    },
+}
+
+impl Request {
+    pub fn request_id(&self) -> u128 {
+        match self {
+            Request::Set { request_id, .. } => *request_id,
+            Request::RateLimitDeltas { request_id, .. } => *request_id,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -45,6 +112,18 @@ pub struct StoredSnapshot {
 
     /// The data of the state machine at the time of this snapshot.
     pub data: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(super) struct SnapshotPayload {
+    pub data: BTreeMap<String, Vec<u8>>,
+    pub rate_limits: BTreeMap<RateLimitKey, RateLimitWindow>,
+}
+
+impl SnapshotPayload {
+    fn decode(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+        rmp_serde::from_slice(bytes)
+    }
 }
 
 /// Data contained in the Raft state machine.
@@ -77,6 +156,15 @@ pub struct StateMachineStore {
 
     /// Optional on-disk persistence configuration.
     persistence: Option<Arc<SnapshotPersistence>>,
+
+    /// Concurrent request-id deduplication cache to avoid re-applying idempotent requests.
+    request_dedupe: HashCache<u128, (), RandomState>,
+
+    /// Concurrent hash map for rate limits, swapped atomically during snapshot installs.
+    rate_limits: AtomicOwned<HashMap<RateLimitKey, RateLimitWindow, RandomState>>,
+
+    /// Guard to synchronize apply and snapshot building for consistent cuts.
+    snapshot_guard: tokio::sync::Mutex<()>,
 }
 
 impl Default for StateMachineStore {
@@ -86,18 +174,52 @@ impl Default for StateMachineStore {
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: AtomicOwned::null(),
             persistence: None,
+            request_dedupe: HashCache::with_capacity_and_hasher(512, 1024, RandomState::default()),
+            rate_limits: AtomicOwned::new(HashMap::with_capacity_and_hasher(
+                4096,
+                RandomState::default(),
+            )),
+            snapshot_guard: tokio::sync::Mutex::new(()),
         }
     }
 }
 
 impl StateMachineStore {
+    fn build_rate_limit_map(
+        new_limits: BTreeMap<RateLimitKey, RateLimitWindow>,
+    ) -> HashMap<RateLimitKey, RateLimitWindow, RandomState> {
+        let capacity = new_limits.len().max(4096);
+        let map = HashMap::with_capacity_and_hasher(capacity, RandomState::default());
+        for (key, value) in new_limits {
+            let _ = map.insert_sync(key, value);
+        }
+        map
+    }
+
+    fn current_rate_limits<'guard>(
+        &self,
+        guard: &'guard Guard,
+    ) -> Option<&'guard HashMap<RateLimitKey, RateLimitWindow, RandomState>> {
+        self.rate_limits.load(Ordering::Acquire, guard).as_ref()
+    }
+
+    fn sync_rate_limits(&self, new_limits: BTreeMap<RateLimitKey, RateLimitWindow>) {
+        let map = Self::build_rate_limit_map(new_limits);
+        let _ = self
+            .rate_limits
+            .swap((Some(Owned::new(map)), Tag::None), Ordering::AcqRel);
+    }
+
     pub fn with_persistence<P: AsRef<Path>>(
         dir: P,
         retention: usize,
         log_store_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         let persistence = Arc::new(SnapshotPersistence::new(dir, retention, log_store_path)?);
-        let (state_machine_data, snapshot_idx, current_snapshot) = persistence.load_latest()?;
+        let (state_machine_data, rate_limits_data, snapshot_idx, current_snapshot) =
+            persistence.load_latest()?;
+
+        let rate_limits = Self::build_rate_limit_map(rate_limits_data);
 
         Ok(Self {
             state_machine: RwLock::new(state_machine_data),
@@ -107,12 +229,33 @@ impl StateMachineStore {
                 None => AtomicOwned::null(),
             },
             persistence: Some(persistence),
+            request_dedupe: HashCache::with_capacity_and_hasher(256, 1024, RandomState::default()),
+            rate_limits: AtomicOwned::new(rate_limits),
+            snapshot_guard: tokio::sync::Mutex::new(()),
         })
+    }
+
+    async fn is_duplicate_request(&self, request_id: u128) -> bool {
+        let mut is_dup = false;
+        self.request_dedupe
+            .entry_async(request_id)
+            .await
+            .and_modify(|_| {
+                is_dup = true;
+            })
+            .or_put(());
+        is_dup
     }
 
     pub async fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
         let sm = self.state_machine.read().await;
         sm.data.get(key).cloned()
+    }
+
+    pub async fn get_rate_limit_window(&self, key: &RateLimitKey) -> Option<RateLimitWindow> {
+        let guard = Guard::new();
+        self.current_rate_limits(&guard)
+            .and_then(|map| map.read_sync(key, |_, v| *v))
     }
 
     async fn persist_snapshot(
@@ -145,16 +288,105 @@ impl StateMachineStore {
         }
         Ok(())
     }
+
+    async fn apply_blank(&self, log_id: LogId<NodeId>) {
+        let _sg = self.snapshot_guard.lock().await;
+        let mut sm = self.state_machine.write().await;
+        sm.last_applied_log = Some(log_id);
+    }
+
+    async fn apply_membership(&self, log_id: LogId<NodeId>, mem: Membership<NodeId, BasicNode>) {
+        let _sg = self.snapshot_guard.lock().await;
+        let mut sm = self.state_machine.write().await;
+        sm.last_applied_log = Some(log_id);
+        sm.last_membership = StoredMembership::new(Some(log_id), mem);
+    }
+
+    async fn apply_request(&self, log_id: LogId<NodeId>, request: Request, is_dup: bool) {
+        let _sg = self.snapshot_guard.lock().await;
+        match request {
+            Request::Set { key, value, .. } => {
+                let mut sm = self.state_machine.write().await;
+                if !is_dup {
+                    sm.data.insert(key, value);
+                }
+                sm.last_applied_log = Some(log_id);
+            }
+            Request::RateLimitDeltas { deltas, .. } => {
+                if !is_dup {
+                    let guard = Guard::new();
+                    let map = self
+                        .current_rate_limits(&guard)
+                        .expect("rate limit map should be initialized");
+                    for d in deltas {
+                        let key = d.key();
+                        map.entry_sync(key)
+                            .and_modify(|w| {
+                                let mut add_hour = d.add_hour as u64;
+                                match d.hour_epoch.cmp(&w.hour_epoch) {
+                                    std::cmp::Ordering::Greater => {
+                                        w.hour_epoch = d.hour_epoch;
+                                        w.hour = 0;
+                                    }
+                                    std::cmp::Ordering::Less => {
+                                        add_hour = 0;
+                                    }
+                                    std::cmp::Ordering::Equal => {}
+                                }
+
+                                let mut add_day = d.add_day as u64;
+                                match d.day_epoch.cmp(&w.day_epoch) {
+                                    std::cmp::Ordering::Greater => {
+                                        w.day_epoch = d.day_epoch;
+                                        w.day = 0;
+                                    }
+                                    std::cmp::Ordering::Less => {
+                                        add_day = 0;
+                                    }
+                                    std::cmp::Ordering::Equal => {}
+                                }
+
+                                w.hour = w.hour.saturating_add(add_hour);
+                                w.day = w.day.saturating_add(add_day);
+                            })
+                            .or_insert(RateLimitWindow {
+                                hour_epoch: d.hour_epoch,
+                                day_epoch: d.day_epoch,
+                                hour: d.add_hour as u64,
+                                day: d.add_day as u64,
+                            });
+                    }
+                }
+
+                let mut sm = self.state_machine.write().await;
+                sm.last_applied_log = Some(log_id);
+            }
+        }
+    }
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (data, last_applied_log, last_membership) = {
+        let (payload, last_applied_log, last_membership) = {
+            // Ensure a consistent cut between state_machine and rate_limits
+            let _sg = self.snapshot_guard.lock().await;
             let state_machine = self.state_machine.read().await;
-            let data = rmp_serde::to_vec(&state_machine.data)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+            // Collect rate limits from the concurrent HashMap
+            let mut rate_limits = BTreeMap::new();
+            let guard = Guard::new();
+            if let Some(map) = self.current_rate_limits(&guard) {
+                map.iter_sync(|k, v| {
+                    rate_limits.insert(*k, *v);
+                    true
+                });
+            }
+
             (
-                data,
+                SnapshotPayload {
+                    data: state_machine.data.clone(),
+                    rate_limits,
+                },
                 state_machine.last_applied_log,
                 state_machine.last_membership.clone(),
             )
@@ -173,9 +405,11 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             snapshot_id,
         };
 
+        let snapshot_bytes =
+            rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
         let snapshot = StoredSnapshot {
             meta: meta.clone(),
-            data: data.clone(),
+            data: snapshot_bytes.clone(),
         };
 
         self.persist_snapshot(&snapshot).await?;
@@ -186,7 +420,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(snapshot_bytes)),
         })
     }
 }
@@ -209,23 +443,19 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
-        let mut res = Vec::new(); //No `with_capacity`; do not know `len` of iterator
-
-        let mut sm = self.state_machine.write().await;
+        let mut res = Vec::new();
 
         for entry in entries {
-            tracing::debug!(%entry.log_id, "replicate to sm");
-
-            sm.last_applied_log = Some(entry.log_id);
+            let log_id = entry.log_id;
 
             match entry.payload {
-                EntryPayload::Blank => {}
-                EntryPayload::Normal(Request::Set { key, value }) => {
-                    sm.data.insert(key, value);
+                EntryPayload::Blank => self.apply_blank(log_id).await,
+                EntryPayload::Normal(request) => {
+                    let request_id = request.request_id();
+                    let is_dup = self.is_duplicate_request(request_id).await;
+                    self.apply_request(log_id, request, is_dup).await;
                 }
-                EntryPayload::Membership(mem) => {
-                    sm.last_membership = StoredMembership::new(Some(entry.log_id), mem);
-                }
+                EntryPayload::Membership(mem) => self.apply_membership(log_id, mem).await,
             }
             res.push(Response);
         }
@@ -243,7 +473,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
         meta: &SnapshotMeta<NodeId, BasicNode>,
         snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
     ) -> Result<(), StorageError<NodeId>> {
-        tracing::info!(
+        info!(
             { snapshot_size = snapshot.get_ref().len() },
             "decoding snapshot for installation"
         );
@@ -253,19 +483,31 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             data: snapshot.into_inner(),
         };
 
-        let updated_state_machine_data = rmp_serde::from_slice(&new_snapshot.data)
+        let payload = SnapshotPayload::decode(&new_snapshot.data)
             .map_err(|e| StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e))?;
         self.persist_snapshot(&new_snapshot).await?;
 
-        // Update the state machine.
-        let updated_state_machine = StateMachineData {
-            last_applied_log: meta.last_log_id,
-            last_membership: meta.last_membership.clone(),
-            data: updated_state_machine_data,
-        };
+        // Update the state machine and rate limits under the snapshot guard.
         {
-            let mut state_machine = self.state_machine.write().await;
-            *state_machine = updated_state_machine;
+            let _sg = self.snapshot_guard.lock().await;
+
+            let SnapshotPayload {
+                data,
+                rate_limits: new_rate_limits,
+            } = payload;
+
+            let updated_state_machine = StateMachineData {
+                last_applied_log: meta.last_log_id,
+                last_membership: meta.last_membership.clone(),
+                data,
+            };
+
+            {
+                let mut state_machine = self.state_machine.write().await;
+                *state_machine = updated_state_machine;
+            }
+
+            self.sync_rate_limits(new_rate_limits);
         }
 
         // Update current snapshot atomically

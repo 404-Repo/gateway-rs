@@ -60,8 +60,10 @@ use crate::http3::server::Http3Server;
 use crate::metrics::Metrics;
 use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
+use crate::raft::store::RateLimitDelta;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
+use scc::Queue;
 use tokio_util::sync::CancellationToken;
 
 pub type NodeId = u64;
@@ -70,6 +72,7 @@ pub type StateMachineStore = store::StateMachineStore;
 pub type Raft = openraft::Raft<TypeConfig>;
 
 pub(crate) const SNAPSHOT_COMPRESSION_LVL: i32 = 1;
+const MAX_DELTAS_IN_BATCH: usize = 8192;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum GatewayMode {
@@ -106,20 +109,29 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    async fn flush_rate_limit_deltas(
+        gateway_state: &GatewayState,
+        deltas: Arc<Vec<RateLimitDelta>>,
+        client: Option<&Http3Client>,
+    ) {
+        if deltas.is_empty() {
+            return;
+        }
+        let _ = gateway_state.submit_rate_limit_deltas(deltas, client).await;
+    }
+
     pub async fn gateway_info_updater(
         config: Arc<NodeConfig>,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
+        rate_limit_queue: Arc<Queue<RateLimitDelta>>,
         shutdown: CancellationToken,
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
-        let max_idle_timeout_sec = config.http.max_idle_timeout_sec;
-        let keep_alive_interval_sec = config.http.keep_alive_interval_sec;
         let post_timeout = Duration::from_secs(config.http.post_timeout_sec);
         let update_interval = Duration::from_millis(config.basic.update_gateway_info_ms);
-        let admin_key = config.http.admin_key.to_string();
 
         loop {
             tokio::select! {
@@ -135,30 +147,39 @@ impl Gateway {
                 }
             };
 
-            let last_update = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(duration) => duration.as_secs(),
-                Err(e) => {
+            // Drain any pending rate limit deltas
+            let mut deltas = Vec::new();
+            while let Some(entry) = rate_limit_queue.pop() {
+                deltas.push(**entry);
+                if deltas.len() == MAX_DELTAS_IN_BATCH {
+                    break;
+                }
+            }
+
+            let last_update = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_else(|e| {
                     error!("SystemTime before UNIX EPOCH: {:?}", e);
                     0
-                }
-            };
+                });
             let available_tasks = task_queue.len();
             let last_task_acquisition = last_task_acquisition.load(Ordering::Relaxed);
 
             if leader == config.network.node_id {
-                let info = GatewayInfoRef {
-                    node_id: config.network.node_id,
-                    domain: &config.network.domain,
-                    ip: &config.network.external_ip,
-                    name: &config.network.name,
-                    http_port: config.http.port,
-                    available_tasks,
-                    last_task_acquisition,
-                    last_update,
-                };
-                if let Err(e) = gateway_state.set_gateway_info(info).await {
-                    error!("set_gateway_info update error: {:?}", e);
-                }
+                let _ = tokio::join!(
+                    gateway_state.set_gateway_info(GatewayInfoRef {
+                        node_id: config.network.node_id,
+                        domain: &config.network.domain,
+                        ip: &config.network.external_ip,
+                        name: &config.network.name,
+                        http_port: config.http.port,
+                        available_tasks,
+                        last_task_acquisition,
+                        last_update,
+                    }),
+                    Gateway::flush_rate_limit_deltas(&gateway_state, Arc::new(deltas), None)
+                );
                 last_leader = Some(leader);
                 client = None;
                 continue;
@@ -175,18 +196,10 @@ impl Gateway {
             if last_leader != Some(leader) || client.is_none() {
                 client = None;
 
-                let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
-                match Http3ClientBuilder::new()
-                    .server_domain(&leader_info.domain)
-                    .server_ip(&server_ip)
-                    .max_idle_timeout_sec(max_idle_timeout_sec)
-                    .keep_alive_interval(keep_alive_interval_sec)
-                    .dangerous_skip_verification(config.cert.dangerous_skip_verification)
-                    .build()
-                    .await
-                {
-                    Ok(c) => {
-                        client = Some(c);
+                let server_ip = gateway_state.leader_server_addr(&leader_info);
+                match gateway_state.build_leader_client(&leader_info).await {
+                    Ok(new_client) => {
+                        client = Some(new_client);
                         last_leader = Some(leader);
                     }
                     Err(e) => {
@@ -219,31 +232,33 @@ impl Gateway {
                 }
             };
 
-            let url = format!(
-                "https://{}:{}/write",
-                leader_info.domain, leader_info.http_port
-            );
+            let url = gateway_state.leader_write_url(&leader_info);
 
             if let Some(client) = client.as_ref() {
+                let admin_key = gateway_state.admin_key();
                 let headers = [("x-admin-key", admin_key.as_str())];
-                match client
-                    .post(
+                let (info_res, _) = tokio::join!(
+                    client.post(
                         &url,
                         Bytes::from(payload),
                         Some(&headers),
-                        Some(post_timeout),
+                        Some(post_timeout)
+                    ),
+                    Gateway::flush_rate_limit_deltas(
+                        &gateway_state,
+                        Arc::new(deltas),
+                        Some(client)
                     )
-                    .await
-                {
-                    Ok((status, response)) => {
-                        if !status.is_success() {
-                            error!(
-                                "Gateway info update failed with status: {}, response: {:?}",
-                                status,
-                                String::from_utf8_lossy(&response)
-                            );
-                        }
+                );
+                match info_res {
+                    Ok((status, response)) if !status.is_success() => {
+                        error!(
+                            "Gateway info update failed with status: {}, response: {:?}",
+                            status,
+                            String::from_utf8_lossy(&response)
+                        );
                     }
+                    Ok(_) => {}
                     Err(e) => {
                         error!("Gateway info update failed: {:?}", e);
                     }
@@ -683,6 +698,8 @@ pub async fn start_gateway(
     )
     .await;
 
+    let rate_limit_queue = Arc::new(Queue::<RateLimitDelta>::default());
+
     let gateway_state = GatewayState::new(
         state_machine_store,
         raft.clone(),
@@ -690,6 +707,7 @@ pub async fn start_gateway(
         api_key_validator,
         task_manager.clone(),
         Arc::clone(&config),
+        rate_limit_queue.clone(),
     );
 
     let key_cert = if use_cert_files {
@@ -748,6 +766,7 @@ pub async fn start_gateway(
         gateway_state.clone(),
         task_queue,
         last_task_acquisition,
+        rate_limit_queue,
         gateway_shutdown.clone(),
     ));
     let gateway_leader_change = tokio::spawn(Gateway::gateway_leader_change(

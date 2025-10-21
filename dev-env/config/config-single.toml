@@ -14,7 +14,6 @@ compression = true
 compression_lvl = 3
 port = 4443
 basic_rate_limit = 30
-write_rate_limit = 180
 update_key_rate_limit = 10
 add_task_basic_per_ip_rate_limit = 50
 add_task_generic_global_hourly_rate_limit = 40
@@ -45,8 +44,8 @@ forward_timeout_sec = 3
 get_timeout_sec = 2
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
-add_task_whitelist = ["172.25.0.1"]
-company_rate_limiter_max_capacity = 4096
+add_task_whitelist = []
+distributed_rate_limiter_max_capacity = 4096
 
 [db]
 host = "db"
@@ -70,7 +69,7 @@ key_file_path = "/etc/certs/key.pem"
 
 [basic]
 max_restart_attempts = 2
-update_gateway_info_ms = 1000
+update_gateway_info_ms = 500
 unique_validators_per_task = 3
 taskmanager_initial_capacity = 1024
 taskmanager_cleanup_interval = 30

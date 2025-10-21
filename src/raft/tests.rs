@@ -30,6 +30,7 @@ mod tests {
     use tokio::time::Duration;
     use tokio_util::sync::CancellationToken;
     use tracing::info;
+    use uuid::Uuid;
 
     static TRACING: Once = Once::new();
     static LOG_STORE_REGISTRY: OnceLock<scc::HashMap<String, LogStore, RandomState>> =
@@ -318,6 +319,7 @@ mod tests {
 
     fn set_request(key: &str, value: &str) -> Request {
         Request::Set {
+            request_id: Uuid::new_v4().as_u128(),
             key: key.to_string(),
             value: rmp_serde::to_vec(value).unwrap(),
         }

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +12,11 @@ use crate::raft::memstore::persistence::{
 };
 use crate::raft::SNAPSHOT_COMPRESSION_LVL;
 
-use super::{StateMachineData, StoredSnapshot};
+use super::{RateLimitKey, RateLimitWindow, SnapshotPayload, StateMachineData, StoredSnapshot};
+
+type RateLimitsMap = std::collections::BTreeMap<RateLimitKey, RateLimitWindow>;
+type LoadLatestResult = (StateMachineData, RateLimitsMap, u64, Option<StoredSnapshot>);
+type ReadSnapshotResult = (StateMachineData, RateLimitsMap, StoredSnapshot);
 
 pub(crate) const SNAPSHOT_FILE_PREFIX: &str = "snapshot_";
 
@@ -88,9 +91,7 @@ impl SnapshotPersistence {
         Ok(())
     }
 
-    pub(crate) fn load_latest(
-        &self,
-    ) -> anyhow::Result<(StateMachineData, u64, Option<StoredSnapshot>)> {
+    pub(crate) fn load_latest(&self) -> anyhow::Result<LoadLatestResult> {
         let _guard = self
             .lock
             .lock()
@@ -100,8 +101,8 @@ impl SnapshotPersistence {
 
         for (path, idx) in files.into_iter().rev() {
             match Self::read_snapshot_file(&path) {
-                Ok((state_machine, stored)) => {
-                    return Ok((state_machine, idx, Some(stored)));
+                Ok((state_machine, rate_limits, stored)) => {
+                    return Ok((state_machine, rate_limits, idx, Some(stored)));
                 }
                 Err(err) => {
                     warn!(
@@ -117,24 +118,24 @@ impl SnapshotPersistence {
             warn!("no valid snapshot could be loaded from disk; starting from empty state");
         }
 
-        Ok((StateMachineData::default(), 0, None))
+        Ok((StateMachineData::default(), RateLimitsMap::new(), 0, None))
     }
 
-    fn read_snapshot_file(path: &Path) -> anyhow::Result<(StateMachineData, StoredSnapshot)> {
+    fn read_snapshot_file(path: &Path) -> anyhow::Result<ReadSnapshotResult> {
         let buf =
             fs::read(path).with_context(|| format!("Failed to read snapshot file: {:?}", path))?;
         let decoded = zstd::stream::decode_all(Cursor::new(&buf))
             .map_err(|e| anyhow!("decompress snapshot {:?}: {e}", path))?;
         let stored: StoredSnapshot = rmp_serde::from_slice(&decoded)
             .map_err(|e| anyhow!("decode snapshot {:?}: {e}", path))?;
-        let data_map: BTreeMap<String, Vec<u8>> = rmp_serde::from_slice(&stored.data)
+        let payload = SnapshotPayload::decode(&stored.data)
             .map_err(|e| anyhow!("decode snapshot state {:?}: {e}", path))?;
         let state_machine = StateMachineData {
             last_applied_log: stored.meta.last_log_id,
             last_membership: stored.meta.last_membership.clone(),
-            data: data_map,
+            data: payload.data,
         };
-        Ok((state_machine, stored))
+        Ok((state_machine, payload.rate_limits, stored))
     }
 
     fn prune_locked(&self) -> std::io::Result<()> {
