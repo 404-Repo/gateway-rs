@@ -19,6 +19,18 @@ fn error_page_for(status: StatusCode) -> Option<&'static str> {
     }
 }
 
+fn log_error(status: StatusCode, client_ip: String, req: &Request, body: &salvo::http::ResBody) {
+    let ip = &client_ip;
+    let method = req.method();
+    let path = req.uri().path();
+    if let salvo::http::ResBody::Error(e) = body {
+        let reason = e.detail.as_deref().unwrap_or(&e.brief);
+        error!("Error handling request from {ip}: {method} {path} - Status: {status}, Reason: {reason}");
+    } else {
+        error!("Error handling request from {ip}: {method} {path} - Status: {status}");
+    }
+}
+
 #[handler]
 pub async fn custom_response(
     req: &Request,
@@ -33,19 +45,7 @@ pub async fn custom_response(
                 salvo::conn::SocketAddr::IPv6(addr_v6) => addr_v6.ip().to_string(),
                 _ => "unknown".to_string(),
             };
-            let reason = if let salvo::http::ResBody::Error(e) = &res.body {
-                e.detail.as_deref().unwrap_or(&e.brief).to_string()
-            } else {
-                "No specific reason available".to_string()
-            };
-            error!(
-                "Error handling request from {}: {} {} - Status: {}, Reason: {}",
-                client_ip,
-                req.method(),
-                req.uri().path(),
-                status,
-                reason
-            );
+            log_error(status, client_ip, req, &res.body);
         }
 
         if let Some(html) = error_page_for(status) {

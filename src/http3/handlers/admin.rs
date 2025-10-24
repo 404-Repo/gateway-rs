@@ -1,5 +1,6 @@
 use anyhow::Result;
 use salvo::prelude::*;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::api::request::UpdateGenericKeyRequest;
@@ -76,4 +77,21 @@ pub async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(),
             "Invalid or missing admin key".to_string(),
         ))
     }
+}
+
+#[handler]
+pub async fn cluster_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
+    if let Ok(cluster_ips) = depot.obtain::<std::collections::HashSet<IpAddr>>() {
+        let remote_ip_opt: Option<IpAddr> = match req.remote_addr() {
+            salvo::conn::SocketAddr::IPv4(addr) => Some(IpAddr::V4(*addr.ip())),
+            salvo::conn::SocketAddr::IPv6(addr) => Some(IpAddr::V6(*addr.ip())),
+            _ => None,
+        };
+        if let Some(ip) = remote_ip_opt {
+            if cluster_ips.contains(&ip) {
+                return Ok(());
+            }
+        }
+    }
+    Err(ServerError::Unauthorized("Not in cluster".to_string()))
 }

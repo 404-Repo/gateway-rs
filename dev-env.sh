@@ -5,7 +5,7 @@ DOCKERFILE_PATH="$SCRIPT_DIR/Dockerfile"
 
 cd "$SCRIPT_DIR/dev-env"
 
-if [ "$1" = "stop" ]; then
+if [ "$1" = "stop" ] || [ "$1" = "down" ]; then
     echo "Stopping all containers..."
     docker-compose -f docker-compose-single-node.yaml down
     docker-compose down

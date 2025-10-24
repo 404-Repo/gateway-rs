@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, Engine};
+use base64_simd::{AsOut, STANDARD};
 use blake2::{Blake2b512, Digest};
 use parity_scale_codec::{Decode, Encode};
 use schnorrkel::{context::signing_context, PublicKey, Signature};
@@ -149,10 +149,10 @@ pub fn verify_hotkey(
         ss58_decode(validator_hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
 
     let mut signature_bytes = [0u8; 64];
-    let decoded_len = general_purpose::STANDARD
-        .decode_slice(signature, &mut signature_bytes)
+    let decoded = STANDARD
+        .decode(signature.as_bytes(), (signature_bytes[..]).as_out())
         .map_err(|e| anyhow!("Failed to decode signature: {}", e))?;
-    if decoded_len != 64 {
+    if decoded.len() != 64 {
         return Err(anyhow!("Invalid signature length"));
     }
 
@@ -168,7 +168,7 @@ pub fn verify_hotkey(
 mod tests {
     use super::ss58_encode;
     use crate::bittensor::crypto::{verify_hotkey, GATEWAY, SIGNING_CTX};
-    use base64::{engine::general_purpose, Engine};
+    use base64_simd::STANDARD;
     use schnorrkel::{context::signing_context, ExpansionMode, MiniSecretKey};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -192,7 +192,7 @@ mod tests {
         assert!(verify_hotkey(
             &timestamp_string,
             &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &general_purpose::STANDARD.encode(signature.to_bytes()),
+            &STANDARD.encode_to_string(signature.to_bytes()),
             300
         )
         .is_ok());
@@ -212,7 +212,7 @@ mod tests {
         assert!(verify_hotkey(
             &timestamp_string,
             &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &general_purpose::STANDARD.encode(sig_bytes),
+            &STANDARD.encode_to_string(sig_bytes),
             300
         )
         .is_err());
@@ -231,7 +231,7 @@ mod tests {
         assert!(verify_hotkey(
             &timestamp_string,
             &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &general_purpose::STANDARD.encode(signature.to_bytes()),
+            &STANDARD.encode_to_string(signature.to_bytes()),
             300
         )
         .is_err());
@@ -244,7 +244,7 @@ mod tests {
         assert!(verify_hotkey(
             &bad_timestamp,
             &ss58_encode(&[0u8; 32]).parse().unwrap(),
-            &general_purpose::STANDARD.encode([0u8; 64]),
+            &STANDARD.encode_to_string([0u8; 64]),
             300
         )
         .is_err());

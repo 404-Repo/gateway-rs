@@ -1,4 +1,3 @@
-use itoa::Buffer;
 use salvo::prelude::*;
 use salvo::rate_limiter::{
     BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
@@ -9,11 +8,6 @@ use crate::config::HTTPConfig;
 use crate::http3::error::ServerError;
 use crate::http3::whitelist::is_whitelisted_ip;
 use crate::raft::gateway_state::GatewayState;
-
-const USER_ID_PREFIX: &str = "u_";
-const USER_ID_PREFIX_LEN: usize = 2;
-const U128_DECIMAL_MAX_LEN: usize = 39; // Max decimal digits for u128
-const USER_ID_KEY_CAPACITY: usize = USER_ID_PREFIX_LEN + U128_DECIMAL_MAX_LEN;
 
 #[derive(Clone, Debug, Default)]
 pub struct RateLimitContext {
@@ -101,20 +95,6 @@ pub type GlobalGenericKeyRateLimiter = RateLimiter<
     BasicQuota,
 >;
 
-pub type GlobalUserIDRateLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<GlobalUserIDIssuer as RateIssuer>::Key, FixedGuard>,
-    GlobalUserIDIssuer,
-    BasicQuota,
->;
-
-pub type UserIDLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<UserIDLimitIssuer as RateIssuer>::Key, FixedGuard>,
-    UserIDLimitIssuer,
-    BasicQuota,
->;
-
 pub type UnauthorizedOnlyRateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<UnauthorizedOnlyIssuer as RateIssuer>::Key, FixedGuard>,
@@ -145,30 +125,6 @@ impl RateIssuer for GlobalGenericKeyIssuer {
     }
 }
 
-pub struct GlobalUserIDIssuer;
-impl RateIssuer for GlobalUserIDIssuer {
-    type Key = String;
-
-    async fn issue(&self, _req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
-        Some("g_uid".to_string())
-    }
-}
-
-pub struct UserIDLimitIssuer;
-impl RateIssuer for UserIDLimitIssuer {
-    type Key = String;
-
-    async fn issue(&self, _req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let ctx = depot.obtain::<RateLimitContext>().ok()?;
-        let user_id = ctx.user_id?;
-        let mut key = String::with_capacity(USER_ID_KEY_CAPACITY);
-        key.push_str(USER_ID_PREFIX);
-        let mut buf = Buffer::new();
-        key.push_str(buf.format(user_id.as_u128()));
-        Some(key)
-    }
-}
-
 pub struct UnauthorizedOnlyIssuer;
 
 impl RateIssuer for UnauthorizedOnlyIssuer {
@@ -182,14 +138,11 @@ impl RateIssuer for UnauthorizedOnlyIssuer {
 
 pub struct RateLimits {
     pub basic_limiter: PerIPRateLimiter,
-    pub write_limiter: PerIPRateLimiter,
     pub update_limiter: PerIPRateLimiter,
     // This only prevents spam per IP (for unauthenticated users).
     pub unauthorized_only_limiter: UnauthorizedOnlyRateLimiter,
     pub generic_global_limiter: GlobalGenericKeyRateLimiter,
     pub generic_per_ip_limiter: GenericKeyPerIpRateLimiter,
-    pub user_id_global_limiter: GlobalUserIDRateLimiter,
-    pub user_id_per_user_limiter: UserIDLimiter,
     pub read_limiter: PerIPRateLimiter,
     pub result_limiter: PerIPRateLimiter,
     pub load_limiter: PerIPRateLimiter,
@@ -201,7 +154,6 @@ pub struct RateLimits {
 impl RateLimits {
     pub fn new(http_config: &HTTPConfig) -> Self {
         let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
-        let write_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
         let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
         let unauthorized_only_limiter = UnauthorizedOnlyRateLimiter::new(
             FixedGuard::new(),
@@ -215,7 +167,6 @@ impl RateLimits {
                 .map(|ctx| ctx.has_authorized_key())
                 .unwrap_or(false)
         });
-
         let generic_global_limiter = GlobalGenericKeyRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
@@ -240,33 +191,9 @@ impl RateLimits {
                 .map(|ctx| !ctx.is_generic_key)
                 .unwrap_or(false)
         });
-        let user_id_global_limiter = GlobalUserIDRateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            GlobalUserIDIssuer,
-            BasicQuota::per_hour(http_config.add_task_user_id_global_hourly_rate_limit),
-        )
-        .with_skipper(|_: &mut Request, depot: &Depot| {
-            depot
-                .obtain::<RateLimitContext>()
-                .map(|ctx| ctx.user_id.is_none() || ctx.is_whitelisted_ip)
-                .unwrap_or(false)
-        });
-        let user_id_per_user_limiter = UserIDLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            UserIDLimitIssuer,
-            BasicQuota::per_hour(http_config.add_task_user_id_per_user_hourly_rate_limit),
-        )
-        .with_skipper(|_: &mut Request, depot: &Depot| {
-            depot
-                .obtain::<RateLimitContext>()
-                .map(|ctx| ctx.user_id.is_none() || ctx.is_whitelisted_ip)
-                .unwrap_or(false)
-        });
 
         let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
-        let read_limiter = Self::create_ip_rate_limiter(http_config.write_rate_limit);
+        let read_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
         let load_limiter = Self::create_ip_rate_limiter(http_config.load_rate_limit);
         let leader_limiter = Self::create_ip_rate_limiter(http_config.leader_rate_limit);
         let metric_limiter = Self::create_ip_rate_limiter(http_config.metric_rate_limit);
@@ -274,13 +201,10 @@ impl RateLimits {
 
         Self {
             basic_limiter,
-            write_limiter,
             update_limiter,
             unauthorized_only_limiter,
             generic_global_limiter,
             generic_per_ip_limiter,
-            user_id_global_limiter,
-            user_id_per_user_limiter,
             read_limiter,
             result_limiter,
             load_limiter,

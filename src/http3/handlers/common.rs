@@ -3,9 +3,10 @@ use crate::api::response::{GatewayInfoRef, LeaderResponse};
 use crate::common::log::get_build_information;
 use crate::config::HTTPConfig;
 use crate::http3::error::ServerError;
-use crate::http3::user_rate_limits::RateLimitContext;
+use crate::http3::rate_limits::RateLimitContext;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
+use crate::raft::store::Request as RaftRequest;
 use http::HeaderValue;
 use itoa::Buffer;
 use prometheus::Encoder;
@@ -40,10 +41,33 @@ pub async fn write_handler(
         .payload_with_max_size(depot.require::<HTTPConfig>()?.raft_write_size_limit as usize)
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-    let gi: GatewayInfoExt = rmp_serde::from_slice(body.as_ref())
-        .map_err(|e| ServerError::BadRequest(format!("Failed to parse msgpack: {}", e)))?;
 
     let gateway_state = depot.require::<GatewayState>()?;
+
+    if let Ok(request) = rmp_serde::from_slice::<RaftRequest>(body.as_ref()) {
+        match request {
+            RaftRequest::RateLimitDeltas { request_id, deltas } => {
+                gateway_state
+                    .apply_rate_limit_deltas(request_id, deltas)
+                    .await
+                    .map_err(|e| {
+                        ServerError::Internal(format!("Failed to apply rate limit deltas: {:?}", e))
+                    })?;
+                res.status_code(StatusCode::OK);
+                res.render(Text::Plain("Ok"));
+                return Ok(());
+            }
+            other => {
+                return Err(ServerError::BadRequest(format!(
+                    "Unsupported raft write request: {:?}",
+                    other
+                )))
+            }
+        }
+    }
+
+    let gi: GatewayInfoExt = rmp_serde::from_slice(body.as_ref())
+        .map_err(|e| ServerError::BadRequest(format!("Failed to parse msgpack: {}", e)))?;
 
     if gi.cluster_name != gateway_state.cluster_name() {
         return Err(ServerError::Unauthorized("Unauthorized access".to_string()));

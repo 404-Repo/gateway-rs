@@ -94,7 +94,6 @@ pub struct HTTPConfig {
     pub port: u16,
     // Rate limits
     pub basic_rate_limit: usize,
-    pub write_rate_limit: usize,
     pub update_key_rate_limit: usize,
     pub add_task_generic_global_hourly_rate_limit: usize,
     pub add_task_generic_per_ip_hourly_rate_limit: usize,
@@ -103,8 +102,8 @@ pub struct HTTPConfig {
     pub add_task_basic_per_ip_rate_limit: usize,
     #[serde(default)]
     pub add_task_whitelist: HashSet<String>,
-    #[serde(default = "default_company_rate_limiter_max_capacity")]
-    pub company_rate_limiter_max_capacity: usize,
+    #[serde(default = "default_distributed_rate_limiter_max_capacity")]
+    pub distributed_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,
     pub add_result_rate_limit: usize,
     pub leader_rate_limit: usize,
@@ -171,7 +170,7 @@ fn default_deleted_keys_ttl_minutes() -> u64 {
     60
 }
 
-fn default_company_rate_limiter_max_capacity() -> usize {
+fn default_distributed_rate_limiter_max_capacity() -> usize {
     4096
 }
 
