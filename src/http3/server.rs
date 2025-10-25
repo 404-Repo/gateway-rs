@@ -36,6 +36,32 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 use tokio_util::sync::CancellationToken;
 
+// TLS version combinations
+const TLS_V12_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS12];
+const TLS_V13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+const TLS_V12_V13: &[&SupportedProtocolVersion] =
+    &[&rustls::version::TLS12, &rustls::version::TLS13];
+
+fn map_tls_versions_to_static(list: &[String]) -> &'static [&'static SupportedProtocolVersion] {
+    let mut has12 = false;
+    let mut has13 = false;
+    for part in list {
+        let normalized = part.to_lowercase();
+        let trimmed = normalized.trim();
+        match trimmed {
+            "1.2" | "tls1.2" => has12 = true,
+            "1.3" | "tls1.3" => has13 = true,
+            _ => {}
+        }
+    }
+    match (has12, has13) {
+        (true, true) => TLS_V12_V13,
+        (true, false) => TLS_V12_ONLY,
+        (false, true) => TLS_V13_ONLY,
+        (false, false) => TLS_V12_V13,
+    }
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
     subnet_state: SubnetState,
@@ -109,7 +135,7 @@ impl Http3Server {
         }
 
         let router = Self::setup_router(
-            config,
+            config.clone(),
             &subnet_state,
             &gateway_state,
             &task_queue,
@@ -120,12 +146,17 @@ impl Http3Server {
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
+        // QUIC requires TLS1.3 per spec.
         const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
-        let tls_config = tls_config.tls_versions(TLS13_ONLY);
+
+        // Build TCP-specific TLS versions from config (defaults to 1.2,1.3) using static slices.
+        let tcp_versions_static = map_tls_versions_to_static(&config.http.tls_versions);
+        let tls_config_tcp = tls_config.clone().tls_versions(tcp_versions_static);
+        let tls_config_quic = tls_config.tls_versions(TLS13_ONLY);
 
         let join_handle = tokio::spawn(async move {
-            let tcp_listener = TcpListener::new(addr).rustls(tls_config.clone());
-            let acceptor = QuinnListener::new(tls_config, addr)
+            let tcp_listener = TcpListener::new(addr).rustls(tls_config_tcp.clone());
+            let acceptor = QuinnListener::new(tls_config_quic, addr)
                 .join(tcp_listener)
                 .bind()
                 .await;

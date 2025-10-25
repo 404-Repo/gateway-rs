@@ -92,6 +92,8 @@ pub struct HTTPConfig {
     pub compression: bool,
     pub compression_lvl: u32,
     pub port: u16,
+    #[serde(default = "default_tls_versions")]
+    pub tls_versions: Vec<String>,
     // Rate limits
     pub basic_rate_limit: usize,
     pub update_key_rate_limit: usize,
@@ -188,6 +190,10 @@ fn default_compaction_threshold_bytes() -> u64 {
 
 fn default_compaction_ops() -> u64 {
     4096
+}
+
+fn default_tls_versions() -> Vec<String> {
+    vec!["1.2".to_string(), "1.3".to_string()]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

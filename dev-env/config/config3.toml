@@ -13,6 +13,7 @@ node_id_discovery_retries = 5
 compression = true
 compression_lvl = 3
 port = 4443
+tls_versions = ["1.2", "1.3"]
 basic_rate_limit = 30
 update_key_rate_limit = 10
 add_task_basic_per_ip_rate_limit = 50
