@@ -45,6 +45,8 @@ struct MetricsInner {
     queue_time_max: Gauge,
 
     completed_tasks_by_kind: CounterVec,
+    // Count requests by origin/type label (e.g. blender, unity, discord, unknown)
+    requests_by_origin: CounterVec,
 
     completion_time_avg: GaugeVec,
     completion_time_max: GaugeVec,
@@ -79,6 +81,13 @@ impl Metrics {
                 "Total completed tasks partitioned by kind",
             ),
             &["kind"],
+        )?;
+        let requests_by_origin = CounterVec::new(
+            Opts::new(
+                "requests_by_origin_total",
+                "Total requests partitioned by origin/type",
+            ),
+            &["origin"],
         )?;
         let completion_time_max = GaugeVec::new(
             Opts::new("completion_time_max", "Max completion time for task"),
@@ -115,6 +124,7 @@ impl Metrics {
         registry.register(Box::new(completion_time_max.clone()))?;
         registry.register(Box::new(completed_tasks.clone()))?;
         registry.register(Box::new(completed_tasks_by_kind.clone()))?;
+        registry.register(Box::new(requests_by_origin.clone()))?;
         registry.register(Box::new(failed_tasks.clone()))?;
         registry.register(Box::new(timeout_failed_tasks.clone()))?;
         registry.register(Box::new(tasks_received.clone()))?;
@@ -134,12 +144,20 @@ impl Metrics {
             timeout_failed_tasks,
             tasks_received,
             best_results_total: best_completed_tasks,
+            requests_by_origin,
             map: HashMap::with_capacity_and_hasher(16, RandomState::default()),
         };
 
         Ok(Metrics {
             inner: Arc::new(inner),
         })
+    }
+
+    pub fn inc_request_origin(&self, origin: &str) {
+        self.inner
+            .requests_by_origin
+            .with_label_values(&[origin])
+            .inc();
     }
 
     pub fn registry(&self) -> &Registry {

@@ -23,6 +23,13 @@ use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use regex::Regex;
 
+fn extract_origin(req: &Request) -> &str {
+    req.headers()
+        .get("x-client-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+}
+
 #[inline(always)]
 async fn read_text_field(
     field: multer::Field<'_>,
@@ -200,6 +207,17 @@ pub async fn add_task_handler(
     let queue = depot.require::<DupQueue<Task>>()?;
     let metrics = depot.require::<Metrics>()?;
     let http_cfg = depot.require::<HTTPConfig>()?;
+
+    // Determine and validate origin
+    let origin = extract_origin(req);
+    let record_origin = if http_cfg.allowed_origins.contains(origin) {
+        origin
+    } else {
+        "unknown"
+    };
+
+    metrics.inc_request_origin(record_origin);
+
     if queue.len() >= http_cfg.max_task_queue_len {
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
