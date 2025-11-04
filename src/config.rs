@@ -94,6 +94,8 @@ pub struct HTTPConfig {
     pub port: u16,
     #[serde(default = "default_tls_versions")]
     pub tls_versions: Vec<String>,
+    #[serde(default)]
+    pub allowed_origins: HashSet<String>,
     // Rate limits
     pub basic_rate_limit: usize,
     pub update_key_rate_limit: usize,
