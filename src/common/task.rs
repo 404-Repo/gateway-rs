@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::request::AddTaskResultRequest;
 use crate::bittensor::hotkey::Hotkey;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, TaskInProgressGuard};
 
 struct TaskManagerInner {
     completed: HashMap<Uuid, Vec<AddTaskResultRequest>, RandomState>,
@@ -20,6 +20,7 @@ struct TaskManagerInner {
     prompts: HashMap<Uuid, Arc<String>, RandomState>,
     images: HashMap<Uuid, Bytes, RandomState>,
     assigned_validators: HashMap<Uuid, Vec<Hotkey>, RandomState>,
+    in_progress: HashMap<(Uuid, Hotkey), TaskInProgressGuard, RandomState>,
     metrics: Metrics,
 }
 
@@ -81,6 +82,10 @@ impl TaskManager {
                 initial_capacity,
                 RandomState::default(),
             ),
+            in_progress: HashMap::with_capacity_and_hasher(
+                initial_capacity,
+                RandomState::default(),
+            ),
             metrics,
         });
 
@@ -110,7 +115,7 @@ impl TaskManager {
         let result_lifetime_clone = result_lifetime;
         task::spawn(async move {
             let mut expired_ids: Vec<Uuid> = Vec::new();
-            let mut timeouts_to_count: Vec<Hotkey> = Vec::new();
+            let mut timeouts_to_count: Vec<(Uuid, Hotkey)> = Vec::new();
             loop {
                 tokio::select! {
                     _ = token_child.cancelled() => break,
@@ -144,14 +149,16 @@ impl TaskManager {
                                         .as_ref()
                                         .is_some_and(|vec| vec.iter().any(|r| r.validator_hotkey == *validator));
                                     if !has_any {
-                                        timeouts_to_count.push(validator.clone());
+                                        timeouts_to_count.push((task_id, validator.clone()));
                                     }
                                 }
                             }
                         }
 
-                        for hk in timeouts_to_count.drain(..) {
+                        for (task_id, hk) in timeouts_to_count.drain(..) {
                             inner_clone.metrics.inc_timeout_failed(hk.as_ref()).await;
+                            let key = (task_id, hk.clone());
+                            let _ = inner_clone.in_progress.remove_async(&key).await;
                         }
 
                         inner_clone
@@ -172,12 +179,15 @@ impl TaskManager {
     }
 
     pub async fn add_result(&self, task_id: Uuid, result: AddTaskResultRequest) {
+        let validator = result.validator_hotkey.clone();
         self.inner
             .completed
             .entry_async(task_id)
             .await
             .or_default()
             .push(result);
+        let key = (task_id, validator);
+        let _ = self.inner.in_progress.remove_async(&key).await;
     }
 
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
@@ -254,7 +264,13 @@ impl TaskManager {
             .await
             .or_default();
         if !set.contains(&validator) {
-            set.push(validator);
+            let guard = self.inner.metrics.start_task(validator.as_ref()).await;
+            set.push(validator.clone());
+            let _ = self
+                .inner
+                .in_progress
+                .insert_async((task_id, validator), guard)
+                .await;
         }
     }
 
@@ -286,6 +302,14 @@ impl TaskManager {
         self.inner.execution_time.remove_async(&task_id).await;
         self.inner.prompts.remove_async(&task_id).await;
         self.inner.images.remove_async(&task_id).await;
+        if let Some((_task_id, validators)) =
+            self.inner.assigned_validators.remove_async(&task_id).await
+        {
+            for validator in validators {
+                let key = (task_id, validator);
+                let _ = self.inner.in_progress.remove_async(&key).await;
+            }
+        }
     }
 }
 
