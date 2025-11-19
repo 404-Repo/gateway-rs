@@ -3,6 +3,7 @@ use foldhash::fast::RandomState;
 use scc::HashMap;
 use serde::Serialize;
 use std::fmt;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task;
@@ -24,14 +25,56 @@ struct TaskManagerInner {
     metrics: Metrics,
 }
 
+impl TaskManagerInner {
+    fn new(initial_capacity: usize, expected_results: usize, metrics: Metrics) -> Self {
+        Self {
+            completed: Self::hash_map(initial_capacity),
+            expected_results,
+            execution_time: Self::hash_map(initial_capacity),
+            prompts: Self::hash_map(initial_capacity),
+            images: Self::hash_map(initial_capacity),
+            assigned_validators: Self::hash_map(initial_capacity),
+            in_progress: Self::hash_map(initial_capacity),
+            metrics,
+        }
+    }
+
+    fn hash_map<K, V>(capacity: usize) -> HashMap<K, V, RandomState>
+    where
+        K: Eq + Hash,
+    {
+        HashMap::with_capacity_and_hasher(capacity, RandomState::default())
+    }
+
+    async fn finish_task(&self, task_id: Uuid, validator: &Hotkey) {
+        let key = (task_id, validator.clone());
+        let _ = self.in_progress.remove_async(&key).await;
+    }
+
+    async fn finish_tasks<I>(&self, task_id: Uuid, validators: I)
+    where
+        I: IntoIterator<Item = Hotkey>,
+    {
+        for validator in validators {
+            self.finish_task(task_id, &validator).await;
+        }
+    }
+
+    async fn cleanup_task_payload(&self, task_id: Uuid) {
+        self.prompts.remove_async(&task_id).await;
+        self.images.remove_async(&task_id).await;
+    }
+}
+
 pub struct TaskManager {
     inner: Arc<TaskManagerInner>,
     cancel_token: CancellationToken,
     _cleanup_task: Arc<tokio::task::JoinHandle<()>>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
 pub enum TaskStatus {
+    #[default]
     NoResult,
     Failure {
         reason: String,
@@ -42,12 +85,6 @@ pub enum TaskStatus {
         miner_uid: Option<u32>,
         miner_rating: Option<f32>,
     },
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::NoResult
-    }
 }
 
 impl fmt::Display for TaskStatus {
@@ -69,25 +106,11 @@ impl TaskManager {
         result_lifetime: Duration,
         metrics: Metrics,
     ) -> Self {
-        let inner = Arc::new(TaskManagerInner {
-            completed: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
+        let inner = Arc::new(TaskManagerInner::new(
+            initial_capacity,
             expected_results,
-            execution_time: HashMap::with_capacity_and_hasher(
-                initial_capacity,
-                RandomState::default(),
-            ),
-            prompts: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
-            images: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
-            assigned_validators: HashMap::with_capacity_and_hasher(
-                initial_capacity,
-                RandomState::default(),
-            ),
-            in_progress: HashMap::with_capacity_and_hasher(
-                initial_capacity,
-                RandomState::default(),
-            ),
             metrics,
-        });
+        ));
 
         let cancel_token = CancellationToken::new();
         let token_child = cancel_token.child_token();
@@ -111,28 +134,25 @@ impl TaskManager {
         cleanup_interval: Duration,
         result_lifetime: Duration,
     ) -> tokio::task::JoinHandle<()> {
-        let inner_clone = Arc::clone(&inner);
-        let result_lifetime_clone = result_lifetime;
         task::spawn(async move {
             let mut expired_ids: Vec<Uuid> = Vec::new();
-            let mut timeouts_to_count: Vec<(Uuid, Hotkey)> = Vec::new();
             loop {
                 tokio::select! {
                     _ = token_child.cancelled() => break,
                     _ = tokio::time::sleep(cleanup_interval) => {
                         let now = Instant::now();
-                        inner_clone.completed.retain_async(|_, results| {
+                        inner.completed.retain_async(|_, results| {
                             results
                                 .last()
-                                .is_some_and(|last| now.duration_since(last.instant) < result_lifetime_clone)
+                                .is_some_and(|last| now.duration_since(last.instant) < result_lifetime)
                         }).await;
 
                         // Determine expired task ids based on execution_time and drop them
                         expired_ids.clear();
-                        inner_clone
+                        inner
                             .execution_time
                             .retain_async(|task_id, start| {
-                                let keep = now.duration_since(*start) < result_lifetime_clone;
+                                let keep = now.duration_since(*start) < result_lifetime;
                                 if !keep {
                                     expired_ids.push(*task_id);
                                 }
@@ -140,38 +160,31 @@ impl TaskManager {
                             }).await;
 
                         // For expired tasks, increment timeout failures for validators that did not submit any result
-                        timeouts_to_count.clear();
                         for &task_id in &expired_ids {
-                            if let Some((_k, validators)) = inner_clone.assigned_validators.remove_async(&task_id).await {
-                                let had_results = inner_clone.completed.get_async(&task_id).await;
-                                for validator in validators.iter() {
-                                    let has_any = had_results
-                                        .as_ref()
-                                        .is_some_and(|vec| vec.iter().any(|r| r.validator_hotkey == *validator));
-                                    if !has_any {
-                                        timeouts_to_count.push((task_id, validator.clone()));
+                            if let Some((_, validators)) = inner.assigned_validators.remove_async(&task_id).await {
+                                let had_results = inner.completed.get_async(&task_id).await;
+                                for validator in validators {
+                                    if !Self::has_result(&had_results, &validator) {
+                                        inner.metrics.inc_timeout_failed(validator.as_ref()).await;
                                     }
+                                    inner.finish_task(task_id, &validator).await;
                                 }
                             }
+                            inner.cleanup_task_payload(task_id).await;
                         }
-
-                        for (task_id, hk) in timeouts_to_count.drain(..) {
-                            inner_clone.metrics.inc_timeout_failed(hk.as_ref()).await;
-                            let key = (task_id, hk.clone());
-                            let _ = inner_clone.in_progress.remove_async(&key).await;
-                        }
-
-                        inner_clone
-                            .prompts
-                            .retain_async(|task_id, _| inner_clone.execution_time.contains_sync(task_id)).await;
-
-                        inner_clone
-                            .images
-                            .retain_async(|task_id, _| inner_clone.execution_time.contains_sync(task_id)).await;
                     }
                 }
             }
         })
+    }
+
+    fn has_result(
+        results: &Option<impl std::ops::Deref<Target = Vec<AddTaskResultRequest>>>,
+        validator: &Hotkey,
+    ) -> bool {
+        results
+            .as_ref()
+            .is_some_and(|vec| vec.iter().any(|r| &r.validator_hotkey == validator))
     }
 
     pub fn abort(&self) {
@@ -186,47 +199,51 @@ impl TaskManager {
             .await
             .or_default()
             .push(result);
-        let key = (task_id, validator);
-        let _ = self.inner.in_progress.remove_async(&key).await;
+        self.inner.finish_task(task_id, &validator).await;
     }
 
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
-        match self.inner.completed.get_async(&task_id).await {
-            Some(results) if !results.is_empty() => {
-                if let Some(reason) = results.iter().rev().find_map(|r| r.reason.clone()) {
-                    return TaskStatus::Failure { reason };
-                }
-                let mut success_count: usize = 0;
-                let mut best_index: Option<usize> = None;
-                let mut best_score: f32 = f32::NEG_INFINITY;
+        let Some(results) = self.inner.completed.get_async(&task_id).await else {
+            return TaskStatus::NoResult;
+        };
 
-                for (idx, result) in results.iter().enumerate() {
-                    if result.is_success() {
-                        success_count += 1;
-                        let score = result.get_score().unwrap_or(0.0);
-                        if score >= best_score {
-                            best_score = score;
-                            best_index = Some(idx);
-                        }
-                    }
-                }
+        if results.is_empty() {
+            return TaskStatus::NoResult;
+        }
 
-                if success_count < self.inner.expected_results {
-                    TaskStatus::PartialResult(success_count)
-                } else if let Some(index) = best_index {
-                    let best = &results[index];
-                    TaskStatus::Success {
-                        miner_hotkey: best.miner_hotkey.clone(),
-                        miner_uid: best.miner_uid,
-                        miner_rating: best.miner_rating,
-                    }
-                } else {
-                    TaskStatus::Failure {
-                        reason: "No successful result found".to_string(),
-                    }
-                }
+        if let Some(reason) = results.iter().rev().find_map(|r| r.reason.clone()) {
+            return TaskStatus::Failure { reason };
+        }
+
+        let (success_count, best_index) = results
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.is_success())
+            .fold(
+                (0, None),
+                |(count, best): (usize, Option<(usize, f32)>), (idx, result)| {
+                    let score = result.get_score().unwrap_or(0.0);
+                    let new_best = match best {
+                        Some((_, best_score)) if score < best_score => best,
+                        _ => Some((idx, score)),
+                    };
+                    (count + 1, new_best)
+                },
+            );
+
+        if success_count < self.inner.expected_results {
+            TaskStatus::PartialResult(success_count)
+        } else if let Some((index, _)) = best_index {
+            let best = &results[index];
+            TaskStatus::Success {
+                miner_hotkey: best.miner_hotkey.clone(),
+                miner_uid: best.miner_uid,
+                miner_rating: best.miner_rating,
             }
-            _ => TaskStatus::NoResult,
+        } else {
+            TaskStatus::Failure {
+                reason: "No successful result found".to_string(),
+            }
         }
     }
 
@@ -279,7 +296,7 @@ impl TaskManager {
             .prompts
             .get_async(&task_id)
             .await
-            .map(|entry| Arc::clone(entry.get()))
+            .map(|e| Arc::clone(e.get()))
     }
 
     pub async fn get_image(&self, task_id: Uuid) -> Option<Bytes> {
@@ -287,7 +304,7 @@ impl TaskManager {
             .images
             .get_async(&task_id)
             .await
-            .map(|entry| entry.get().clone())
+            .map(|e| e.get().clone())
     }
 
     pub async fn get_time(&self, task_id: Uuid) -> Option<f64> {
@@ -295,20 +312,14 @@ impl TaskManager {
             .execution_time
             .get_async(&task_id)
             .await
-            .map(|start| start.elapsed().as_secs_f64())
+            .map(|e| e.elapsed().as_secs_f64())
     }
 
     pub async fn remove_time(&self, task_id: Uuid) {
         self.inner.execution_time.remove_async(&task_id).await;
-        self.inner.prompts.remove_async(&task_id).await;
-        self.inner.images.remove_async(&task_id).await;
-        if let Some((_task_id, validators)) =
-            self.inner.assigned_validators.remove_async(&task_id).await
-        {
-            for validator in validators {
-                let key = (task_id, validator);
-                let _ = self.inner.in_progress.remove_async(&key).await;
-            }
+        self.inner.cleanup_task_payload(task_id).await;
+        if let Some((_, validators)) = self.inner.assigned_validators.remove_async(&task_id).await {
+            self.inner.finish_tasks(task_id, validators).await;
         }
     }
 }

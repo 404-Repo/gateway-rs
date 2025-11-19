@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::api::Task;
+use crate::bittensor::hotkey::Hotkey;
 use crate::bittensor::subnet_state::SubnetState;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
@@ -86,6 +87,8 @@ impl Http3Server {
             .parse()
             .map_err(|e| anyhow!("Invalid listen address {}: {}", addr_str, e))?;
 
+        let validator_whitelist: foldhash::HashSet<Hotkey> =
+            config.http.validator_whitelist.iter().cloned().collect();
         let subnet_state = SubnetState::new(
             config.http.wss_bittensor.clone(),
             config.http.subnet_number,
@@ -93,6 +96,7 @@ impl Http3Server {
             Duration::from_secs(config.http.subnet_poll_interval_sec),
             config.http.wss_max_message_size,
             shutdown.child_token(),
+            validator_whitelist,
         );
 
         let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
