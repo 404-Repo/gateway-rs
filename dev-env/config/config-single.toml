@@ -64,6 +64,7 @@ keys_cache_ttl_sec = 43200
 keys_cache_initial_capacity = 16000
 keys_cache_max_capacity = 32000
 deleted_keys_ttl_minutes = 60
+company_usage_flush_interval_sec = 5
 
 [cert]
 dangerous_skip_verification = true

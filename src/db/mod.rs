@@ -1,7 +1,7 @@
 mod key_validator;
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use foldhash::fast::RandomState;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
@@ -23,14 +23,15 @@ pub use key_validator::ApiKeyValidator;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum StmtKey {
     ServerTimeUtc,
-    FullUsersKeys,
-    DeltaUsersKeys,
+    AllUserKeyHashes,
+    DeltaUserKeyHashes,
     FullCompaniesMeta,
     DeltaCompaniesMeta,
     FullCompanyKeys,
     DeltaCompanyKeys,
     CompanyKeysForIds,
     CleanupDeletedKeysBoth,
+    UpsertCompanyUsageStats,
 }
 
 #[derive(Debug, Clone)]
@@ -305,13 +306,13 @@ impl Database {
         )
         .await;
         self.upsert_stmt(
-            StmtKey::FullUsersKeys,
-            client.prepare(Self::Q_FULL_USERS_KEYS).await?,
+            StmtKey::AllUserKeyHashes,
+            client.prepare(Self::Q_ALL_USER_KEY_HASHES).await?,
         )
         .await;
         self.upsert_stmt(
-            StmtKey::DeltaUsersKeys,
-            client.prepare(Self::Q_DELTA_USERS_KEYS).await?,
+            StmtKey::DeltaUserKeyHashes,
+            client.prepare(Self::Q_DELTA_USER_KEY_HASHES).await?,
         )
         .await;
         self.upsert_stmt(
@@ -344,6 +345,11 @@ impl Database {
             client.prepare(Self::Q_CLEANUP_DELETED_KEYS_BOTH).await?,
         )
         .await;
+        self.upsert_stmt(
+            StmtKey::UpsertCompanyUsageStats,
+            client.prepare(Self::Q_UPSERT_COMPANY_USAGE_STATS).await?,
+        )
+        .await;
         Ok(())
     }
 
@@ -354,14 +360,15 @@ impl Database {
         let client = self.load_client().await?;
         let sql = match key {
             StmtKey::ServerTimeUtc => Self::Q_SERVER_TIME_UTC,
-            StmtKey::FullUsersKeys => Self::Q_FULL_USERS_KEYS,
-            StmtKey::DeltaUsersKeys => Self::Q_DELTA_USERS_KEYS,
+            StmtKey::AllUserKeyHashes => Self::Q_ALL_USER_KEY_HASHES,
+            StmtKey::DeltaUserKeyHashes => Self::Q_DELTA_USER_KEY_HASHES,
             StmtKey::FullCompaniesMeta => Self::Q_FULL_COMPANIES_META,
             StmtKey::DeltaCompaniesMeta => Self::Q_DELTA_COMPANIES_META,
             StmtKey::FullCompanyKeys => Self::Q_FULL_COMPANY_KEYS,
             StmtKey::DeltaCompanyKeys => Self::Q_DELTA_COMPANY_KEYS,
             StmtKey::CompanyKeysForIds => Self::Q_COMPANY_KEYS_FOR_IDS,
             StmtKey::CleanupDeletedKeysBoth => Self::Q_CLEANUP_DELETED_KEYS_BOTH,
+            StmtKey::UpsertCompanyUsageStats => Self::Q_UPSERT_COMPANY_USAGE_STATS,
         };
         let stmt = client.prepare(sql).await?;
         self.upsert_stmt(key, stmt.clone()).await;
@@ -372,15 +379,18 @@ impl Database {
 SELECT NOW()::timestamptz AS server_time_utc;
 "#;
 
-    const Q_FULL_USERS_KEYS: &'static str = r#"
+    const Q_ALL_USER_KEY_HASHES: &'static str = r#"
 SELECT u.id,
-       COALESCE(array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL), '{}') AS api_key_hashes
+       COALESCE(
+           array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL),
+           '{}'::bytea[]
+       ) AS api_key_hashes
 FROM users u
 LEFT JOIN api_keys a ON u.id = a.user_id
 GROUP BY u.id;
 "#;
 
-    const Q_DELTA_USERS_KEYS: &'static str = r#"
+    const Q_DELTA_USER_KEY_HASHES: &'static str = r#"
 WITH changed AS (
   SELECT DISTINCT user_id
   FROM api_keys
@@ -389,7 +399,10 @@ WITH changed AS (
          OR (deleted_at IS NOT NULL AND deleted_at > $1 AND deleted_at <= $2)
 )
 SELECT c.user_id AS id,
-       COALESCE(array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL), '{}') AS api_key_hashes
+       COALESCE(
+           array_agg(a.api_key_hash) FILTER (WHERE a.deleted_at IS NULL),
+           '{}'::bytea[]
+       ) AS api_key_hashes
 FROM changed c
 LEFT JOIN api_keys a ON a.user_id = c.user_id
 GROUP BY c.user_id;
@@ -425,7 +438,10 @@ WITH changed AS (
      OR (deleted_at IS NOT NULL AND deleted_at > $1 AND deleted_at <= $2)
 )
 SELECT c.company_id,
-       COALESCE(array_agg(k.api_key_hash) FILTER (WHERE k.deleted_at IS NULL), '{}') AS api_key_hashes
+       COALESCE(
+           array_agg(k.api_key_hash) FILTER (WHERE k.deleted_at IS NULL),
+           '{}'::bytea[]
+       ) AS api_key_hashes
 FROM changed c
 LEFT JOIN company_api_keys k ON k.company_id = c.company_id
 GROUP BY c.company_id;
@@ -444,6 +460,15 @@ WITH del_user AS (
 SELECT
   (SELECT COUNT(*) FROM del_user) AS n1,
   (SELECT COUNT(*) FROM del_company) AS n2;
+"#;
+
+    const Q_UPSERT_COMPANY_USAGE_STATS: &'static str = r#"
+INSERT INTO company_usage_stats (company_id, bucket, task_kind, request_count)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (company_id, bucket, task_kind)
+DO UPDATE SET
+    request_count = company_usage_stats.request_count + EXCLUDED.request_count,
+    updated_at = NOW();
 "#;
 
     fn should_reconnect(&self, e: &Error) -> bool {
@@ -514,34 +539,57 @@ SELECT
         }
     }
 
-    pub async fn fetch_full_users_keys(&self) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
-        let rows = self.query_prepared(StmtKey::FullUsersKeys, &[]).await?;
+    async fn execute_prepared(
+        &self,
+        key: StmtKey,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<u64> {
+        let stmt = self.get_statement(key).await?;
+        let client = self.load_client().await?;
+        match client.execute(&stmt, params).await {
+            Ok(rows) => Ok(rows),
+            Err(e) => {
+                info!("Database execute failed: {}. Trying to reconnect...", e);
+                if self.should_reconnect(&e) {
+                    self.reconnect().await?;
+                    let stmt = self.get_statement(key).await?;
+                    let client = self.load_client().await?;
+                    Ok(client.execute(&stmt, params).await?)
+                } else {
+                    Err(anyhow!(e))
+                }
+            }
+        }
+    }
+
+    pub async fn fetch_all_user_key_hashes(&self) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
+        let rows = self.query_prepared(StmtKey::AllUserKeyHashes, &[]).await?;
         let result = rows
             .into_iter()
             .map(|row| {
                 let user_id: uuid::Uuid = row.get("id");
-                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
-                (user_id, api_key_hashes)
+                let api_key_hashes: Vec<Option<Vec<u8>>> = row.get("api_key_hashes");
+                (user_id, api_key_hashes.into_iter().flatten().collect())
             })
             .collect();
         Ok(result)
     }
 
-    pub async fn fetch_delta_users_keys(
+    pub async fn fetch_delta_user_key_hashes(
         &self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<(uuid::Uuid, Vec<Vec<u8>>)>> {
         let params: [&(dyn ToSql + Sync); 2] = [&since, &until];
         let rows = self
-            .query_prepared(StmtKey::DeltaUsersKeys, &params)
+            .query_prepared(StmtKey::DeltaUserKeyHashes, &params)
             .await?;
         let result = rows
             .into_iter()
             .map(|row| {
                 let user_id: uuid::Uuid = row.get("id");
-                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
-                (user_id, api_key_hashes)
+                let api_key_hashes: Vec<Option<Vec<u8>>> = row.get("api_key_hashes");
+                (user_id, api_key_hashes.into_iter().flatten().collect())
             })
             .collect();
         Ok(result)
@@ -610,8 +658,8 @@ SELECT
             .into_iter()
             .map(|row| {
                 let company_id: uuid::Uuid = row.get("company_id");
-                let api_key_hashes: Vec<Vec<u8>> = row.get("api_key_hashes");
-                (company_id, api_key_hashes)
+                let api_key_hashes: Vec<Option<Vec<u8>>> = row.get("api_key_hashes");
+                (company_id, api_key_hashes.into_iter().flatten().collect())
             })
             .collect();
         Ok(result)
@@ -639,6 +687,18 @@ SELECT
             .ok_or_else(|| anyhow!("Server time query returned no rows"))?;
         let dt: DateTime<Utc> = row.get("server_time_utc");
         Ok(dt)
+    }
+
+    pub async fn record_company_usage(
+        &self,
+        company_id: uuid::Uuid,
+        bucket: NaiveDate,
+        task_kind: &str,
+        request_count: i64,
+    ) -> Result<u64> {
+        let params: [&(dyn ToSql + Sync); 4] = [&company_id, &bucket, &task_kind, &request_count];
+        self.execute_prepared(StmtKey::UpsertCompanyUsageStats, &params)
+            .await
     }
 }
 

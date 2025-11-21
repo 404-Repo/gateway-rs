@@ -17,7 +17,7 @@ use backon::Retryable;
 use bytes::Bytes;
 use foldhash::fast::RandomState;
 use futures_util::future::try_join_all;
-use gateway_state::GatewayState;
+use gateway_state::{GatewayState, GatewayStateInit};
 use http::StatusCode;
 use network::Network;
 use openraft::BasicNode;
@@ -47,10 +47,10 @@ use crate::api::Task;
 use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
+use crate::common::company_usage::CompanyUsageRecorder;
 use crate::common::crypto_provider::init_crypto_provider;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
-use crate::common::task::TaskManager;
 use crate::config::NodeConfig;
 use crate::db::ApiKeyValidator;
 use crate::db::DatabaseBuilder;
@@ -63,6 +63,7 @@ use crate::raft::client::RClientBuilder;
 use crate::raft::store::RateLimitDelta;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
+use crate::task::TaskManager;
 use scc::Queue;
 use tokio_util::sync::CancellationToken;
 
@@ -661,19 +662,21 @@ pub async fn start_gateway(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     ));
 
-    let db = DatabaseBuilder::new()
-        .host(&config.db.host)
-        .port(config.db.port)
-        .user(&config.db.user)
-        .password(&config.db.password)
-        .dbname(&config.db.db)
-        .sslcert_path(&config.db.sslcert)
-        .sslkey_path(&config.db.sslkey)
-        .sslrootcert_path(&config.db.sslrootcert)
-        .build()
-        .await?;
+    let db = Arc::new(
+        DatabaseBuilder::new()
+            .host(&config.db.host)
+            .port(config.db.port)
+            .user(&config.db.user)
+            .password(&config.db.password)
+            .dbname(&config.db.db)
+            .sslcert_path(&config.db.sslcert)
+            .sslkey_path(&config.db.sslkey)
+            .sslrootcert_path(&config.db.sslrootcert)
+            .build()
+            .await?,
+    );
     let api_key_validator = ApiKeyValidator::new(
-        Arc::new(db),
+        Arc::clone(&db),
         Duration::from_secs(config.db.api_keys_update_interval),
         config.db.keys_cache_ttl_sec,
         config.db.keys_cache_initial_capacity,
@@ -682,6 +685,12 @@ pub async fn start_gateway(
         config.db.deleted_keys_ttl_minutes,
     )?;
     let api_key_validator = Arc::new(api_key_validator);
+    let flush_interval = config.db.company_usage_flush_interval_sec.max(1);
+    let company_usage_recorder = CompanyUsageRecorder::new(
+        Arc::clone(&db),
+        Duration::from_secs(flush_interval),
+        gateway_shutdown.clone(),
+    );
 
     let api_key_validator_updater = tokio::spawn(ApiKeyValidator::run(
         Arc::clone(&api_key_validator),
@@ -700,15 +709,16 @@ pub async fn start_gateway(
 
     let rate_limit_queue = Arc::new(Queue::<RateLimitDelta>::default());
 
-    let gateway_state = GatewayState::new(
-        state_machine_store,
-        raft.clone(),
-        last_task_acquisition.clone(),
-        api_key_validator,
-        task_manager.clone(),
-        Arc::clone(&config),
-        rate_limit_queue.clone(),
-    );
+    let gateway_state = GatewayState::new(GatewayStateInit {
+        state: state_machine_store,
+        raft: raft.clone(),
+        last_task_acquisition: last_task_acquisition.clone(),
+        key_validator_updater: api_key_validator,
+        task_manager: task_manager.clone(),
+        config: Arc::clone(&config),
+        rate_limit_queue: rate_limit_queue.clone(),
+        usage_recorder: company_usage_recorder.clone(),
+    });
 
     let key_cert = if use_cert_files {
         Keycert::new()

@@ -7,6 +7,7 @@ mod http3;
 mod metrics;
 mod protocol;
 mod raft;
+mod task;
 
 use clap::Parser;
 use clap::ValueEnum;

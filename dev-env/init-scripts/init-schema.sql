@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   display_name VARCHAR(255),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 CREATE TABLE IF NOT EXISTS api_keys (
   id SERIAL PRIMARY KEY,
@@ -77,3 +78,15 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user_id_updated ON api_keys(user_id, upd
 CREATE INDEX IF NOT EXISTS idx_api_keys_user_id_created ON api_keys(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_company_api_keys_company_id_updated ON company_api_keys(company_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_company_api_keys_company_id_created ON company_api_keys(company_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS company_usage_stats (
+  company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
+  bucket DATE NOT NULL,
+  task_kind VARCHAR(16) NOT NULL DEFAULT 'txt3d',
+  request_count BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (company_id, bucket, task_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_company_usage_bucket ON company_usage_stats(bucket DESC, task_kind);
+CREATE INDEX IF NOT EXISTS idx_company_usage_company_bucket ON company_usage_stats(company_id, bucket DESC, task_kind);

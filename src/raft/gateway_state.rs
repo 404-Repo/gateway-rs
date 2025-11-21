@@ -3,10 +3,12 @@ use super::store::{rate_limit_key, RateLimitDelta, RateLimitWindow, Subject};
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
-use crate::common::task::TaskManager;
+use crate::common::company_usage::CompanyUsageRecorder;
 use crate::config::NodeConfig;
 use crate::db::ApiKeyValidator;
 use crate::http3::client::{Http3Client, Http3ClientBuilder};
+use crate::metrics::TaskKind;
+use crate::task::TaskManager;
 use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
@@ -68,11 +70,23 @@ struct GatewayStateInner {
     task_manager: TaskManager,
     config: Arc<NodeConfig>,
     rate_limit_queue: Arc<Queue<RateLimitDelta>>,
+    usage_recorder: CompanyUsageRecorder,
 }
 
 #[derive(Clone)]
 pub struct GatewayState {
     internal: Arc<GatewayStateInner>,
+}
+
+pub struct GatewayStateInit {
+    pub state: Arc<StateMachineStore>,
+    pub raft: Raft,
+    pub last_task_acquisition: Arc<AtomicU64>,
+    pub key_validator_updater: Arc<ApiKeyValidator>,
+    pub task_manager: TaskManager,
+    pub config: Arc<NodeConfig>,
+    pub rate_limit_queue: Arc<Queue<RateLimitDelta>>,
+    pub usage_recorder: CompanyUsageRecorder,
 }
 
 impl GatewayState {
@@ -121,15 +135,17 @@ impl GatewayState {
         })
     }
 
-    pub fn new(
-        state: Arc<StateMachineStore>,
-        raft: Raft,
-        last_task_acquisition: Arc<AtomicU64>,
-        key_validator_updater: Arc<ApiKeyValidator>,
-        task_manager: TaskManager,
-        config: Arc<NodeConfig>,
-        rate_limit_queue: Arc<Queue<RateLimitDelta>>,
-    ) -> Self {
+    pub fn new(args: GatewayStateInit) -> Self {
+        let GatewayStateInit {
+            state,
+            raft,
+            last_task_acquisition,
+            key_validator_updater,
+            task_manager,
+            config,
+            rate_limit_queue,
+            usage_recorder,
+        } = args;
         Self {
             internal: Arc::new(GatewayStateInner {
                 state,
@@ -139,6 +155,7 @@ impl GatewayState {
                 task_manager,
                 config,
                 rate_limit_queue,
+                usage_recorder,
             }),
         }
     }
@@ -357,6 +374,13 @@ impl GatewayState {
 
     pub fn enqueue_rate_limit_delta(&self, delta: RateLimitDelta) {
         self.internal.rate_limit_queue.push(delta);
+    }
+
+    pub async fn record_company_usage(&self, company_id: Uuid, task_kind: TaskKind) {
+        self.internal
+            .usage_recorder
+            .record(company_id, task_kind)
+            .await;
     }
 
     pub async fn submit_rate_limit_deltas(

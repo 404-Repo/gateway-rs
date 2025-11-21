@@ -19,7 +19,8 @@ use crate::common::queue::DupQueue;
 use crate::config::{HTTPConfig, ImageConfig, PromptConfig};
 use crate::http3::error::ServerError;
 use crate::http3::handlers::common::{DepotExt, BOUNDARY_PREFIX, MULTIPART_PREFIX};
-use crate::metrics::Metrics;
+use crate::http3::rate_limits::RateLimitContext;
+use crate::metrics::{Metrics, TaskKind};
 use crate::raft::gateway_state::GatewayState;
 use regex::Regex;
 
@@ -185,6 +186,12 @@ pub async fn add_task_handler(
         }));
     }
 
+    let task_kind = if has_image {
+        TaskKind::ImageTo3D
+    } else {
+        TaskKind::TextTo3D
+    };
+
     if let Some(prompt) = &add_task.prompt {
         let prompt_cfg = depot.require::<PromptConfig>()?;
         let len = prompt.chars().count();
@@ -207,6 +214,7 @@ pub async fn add_task_handler(
     let queue = depot.require::<DupQueue<Task>>()?;
     let metrics = depot.require::<Metrics>()?;
     let http_cfg = depot.require::<HTTPConfig>()?;
+    let is_company_request = depot.require::<RateLimitContext>()?.is_company_key;
 
     // Determine and validate origin
     let origin = extract_origin(req);
@@ -261,6 +269,20 @@ pub async fn add_task_handler(
     );
 
     gateway_state.task_manager().add_task(task).await;
+
+    if is_company_request {
+        if let Some(api_key) = req
+            .headers()
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+        {
+            if let Some((company_id, _)) = gateway_state.get_company_info_from_key(api_key).await {
+                gateway_state
+                    .record_company_usage(company_id, task_kind)
+                    .await;
+            }
+        }
+    }
 
     res.render(Json(serde_json::json!({
         "id": task_id

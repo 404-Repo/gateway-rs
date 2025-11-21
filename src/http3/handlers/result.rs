@@ -570,8 +570,12 @@ pub async fn add_result_handler(
             .record_completion_time(&task_result.validator_hotkey, elapsed)
             .await;
     }
-    manager.add_result(task_id, task_result).await;
-    manager.remove_time(task_id).await;
+
+    let all_assignments_completed = manager.add_result(task_id, task_result).await;
+
+    if all_assignments_completed {
+        manager.finalize_task(task_id).await;
+    }
 
     res.status_code(StatusCode::OK);
     res.render(Text::Plain("Ok"));
