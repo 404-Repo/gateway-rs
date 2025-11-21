@@ -7,6 +7,8 @@ use std::{fmt, path::Path};
 use tracing::Level;
 use uuid::Uuid;
 
+use crate::bittensor::hotkey::Hotkey;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
@@ -106,6 +108,8 @@ pub struct HTTPConfig {
     pub add_task_basic_per_ip_rate_limit: usize,
     #[serde(default)]
     pub add_task_whitelist: HashSet<String>,
+    #[serde(default)]
+    pub validator_whitelist: HashSet<Hotkey>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,

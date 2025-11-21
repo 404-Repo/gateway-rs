@@ -46,6 +46,7 @@ get_timeout_sec = 2
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
 add_task_whitelist = []
+validator_whitelist = []
 distributed_rate_limiter_max_capacity = 4096
 allowed_origins = ["discord", "unity", "blender"]
 

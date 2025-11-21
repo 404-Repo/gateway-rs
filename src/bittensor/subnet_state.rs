@@ -3,6 +3,7 @@ use async_tungstenite::tokio::connect_async_with_config;
 use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
 use foldhash::fast::RandomState;
+use foldhash::HashSet as FoldHashSet;
 use futures_util::StreamExt;
 use hex;
 use itertools::izip;
@@ -56,6 +57,7 @@ pub struct State {
 struct Inner {
     map: HashMap<AccountId32, HotkeyData, RandomState>,
     join_handle: JoinHandle<()>,
+    validator_whitelist: FoldHashSet<Hotkey>,
 }
 
 #[derive(Clone)]
@@ -71,9 +73,11 @@ impl SubnetState {
         poll_interval: Duration,
         wss_max_message_size: usize,
         shutdown: CancellationToken,
+        validator_whitelist: FoldHashSet<Hotkey>,
     ) -> Self {
         let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
             let map = HashMap::with_capacity_and_hasher(256, RandomState::default());
+            let whitelist = validator_whitelist.clone();
             let join_handle = tokio::spawn({
                 let weak = weak.clone();
                 let wss_bittensor = wss_bittensor.clone();
@@ -109,13 +113,22 @@ impl SubnetState {
                     }
                 }
             });
-            Inner { map, join_handle }
+            Inner {
+                map,
+                join_handle,
+                validator_whitelist: whitelist,
+            }
         });
         SubnetState { inner }
     }
 
     // Check that the hotkey exists and has at least 10k TAO
+    // If the hotkey is in the whitelist, skip all checks
     pub async fn validate_hotkey(&self, hotkey: &Hotkey) -> Result<()> {
+        if self.inner.validator_whitelist.contains(hotkey) {
+            return Ok(());
+        }
+
         let account_id = ss58_decode(hotkey)?;
         if let Some(hk) = self.inner.map.get_async(&account_id).await {
             let total_stake = hk.total_stake;
@@ -282,6 +295,7 @@ impl fmt::Display for Balance {
 
 #[cfg(test)]
 mod tests {
+    use super::{FoldHashSet, Hotkey};
     use crate::bittensor::{crypto::ss58_decode, subnet_state::SubnetState};
     use rustls::crypto::CryptoProvider;
     use std::time::Duration;
@@ -310,6 +324,7 @@ mod tests {
             poll_interval,
             2097152,
             CancellationToken::new(),
+            FoldHashSet::<Hotkey>::default(),
         );
 
         tokio::time::sleep(Duration::from_secs(2)).await;
