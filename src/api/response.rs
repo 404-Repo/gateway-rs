@@ -3,7 +3,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::bittensor::hotkey::Hotkey;
-use crate::common::task::TaskStatus;
+use crate::task::TaskStatus;
 
 use super::Task;
 
@@ -105,7 +105,7 @@ pub struct LeaderResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::task::TaskStatus;
+    use crate::task::TaskStatus;
 
     #[test]
     fn converts_no_result() {

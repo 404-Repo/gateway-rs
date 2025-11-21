@@ -98,6 +98,25 @@ impl ApiKeyValidator {
         }
     }
 
+    fn convert_hash(bytes: &[u8]) -> Option<[u8; 32]> {
+        (bytes.len() == 32).then(|| {
+            let mut array = [0u8; 32];
+            array.copy_from_slice(bytes);
+            array
+        })
+    }
+
+    fn convert_hashes<I, T>(hashes: I) -> Vec<[u8; 32]>
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<[u8]>,
+    {
+        hashes
+            .into_iter()
+            .filter_map(|bytes| Self::convert_hash(bytes.as_ref()))
+            .collect()
+    }
+
     async fn update_entity_hashes(
         &self,
         forward_map: &scc::HashMap<Uuid, Vec<[u8; 32]>, RandomState>,
@@ -198,7 +217,7 @@ impl ApiKeyValidator {
         if last_sync_sec != 0 {
             let since = DateTime::<Utc>::from_timestamp(last_sync_sec as i64, 0)
                 .unwrap_or_else(|| now - ChronoDuration::seconds(1));
-            let deltas = self.db.fetch_delta_users_keys(since, now).await?;
+            let deltas = self.db.fetch_delta_user_key_hashes(since, now).await?;
             let total_new = deltas.iter().map(|(_, v)| v.len()).sum::<usize>();
             info!(
                 "Fetched {} user API key hashes for {} users (delta)",
@@ -206,19 +225,12 @@ impl ApiKeyValidator {
                 deltas.len()
             );
             for (user_id, new_hashes) in deltas {
-                let mut converted: Vec<[u8; 32]> = Vec::with_capacity(new_hashes.len());
-                for v in new_hashes {
-                    if v.len() == 32 {
-                        let mut a = [0u8; 32];
-                        a.copy_from_slice(&v);
-                        converted.push(a);
-                    }
-                }
+                let converted = Self::convert_hashes(new_hashes);
                 self.apply_user_hashes(user_id, converted).await;
             }
         } else {
             // Full fetch on first run
-            let all = self.db.fetch_full_users_keys().await?;
+            let all = self.db.fetch_all_user_key_hashes().await?;
             info!(
                 "Retrieved {} API key hashes for {} users from the database",
                 all.iter().map(|(_, v)| v.len()).sum::<usize>(),
@@ -230,15 +242,9 @@ impl ApiKeyValidator {
             self.api_key_hashes.clear_async().await;
             self.users.clear_async().await;
             for (user_id, hashes) in all {
-                let mut list: Vec<[u8; 32]> = Vec::with_capacity(hashes.len());
-                for v in hashes {
-                    if v.len() == 32 {
-                        let mut a = [0u8; 32];
-                        a.copy_from_slice(&v);
-                        // update reverse map and push into forward list
-                        let _ = self.api_key_hashes.insert_async(a, user_id).await;
-                        list.push(a);
-                    }
+                let list = Self::convert_hashes(hashes);
+                for hash in &list {
+                    let _ = self.api_key_hashes.insert_async(*hash, user_id).await;
                 }
                 let _ = self.users.insert_async(user_id, list).await;
             }
@@ -286,14 +292,7 @@ impl ApiKeyValidator {
                 total_new, companies
             );
             for (cid, hashes) in deltas {
-                let mut list: Vec<[u8; 32]> = Vec::with_capacity(hashes.len());
-                for v in hashes {
-                    if v.len() == 32 {
-                        let mut a = [0u8; 32];
-                        a.copy_from_slice(&v);
-                        list.push(a);
-                    }
-                }
+                let list = Self::convert_hashes(hashes);
                 self.apply_company_hashes(cid, list).await;
             }
         } else {
@@ -305,11 +304,9 @@ impl ApiKeyValidator {
 
             let mut grouped: FoldHashMap<Uuid, Vec<[u8; 32]>> = FoldHashMap::default();
             for (cid, hash) in all_keys {
-                if hash.len() == 32 {
-                    let mut a = [0u8; 32];
-                    a.copy_from_slice(&hash);
-                    let _ = self.company_api_key_hashes.insert_async(a, cid).await;
-                    grouped.entry(cid).or_default().push(a);
+                if let Some(array) = Self::convert_hash(&hash) {
+                    let _ = self.company_api_key_hashes.insert_async(array, cid).await;
+                    grouped.entry(cid).or_default().push(array);
                 }
             }
             let companies = grouped.len();

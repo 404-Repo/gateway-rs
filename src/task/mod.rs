@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use foldhash::fast::RandomState;
-use scc::HashMap;
+use scc::{hash_map::Entry, HashMap};
 use serde::Serialize;
 use std::fmt;
 use std::hash::Hash;
@@ -51,12 +51,18 @@ impl TaskManagerInner {
         let _ = self.in_progress.remove_async(&key).await;
     }
 
-    async fn finish_tasks<I>(&self, task_id: Uuid, validators: I)
-    where
-        I: IntoIterator<Item = Hotkey>,
-    {
-        for validator in validators {
-            self.finish_task(task_id, &validator).await;
+    async fn complete_assignment(&self, task_id: Uuid, validator: &Hotkey) -> bool {
+        match self.assigned_validators.entry_async(task_id).await {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().retain(|v| v != validator);
+                if entry.get().is_empty() {
+                    let _ = entry.remove_entry();
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => true,
         }
     }
 
@@ -191,7 +197,7 @@ impl TaskManager {
         self.cancel_token.cancel();
     }
 
-    pub async fn add_result(&self, task_id: Uuid, result: AddTaskResultRequest) {
+    pub async fn add_result(&self, task_id: Uuid, result: AddTaskResultRequest) -> bool {
         let validator = result.validator_hotkey.clone();
         self.inner
             .completed
@@ -200,6 +206,7 @@ impl TaskManager {
             .or_default()
             .push(result);
         self.inner.finish_task(task_id, &validator).await;
+        self.inner.complete_assignment(task_id, &validator).await
     }
 
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
@@ -315,12 +322,9 @@ impl TaskManager {
             .map(|e| e.elapsed().as_secs_f64())
     }
 
-    pub async fn remove_time(&self, task_id: Uuid) {
+    pub async fn finalize_task(&self, task_id: Uuid) {
         self.inner.execution_time.remove_async(&task_id).await;
         self.inner.cleanup_task_payload(task_id).await;
-        if let Some((_, validators)) = self.inner.assigned_validators.remove_async(&task_id).await {
-            self.inner.finish_tasks(task_id, validators).await;
-        }
     }
 }
 
@@ -343,192 +347,4 @@ impl Drop for TaskManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use uuid::Uuid;
-
-    use crate::api::request::AddTaskResultRequest;
-    use crate::api::Task;
-    use crate::bittensor::hotkey::Hotkey;
-    use crate::common::task::TaskManager;
-    use crate::common::task::TaskStatus;
-    use bytes::Bytes;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    #[tokio::test]
-    async fn test_cleanup() {
-        const CLEANUP_INTERVAL: Duration = Duration::from_millis(200);
-        const RESULT_LIFETIME: Duration = Duration::from_millis(400);
-        const EXPECTED_RESULTS: usize = 2;
-        const WAIT_DURATION: Duration = Duration::from_millis(600);
-
-        fn make_result(
-            validator: &str,
-            miner: &str,
-            score: f32,
-            instant: Instant,
-        ) -> AddTaskResultRequest {
-            AddTaskResultRequest {
-                validator_hotkey: validator.parse().unwrap(),
-                miner_hotkey: Some(miner.parse().unwrap()),
-                miner_uid: None,
-                miner_rating: None,
-                asset: Some(vec![]),
-                score: Some(score),
-                reason: None,
-                instant,
-            }
-        }
-
-        let task_manager = TaskManager::new(
-            10,
-            EXPECTED_RESULTS,
-            CLEANUP_INTERVAL,
-            RESULT_LIFETIME,
-            crate::metrics::Metrics::new(0.05).unwrap(),
-        )
-        .await;
-        let now = Instant::now();
-
-        // Task 1: Incomplete, old result
-        let task_id1 = Uuid::new_v4();
-        task_manager
-            .add_result(
-                task_id1,
-                make_result(
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    0.5,
-                    now - Duration::from_millis(600),
-                ),
-            )
-            .await;
-
-        // Task 2: Complete, last result will expire
-        let task_id2 = Uuid::new_v4();
-        task_manager
-            .add_result(
-                task_id2,
-                make_result(
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    0.6,
-                    now - Duration::from_millis(600),
-                ),
-            )
-            .await;
-        task_manager
-            .add_result(
-                task_id2,
-                make_result(
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    0.7,
-                    now - Duration::from_millis(200),
-                ),
-            )
-            .await;
-
-        // Task 3: Complete, last result recent but will expire
-        let task_id3 = Uuid::new_v4();
-        task_manager
-            .add_result(
-                task_id3,
-                make_result(
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    0.8,
-                    now - Duration::from_millis(100),
-                ),
-            )
-            .await;
-        task_manager
-            .add_result(
-                task_id3,
-                make_result(
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7",
-                    0.9,
-                    now - Duration::from_millis(100),
-                ),
-            )
-            .await;
-
-        assert_eq!(
-            task_manager.get_status(task_id1).await,
-            TaskStatus::PartialResult(1)
-        );
-        assert_ne!(
-            task_manager.get_status(task_id2).await,
-            TaskStatus::PartialResult(1)
-        );
-        assert_ne!(
-            task_manager.get_status(task_id3).await,
-            TaskStatus::PartialResult(1)
-        );
-
-        tokio::time::sleep(WAIT_DURATION).await;
-
-        assert_eq!(
-            task_manager.get_status(task_id1).await,
-            TaskStatus::NoResult
-        );
-        assert_eq!(
-            task_manager.get_status(task_id2).await,
-            TaskStatus::NoResult
-        );
-        assert_eq!(
-            task_manager.get_status(task_id3).await,
-            TaskStatus::NoResult
-        );
-    }
-
-    #[tokio::test]
-    async fn test_timeout_increments_metric() {
-        const CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
-        const RESULT_LIFETIME: Duration = Duration::from_millis(120);
-
-        let metrics = crate::metrics::Metrics::new(0.05).unwrap();
-        let task_manager =
-            TaskManager::new(8, 1, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics.clone()).await;
-
-        let task_id = Uuid::new_v4();
-        let task = Task {
-            id: task_id,
-            prompt: None,
-            image: Some(Bytes::from_static(b"")),
-        };
-        task_manager.add_task(task).await;
-
-        let validator: Hotkey = Hotkey::from_bytes(&[42u8; 32]);
-        task_manager
-            .record_assignment(task_id, validator.clone())
-            .await;
-
-        tokio::time::sleep(Duration::from_millis(
-            RESULT_LIFETIME.as_millis() as u64 + 200,
-        ))
-        .await;
-
-        let families = metrics.registry().gather();
-        let mut found = false;
-        for mf in families {
-            if mf.name() == "timeout_failures_total" {
-                for m in &mf.metric {
-                    let matched = m
-                        .label
-                        .iter()
-                        .any(|lp| lp.name() == "validator" && lp.value() == validator.to_string());
-                    if matched && m.get_counter().as_ref().is_some_and(|c| c.value() >= 1.0) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if found {
-                break;
-            }
-        }
-        assert!(found, "timeout_failures_total for validator was not found");
-    }
-}
+mod tests;
