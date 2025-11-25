@@ -172,10 +172,16 @@ pub struct DbConfig {
     pub keys_cache_max_capacity: u64,
     #[serde(default = "default_deleted_keys_ttl_minutes")]
     pub deleted_keys_ttl_minutes: u64,
+    #[serde(default = "default_company_usage_flush_interval_sec")]
+    pub company_usage_flush_interval_sec: u64,
 }
 
 fn default_deleted_keys_ttl_minutes() -> u64 {
     60
+}
+
+fn default_company_usage_flush_interval_sec() -> u64 {
+    5
 }
 
 fn default_distributed_rate_limiter_max_capacity() -> usize {

@@ -17,7 +17,7 @@ pub struct MetricsEntry {
     pub tasks_in_progress: IntGauge,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TaskKind {
     TextTo3D,
     ImageTo3D,
@@ -25,7 +25,7 @@ pub enum TaskKind {
 
 impl TaskKind {
     #[inline]
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             TaskKind::TextTo3D => "txt3d",
             TaskKind::ImageTo3D => "img3d",
