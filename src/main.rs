@@ -14,8 +14,8 @@ use clap::ValueEnum;
 use common::log::{init_tracing, log_app_config, log_build_information};
 use std::{env, sync::Arc, time::Duration};
 
-use config::{read_config, NodeConfig};
-use raft::{start_gateway, GatewayMode};
+use config::read_config;
+use raft::{start_gateway, GatewayExit, GatewayMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -39,6 +39,33 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await
+}
+
+async fn retry_or_stop(
+    attempts: &mut usize,
+    max_attempts: usize,
+    shutdown: &CancellationToken,
+    restart_delay_secs: u64,
+    log_failure: impl FnOnce(usize, usize),
+) -> bool {
+    *attempts += 1;
+    log_failure(*attempts, max_attempts);
+
+    if *attempts >= max_attempts {
+        error!(
+            "Reached maximum restart attempts ({}). Stopping.",
+            max_attempts
+        );
+        shutdown.cancel();
+        return false;
+    }
+
+    warn!("Retrying...");
+    let sleep = tokio::time::sleep(Duration::from_secs(restart_delay_secs));
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = sleep => true,
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -65,16 +92,31 @@ async fn main() {
     let env_config = env::var("GATEWAY_CONFIG").ok();
     let config_path: Option<&String> = cli.config.as_ref().or(env_config.as_ref());
 
-    let node_config: Arc<NodeConfig> = Arc::new(
-        read_config(config_path)
-            .await
-            .unwrap_or_else(|e| panic!("Failed to load config file: {}", e)),
-    );
+    let node_config = match read_config(config_path).await {
+        Ok(config) => Arc::new(config),
+        Err(e) => {
+            eprintln!("Failed to load config file: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let _guards = init_tracing(&node_config.log.path, (&node_config.log.level).into());
 
     log_build_information();
     log_app_config(&node_config);
+
+    let restart_delay_secs = match env::var("GATEWAY_RESTART_DELAY_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                warn!(
+                    "Invalid GATEWAY_RESTART_DELAY_SECS value {value}, using default {RESTART_DELAY_SECS}"
+                );
+                RESTART_DELAY_SECS
+            }
+        },
+        Err(_) => RESTART_DELAY_SECS,
+    };
 
     let max_attempts = node_config.basic.max_restart_attempts;
     let mut attempts = 0;
@@ -103,35 +145,54 @@ async fn main() {
 
         match start_gateway(gateway_mode, Arc::clone(&node_config), shutdown.clone()).await {
             Ok(gateway) => {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {}
-                }
-
-                gateway.shutdown();
-                drop(gateway);
-                break;
-            }
-            Err(e) => {
-                attempts += 1;
-                error!(
-                    "Failed to start gateway: {e}, attempt {}/{}",
-                    attempts, max_attempts
-                );
-
-                if attempts >= max_attempts {
-                    error!(
-                        "Reached maximum restart attempts ({}). Stopping.",
-                        max_attempts
-                    );
-                    shutdown.cancel();
+                let exit = gateway.wait_for_exit().await;
+                if shutdown.is_cancelled() {
                     break;
                 }
 
-                warn!("Retrying...");
-                let sleep = tokio::time::sleep(Duration::from_secs(RESTART_DELAY_SECS));
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = sleep => {}
+                let should_continue = match exit {
+                    GatewayExit::Shutdown => false,
+                    GatewayExit::TaskStopped { task, result } => {
+                        retry_or_stop(
+                            &mut attempts,
+                            max_attempts,
+                            &shutdown,
+                            restart_delay_secs,
+                            |attempts, max_attempts| match result {
+                                Ok(()) => error!(
+                                    "Gateway task {task} stopped unexpectedly, attempt {}/{}",
+                                    attempts, max_attempts
+                                ),
+                                Err(e) => error!(
+                                    "Gateway task {task} failed: {e}, attempt {}/{}",
+                                    attempts, max_attempts
+                                ),
+                            },
+                        )
+                        .await
+                    }
+                };
+
+                if !should_continue {
+                    break;
+                }
+            }
+            Err(e) => {
+                let should_continue = retry_or_stop(
+                    &mut attempts,
+                    max_attempts,
+                    &shutdown,
+                    restart_delay_secs,
+                    |attempts, max_attempts| {
+                        error!(
+                            "Failed to start gateway: {e}, attempt {}/{}",
+                            attempts, max_attempts
+                        );
+                    },
+                )
+                .await;
+                if !should_continue {
+                    break;
                 }
             }
         }
@@ -141,6 +202,8 @@ async fn main() {
         signal_listener.abort();
     }
     if let Err(e) = signal_listener.await {
-        error!("Shutdown listener failed: {e}");
+        if !e.is_cancelled() {
+            error!("Shutdown listener failed: {e}");
+        }
     }
 }

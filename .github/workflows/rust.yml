@@ -6,13 +6,13 @@ on:
       - main
   pull_request:
     branches:
-      - '**'
+      - "**"
   workflow_dispatch:
 
 env:
   SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   CARGO_TERM_COLOR: always
-  RUST_VERSION: "1.91.1"
+  RUST_VERSION: "1.92.0"
 
 jobs:
   check:
@@ -24,7 +24,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ mold
+          sudo apt-get install -y gcc g++
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -51,7 +51,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ mold
+          sudo apt-get install -y gcc g++
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -89,7 +89,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ mold
+          sudo apt-get install -y gcc g++
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -144,7 +144,7 @@ jobs:
           tags: 404gen/gateway:${{ env.SHA }}-amd64
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=min,ttl=604800  # 1 week
+          cache-to: type=gha,mode=min,ttl=604800 # 1 week
           build-args: |
             RUST_VERSION=${{ env.RUST_VERSION }}
 
@@ -187,7 +187,7 @@ jobs:
           tags: 404gen/gateway:${{ env.SHA }}-arm64
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=min,ttl=604800  # 1 week
+          cache-to: type=gha,mode=min,ttl=604800 # 1 week
           build-args: |
             RUST_VERSION=${{ env.RUST_VERSION }}
 

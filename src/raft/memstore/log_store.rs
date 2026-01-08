@@ -188,16 +188,16 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
             _ => None,
         };
 
+        if let Some(start) = start_index {
+            self.ensure_not_compacted(start).map_err(|e| *e)?;
+        }
+
         let mut response = match expected_len {
             Some(len) => Vec::with_capacity(len as usize),
             None => Vec::new(),
         };
         for (_, val) in self.log.range(range.clone()) {
             response.push(val.clone());
-        }
-
-        if let Some(start) = start_index {
-            self.ensure_not_compacted(start).map_err(|e| *e)?;
         }
 
         if response.is_empty() {
@@ -581,11 +581,19 @@ mod impl_log_store {
 mod tests {
     use super::*;
     use crate::raft::test_utils::unique_path;
+    use crate::raft::TypeConfig;
     use openraft::Entry;
     use openraft::EntryPayload;
     use openraft::LeaderId;
     use std::fs;
     use tempfile::tempdir;
+
+    fn blank_entry(leader: LeaderId<u64>, idx: u64) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(leader, idx),
+            payload: EntryPayload::Blank,
+        }
+    }
 
     #[tokio::test]
     async fn persists_and_recovers_log_store() -> anyhow::Result<()> {
@@ -596,10 +604,7 @@ mod tests {
 
         // Mutate in-memory and persist per-op without cloning the entire store
         let log_id = LogId::new(LeaderId::new(1, 1), 1);
-        let entry = Entry {
-            log_id,
-            payload: EntryPayload::Blank,
-        };
+        let entry = blank_entry(LeaderId::new(1, 1), 1);
         {
             let mut guard = log_store.inner.lock().await;
             guard.log.insert(1, entry.clone());
@@ -638,7 +643,7 @@ mod tests {
         let restored = LogStore::with_persistence(&log_path)?;
         let guard = restored.inner.lock().await;
         assert_eq!(guard.log.len(), 1);
-        assert!(guard.log.get(&1).is_some());
+        assert!(guard.log.contains_key(&1));
         assert_eq!(guard.committed.unwrap().index, 1);
         assert_eq!(guard.last_purged_log_id.unwrap().index, 0);
         assert_eq!(guard.vote.unwrap().leader_id().node_id, 1);
@@ -653,10 +658,7 @@ mod tests {
         let persistence = TypeConfigLogPersistence::new(&log_path)?;
 
         let log_id = LogId::new(LeaderId::new(1, 1), 7);
-        let entry = Entry {
-            log_id,
-            payload: EntryPayload::Blank,
-        };
+        let entry = blank_entry(LeaderId::new(1, 1), 7);
         // Write using diff-only append methods
         persistence.append_append(&[entry])?;
         persistence.append_committed(&Some(log_id))?;
@@ -670,7 +672,7 @@ mod tests {
         let restored = LogStore::with_persistence(&log_path)?;
         let guard = restored.inner.lock().await;
         assert_eq!(guard.log.len(), 1);
-        assert!(guard.log.get(&log_id.index).is_some());
+        assert!(guard.log.contains_key(&log_id.index));
         assert_eq!(guard.committed.unwrap(), log_id);
 
         Ok(())
@@ -680,14 +682,8 @@ mod tests {
     async fn truncate_removes_boundary_entry() -> anyhow::Result<()> {
         let mut inner = LogStoreInner::<TypeConfig>::default();
         let leader = LeaderId::new(1, 1);
-        let entry1 = Entry {
-            log_id: LogId::new(leader.clone(), 5),
-            payload: EntryPayload::Blank,
-        };
-        let entry2 = Entry {
-            log_id: LogId::new(leader.clone(), 6),
-            payload: EntryPayload::Blank,
-        };
+        let entry1 = blank_entry(leader, 5);
+        let entry2 = blank_entry(leader, 6);
         inner.log.insert(entry1.log_id.index, entry1.clone());
         inner.log.insert(entry2.log_id.index, entry2);
 
@@ -707,14 +703,8 @@ mod tests {
         let log_store = LogStore::with_persistence(&log_path)?;
         let leader = LeaderId::new(1, 1);
 
-        let entry1 = Entry {
-            log_id: LogId::new(leader.clone(), 1),
-            payload: EntryPayload::Blank,
-        };
-        let entry2 = Entry {
-            log_id: LogId::new(leader.clone(), 2),
-            payload: EntryPayload::Blank,
-        };
+        let entry1 = blank_entry(leader, 1);
+        let entry2 = blank_entry(leader, 2);
 
         {
             let mut guard = log_store.inner.lock().await;
@@ -733,14 +723,14 @@ mod tests {
 
         let size_after_append = fs::metadata(&log_path)?.len();
 
-        let purge_id = entry1.log_id.clone();
+        let purge_id = entry1.log_id;
         {
             let mut guard = log_store.inner.lock().await;
-            guard.purge(purge_id.clone()).await?;
+            guard.purge(purge_id).await?;
         }
         log_store
             .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::PurgeTo(purge_id.clone()))),
+                log_store.persist_op_if_needed(Some(super::PersistOp::PurgeTo(purge_id))),
             )
             .await?;
 
@@ -756,9 +746,9 @@ mod tests {
 
         let restored = LogStore::with_persistence(&log_path)?;
         let guard = restored.inner.lock().await;
-        assert_eq!(guard.last_purged_log_id, Some(purge_id.clone()));
-        assert!(guard.log.get(&purge_id.index).is_none());
-        assert!(guard.log.get(&(purge_id.index + 1)).is_some());
+        assert_eq!(guard.last_purged_log_id, Some(purge_id));
+        assert!(!guard.log.contains_key(&purge_id.index));
+        assert!(guard.log.contains_key(&(purge_id.index + 1)));
 
         Ok(())
     }

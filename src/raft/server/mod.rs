@@ -6,7 +6,7 @@ use quinn::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -171,6 +171,10 @@ impl RServer {
         self.cancel_token.cancel();
         self.accept_task.abort();
         self.endpoint.close(0u32.into(), b"shutdown");
+    }
+
+    pub async fn wait(&mut self) -> Result<(), JoinError> {
+        (&mut self.accept_task).await
     }
 }
 
