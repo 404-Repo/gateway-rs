@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod client;
 pub mod gateway_state;
 pub mod memstore;
@@ -34,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::sleep;
 use tracing::error;
 use tracing::info;
@@ -107,6 +108,14 @@ pub struct Gateway {
     task_manager: TaskManager,
     http_server: Http3Server,
     shutdown: CancellationToken,
+}
+
+pub enum GatewayExit {
+    Shutdown,
+    TaskStopped {
+        task: &'static str,
+        result: Result<(), JoinError>,
+    },
 }
 
 impl Gateway {
@@ -315,6 +324,43 @@ impl Gateway {
         }
     }
 
+    pub async fn wait_for_exit(mut self) -> GatewayExit {
+        let Gateway {
+            server,
+            gateway_info_updater,
+            gateway_leader_change,
+            api_key_validator_updater,
+            http_server,
+            shutdown,
+            ..
+        } = &mut self;
+
+        tokio::select! {
+            _ = shutdown.cancelled() => GatewayExit::Shutdown,
+            res = server.wait() => GatewayExit::TaskStopped {
+                task: "rserver_accept",
+                result: res,
+            },
+            res = http_server.wait() => GatewayExit::TaskStopped {
+                task: "http3_server",
+                result: res,
+            },
+            res = gateway_info_updater => GatewayExit::TaskStopped {
+                task: "gateway_info_updater",
+                result: res,
+            },
+            res = gateway_leader_change => GatewayExit::TaskStopped {
+                task: "gateway_leader_change",
+                result: res,
+            },
+            res = api_key_validator_updater => GatewayExit::TaskStopped {
+                task: "api_key_validator_updater",
+                result: res,
+            },
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         self.shutdown.cancel();
         self.task_manager.abort();
@@ -662,19 +708,7 @@ pub async fn start_gateway(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     ));
 
-    let db = Arc::new(
-        DatabaseBuilder::new()
-            .host(&config.db.host)
-            .port(config.db.port)
-            .user(&config.db.user)
-            .password(&config.db.password)
-            .dbname(&config.db.db)
-            .sslcert_path(&config.db.sslcert)
-            .sslkey_path(&config.db.sslkey)
-            .sslrootcert_path(&config.db.sslrootcert)
-            .build()
-            .await?,
-    );
+    let db = Arc::new(DatabaseBuilder::from_config(&config.db).build().await?);
     let api_key_validator = ApiKeyValidator::new(
         Arc::clone(&db),
         Duration::from_secs(config.db.api_keys_update_interval),

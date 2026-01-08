@@ -4,12 +4,11 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use foldhash::fast::RandomState;
 use rustls::{ClientConfig, RootCertStore};
-use rustls_pemfile::certs;
 use scc::HashMap as SccHashMap;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::error::Error as _;
 use std::io;
-use std::io::BufReader;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::{fs, task::JoinHandle};
@@ -17,7 +16,8 @@ use tokio_postgres::{types::ToSql, Client, Config, Error, Row, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
 
-use crate::common::cert::{load_certificates, load_private_key};
+use crate::common::cert::{load_certificates, load_private_key, parse_certificates_from_pem_bytes};
+use crate::config::DbConfig;
 pub use key_validator::ApiKeyValidator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,6 +108,32 @@ pub struct DatabaseBuilder {
 async fn connect_postgres(
     config: &PostgresConnectionConfig<'_>,
 ) -> Result<(Arc<Client>, JoinHandle<()>)> {
+    let tls_config = build_tls_config(config).await?;
+    let tls_connector = MakeRustlsConnect::new(tls_config);
+
+    let mut pg_cfg = Config::new();
+    pg_cfg.host(config.host);
+    pg_cfg.port(config.port);
+    pg_cfg.user(config.user);
+    pg_cfg.password(config.password);
+    pg_cfg.dbname(config.dbname);
+    pg_cfg.ssl_mode(tokio_postgres::config::SslMode::Require);
+
+    let (client, connection) = pg_cfg
+        .connect(tls_connector)
+        .await
+        .map_err(|e| anyhow!("Failed to connect to PostgreSQL using rustls: {}", e))?;
+
+    let connection_task = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("Database connection error: {}", e);
+        }
+    });
+
+    Ok((Arc::new(client), connection_task))
+}
+
+async fn build_tls_config(config: &PostgresConnectionConfig<'_>) -> Result<ClientConfig> {
     let ca_cert_bytes = fs::read(config.sslrootcert_path).await.map_err(|e| {
         anyhow!(
             "Failed to read CA certificate at {}: {}",
@@ -115,9 +141,7 @@ async fn connect_postgres(
             e
         )
     })?;
-    let mut reader = BufReader::new(&ca_cert_bytes[..]);
-    let certs = certs(&mut reader)
-        .collect::<std::io::Result<Vec<_>>>()
+    let certs = parse_certificates_from_pem_bytes(&ca_cert_bytes)
         .map_err(|e| anyhow!("Failed to parse CA certificate as PEM: {}", e))?;
 
     let mut root_store = RootCertStore::empty();
@@ -147,28 +171,7 @@ async fn connect_postgres(
         .with_root_certificates(root_store)
         .with_client_auth_cert(client_certs, client_key)?;
 
-    let tls_connector = MakeRustlsConnect::new(tls_config);
-
-    let mut pg_cfg = Config::new();
-    pg_cfg.host(config.host);
-    pg_cfg.port(config.port);
-    pg_cfg.user(config.user);
-    pg_cfg.password(config.password);
-    pg_cfg.dbname(config.dbname);
-    pg_cfg.ssl_mode(tokio_postgres::config::SslMode::Require);
-
-    let (client, connection) = pg_cfg
-        .connect(tls_connector)
-        .await
-        .map_err(|e| anyhow!("Failed to connect to PostgreSQL using rustls: {}", e))?;
-
-    let connection_task = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            error!("Database connection error: {}", e);
-        }
-    });
-
-    Ok((Arc::new(client), connection_task))
+    Ok(tls_config)
 }
 
 impl DatabaseBuilder {
@@ -183,6 +186,18 @@ impl DatabaseBuilder {
             password: None,
             dbname: None,
         }
+    }
+
+    pub fn from_config(config: &DbConfig) -> Self {
+        Self::new()
+            .host(&config.host)
+            .port(config.port)
+            .user(&config.user)
+            .password(&config.password)
+            .dbname(&config.db)
+            .sslcert_path(&config.sslcert)
+            .sslkey_path(&config.sslkey)
+            .sslrootcert_path(&config.sslrootcert)
     }
 
     pub fn sslcert_path(mut self, path: &str) -> Self {

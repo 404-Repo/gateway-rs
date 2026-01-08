@@ -353,14 +353,14 @@ mod tests {
         local_bind_addr: &str,
         pcfg: &RServerConfig,
     ) -> Result<RClient> {
-        Ok(RClientBuilder::new()
+        RClientBuilder::new()
             .remote_addr(remote_addr)
             .server_name("localhost")
             .local_bind_addr(local_bind_addr)
             .dangerous_skip_verification(true)
             .protocol_cfg(pcfg.clone())
             .build()
-            .await?)
+            .await
     }
 
     async fn wait_for_leader(nodes: &[Raft], timeout: Duration) -> Result<u64> {

@@ -22,6 +22,7 @@ use std::io::{Cursor, Error as IoError};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
 use tracing::info;
@@ -31,6 +32,7 @@ use crate::raft::TypeConfig;
 
 use foldhash::fast::RandomState;
 use persistence::SnapshotPersistence;
+use scc::hash_cache::Entry as CacheEntry;
 use scc::{HashCache, HashMap};
 
 pub type LogStore = crate::raft::memstore::log_store::LogStore<TypeConfig>;
@@ -41,6 +43,46 @@ pub struct RateLimitWindow {
     pub day_epoch: u64,
     pub hour: u64,
     pub day: u64,
+}
+
+impl RateLimitWindow {
+    fn from_delta(delta: &RateLimitDelta) -> Self {
+        Self {
+            hour_epoch: delta.hour_epoch,
+            day_epoch: delta.day_epoch,
+            hour: delta.add_hour as u64,
+            day: delta.add_day as u64,
+        }
+    }
+
+    fn apply_delta(&mut self, delta: &RateLimitDelta) {
+        let mut add_hour = delta.add_hour as u64;
+        match delta.hour_epoch.cmp(&self.hour_epoch) {
+            std::cmp::Ordering::Greater => {
+                self.hour_epoch = delta.hour_epoch;
+                self.hour = 0;
+            }
+            std::cmp::Ordering::Less => {
+                add_hour = 0;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+
+        let mut add_day = delta.add_day as u64;
+        match delta.day_epoch.cmp(&self.day_epoch) {
+            std::cmp::Ordering::Greater => {
+                self.day_epoch = delta.day_epoch;
+                self.day = 0;
+            }
+            std::cmp::Ordering::Less => {
+                add_day = 0;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+
+        self.hour = self.hour.saturating_add(add_hour);
+        self.day = self.day.saturating_add(add_day);
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
@@ -120,6 +162,12 @@ pub(super) struct SnapshotPayload {
     pub rate_limits: BTreeMap<RateLimitKey, RateLimitWindow>,
 }
 
+#[derive(Serialize)]
+struct SnapshotPayloadRef<'a> {
+    data: &'a BTreeMap<String, Vec<u8>>,
+    rate_limits: &'a BTreeMap<RateLimitKey, RateLimitWindow>,
+}
+
 impl SnapshotPayload {
     fn decode(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         rmp_serde::from_slice(bytes)
@@ -158,7 +206,7 @@ pub struct StateMachineStore {
     persistence: Option<Arc<SnapshotPersistence>>,
 
     /// Concurrent request-id deduplication cache to avoid re-applying idempotent requests.
-    request_dedupe: HashCache<u128, (), RandomState>,
+    request_dedupe: HashCache<u128, Instant, RandomState>,
 
     /// Concurrent hash map for rate limits, swapped atomically during snapshot installs.
     rate_limits: AtomicOwned<HashMap<RateLimitKey, RateLimitWindow, RandomState>>,
@@ -166,6 +214,11 @@ pub struct StateMachineStore {
     /// Guard to synchronize apply and snapshot building for consistent cuts.
     snapshot_guard: tokio::sync::Mutex<()>,
 }
+
+#[cfg(test)]
+const REQUEST_DEDUPE_TTL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const REQUEST_DEDUPE_TTL: Duration = Duration::from_secs(600);
 
 impl Default for StateMachineStore {
     fn default() -> Self {
@@ -236,15 +289,19 @@ impl StateMachineStore {
     }
 
     async fn is_duplicate_request(&self, request_id: u128) -> bool {
-        let mut is_dup = false;
-        self.request_dedupe
-            .entry_async(request_id)
-            .await
-            .and_modify(|_| {
-                is_dup = true;
-            })
-            .or_put(());
-        is_dup
+        let now = Instant::now();
+        match self.request_dedupe.entry_async(request_id).await {
+            CacheEntry::Occupied(mut entry) => {
+                let seen_at = *entry.get();
+                let is_dup = now.duration_since(seen_at) <= REQUEST_DEDUPE_TTL;
+                *entry.get_mut() = now;
+                is_dup
+            }
+            CacheEntry::Vacant(entry) => {
+                entry.put_entry(now);
+                false
+            }
+        }
     }
 
     pub async fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
@@ -322,39 +379,9 @@ impl StateMachineStore {
                         let key = d.key();
                         map.entry_sync(key)
                             .and_modify(|w| {
-                                let mut add_hour = d.add_hour as u64;
-                                match d.hour_epoch.cmp(&w.hour_epoch) {
-                                    std::cmp::Ordering::Greater => {
-                                        w.hour_epoch = d.hour_epoch;
-                                        w.hour = 0;
-                                    }
-                                    std::cmp::Ordering::Less => {
-                                        add_hour = 0;
-                                    }
-                                    std::cmp::Ordering::Equal => {}
-                                }
-
-                                let mut add_day = d.add_day as u64;
-                                match d.day_epoch.cmp(&w.day_epoch) {
-                                    std::cmp::Ordering::Greater => {
-                                        w.day_epoch = d.day_epoch;
-                                        w.day = 0;
-                                    }
-                                    std::cmp::Ordering::Less => {
-                                        add_day = 0;
-                                    }
-                                    std::cmp::Ordering::Equal => {}
-                                }
-
-                                w.hour = w.hour.saturating_add(add_hour);
-                                w.day = w.day.saturating_add(add_day);
+                                w.apply_delta(&d);
                             })
-                            .or_insert(RateLimitWindow {
-                                hour_epoch: d.hour_epoch,
-                                day_epoch: d.day_epoch,
-                                hour: d.add_hour as u64,
-                                day: d.add_day as u64,
-                            });
+                            .or_insert(RateLimitWindow::from_delta(&d));
                     }
                 }
 
@@ -367,7 +394,7 @@ impl StateMachineStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (payload, last_applied_log, last_membership) = {
+        let (snapshot_bytes, last_applied_log, last_membership) = {
             // Ensure a consistent cut between state_machine and rate_limits
             let _sg = self.snapshot_guard.lock().await;
             let state_machine = self.state_machine.read().await;
@@ -382,11 +409,15 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
                 });
             }
 
+            let payload = SnapshotPayloadRef {
+                data: &state_machine.data,
+                rate_limits: &rate_limits,
+            };
+            let snapshot_bytes =
+                rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
+
             (
-                SnapshotPayload {
-                    data: state_machine.data.clone(),
-                    rate_limits,
-                },
+                snapshot_bytes,
                 state_machine.last_applied_log,
                 state_machine.last_membership.clone(),
             )
@@ -405,8 +436,6 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             snapshot_id,
         };
 
-        let snapshot_bytes =
-            rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
         let snapshot = StoredSnapshot {
             meta: meta.clone(),
             data: snapshot_bytes.clone(),
@@ -545,6 +574,7 @@ mod tests {
     use crate::raft::memstore::persistence::TypeConfigLogPersistence;
     use crate::raft::memstore::persistence::LOG_STORE_ARCHIVE_PREFIX;
     use crate::raft::test_utils::unique_path;
+    use crate::raft::TypeConfig;
 
     use super::*;
     use anyhow::Result;
@@ -556,7 +586,15 @@ mod tests {
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::{tempdir, TempDir};
+
+    fn blank_entry(leader: LeaderId<u64>, idx: u64) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(leader, idx),
+            payload: EntryPayload::Blank,
+        }
+    }
 
     fn prepare_snapshot_dir() -> Result<(TempDir, PathBuf)> {
         let dir = tempdir()?;
@@ -772,7 +810,7 @@ mod tests {
     fn decode_log_store_archive(path: &Path) -> anyhow::Result<PersistedLogState> {
         let raw = fs::read(path)?;
         let decoded = zstd::stream::decode_all(Cursor::new(raw))?;
-        Ok(TypeConfigLogPersistence::decode_diff_bytes(&decoded)?)
+        TypeConfigLogPersistence::decode_diff_bytes(&decoded)
     }
 
     #[tokio::test]
@@ -792,10 +830,7 @@ mod tests {
         let leader = LeaderId::new(1, 1);
 
         for idx in 0..1_000u64 {
-            let entry = Entry {
-                log_id: LogId::new(leader.clone(), idx),
-                payload: EntryPayload::Blank,
-            };
+            let entry = blank_entry(leader, idx);
             persistence.append_append(&[entry])?;
         }
 
@@ -817,10 +852,7 @@ mod tests {
         );
 
         for idx in 1_000..2_000u64 {
-            let entry = Entry {
-                log_id: LogId::new(leader.clone(), idx),
-                payload: EntryPayload::Blank,
-            };
+            let entry = blank_entry(leader, idx);
             persistence.append_append(&[entry])?;
         }
 
@@ -863,5 +895,20 @@ mod tests {
     fn extract_log_store_idx_handles_underscored_timestamp() {
         let path = Path::new("log_store_1-1-42-3_2025_10_01_T_12_34_56Z.bin.zst");
         assert_eq!(SnapshotPersistence::extract_log_store_idx(path), Some(3));
+    }
+
+    #[tokio::test]
+    async fn request_dedupe_expires_after_ttl() -> Result<()> {
+        let store = StateMachineStore::default();
+        let request_id = 4242u128;
+
+        assert!(!store.is_duplicate_request(request_id).await);
+        assert!(store.is_duplicate_request(request_id).await);
+
+        tokio::time::sleep(REQUEST_DEDUPE_TTL + Duration::from_millis(10)).await;
+
+        assert!(!store.is_duplicate_request(request_id).await);
+
+        Ok(())
     }
 }

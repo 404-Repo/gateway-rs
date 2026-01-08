@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+set -e
+
+export DOCKER_BUILDKIT=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKERFILE_PATH="$SCRIPT_DIR/Dockerfile"
 

@@ -320,4 +320,8 @@ impl Http3Server {
         self.join_handle.abort();
         self.subnet_state.abort();
     }
+
+    pub async fn wait(&mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.join_handle).await
+    }
 }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use quinn::{crypto::rustls::QuicServerConfig, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use salvo::conn::rustls::Keycert;
 use std::{path::Path, sync::Arc};
 
@@ -65,15 +65,7 @@ where
     P: AsRef<Path>,
 {
     let pem_bytes = tokio::fs::read(path).await?;
-    let mut reader = pem_bytes.as_slice();
-
-    let cert_der_list = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-
-    if cert_der_list.is_empty() {
-        return Err(anyhow::anyhow!("no certificates found in PEM file"));
-    }
-
-    Ok(cert_der_list.into_iter().collect())
+    parse_certificates_from_pem_bytes(&pem_bytes)
 }
 
 pub async fn load_private_key<P>(path: P) -> Result<PrivateKeyDer<'static>>
@@ -81,12 +73,19 @@ where
     P: AsRef<Path>,
 {
     let pem_bytes = tokio::fs::read(path).await?;
-    let mut reader = pem_bytes.as_slice();
-
-    let key = rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in PEM file"))?;
+    let key = PrivateKeyDer::from_pem_slice(&pem_bytes)?;
 
     Ok(key)
+}
+
+pub fn parse_certificates_from_pem_bytes(pem_bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
+    let cert_der_list = CertificateDer::pem_slice_iter(pem_bytes).collect::<Result<Vec<_>, _>>()?;
+
+    if cert_der_list.is_empty() {
+        return Err(anyhow::anyhow!("no certificates found in PEM data"));
+    }
+
+    Ok(cert_der_list.into_iter().collect())
 }
 
 pub fn generate_self_signed_config() -> Result<ServerConfig> {
