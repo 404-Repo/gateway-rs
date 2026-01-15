@@ -10,8 +10,8 @@ mod tests;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-use anyhow::bail;
 use anyhow::Result;
+use anyhow::bail;
 use backon::BackoffBuilder;
 use backon::ConstantBuilder;
 use backon::Retryable;
@@ -29,9 +29,9 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -42,17 +42,17 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::api::Task;
 use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfoRef;
-use crate::api::Task;
 use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
 use crate::common::company_usage::CompanyUsageRecorder;
-use crate::common::crypto_provider::init_crypto_provider;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
-use crate::config::NodeConfig;
+use crate::config::{ModelConfigStore, NodeConfig};
+use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::ApiKeyValidator;
 use crate::db::DatabaseBuilder;
 use crate::http3::client::Http3Client;
@@ -408,19 +408,16 @@ async fn get_id_for_endpoint(
             .dangerous_skip_verification(skip_verification)
             .build()
             .await
+            && let Ok((status, body)) = client.get(&url, Some(timeout)).await
+            && status == StatusCode::OK
         {
-            if let Ok((status, body)) = client.get(&url, Some(timeout)).await {
-                if status == StatusCode::OK {
-                    let body_str = std::str::from_utf8(&body).map_err(|e| {
-                        anyhow::anyhow!("Failed to convert response body to UTF-8: {}", e)
-                    })?;
-                    let id = body_str
-                        .trim()
-                        .parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse ID as u64: {}", e))?;
-                    return Ok(id);
-                }
-            }
+            let body_str = std::str::from_utf8(&body)
+                .map_err(|e| anyhow::anyhow!("Failed to convert response body to UTF-8: {}", e))?;
+            let id = body_str
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("Failed to parse ID as u64: {}", e))?;
+            return Ok(id);
         }
         Err(anyhow::anyhow!(format!(
             "Failed to get ID from {}, {}",
@@ -462,7 +459,7 @@ pub async fn get_node_ids(
 
 fn build_task_queue(cfg: &NodeConfig) -> DupQueue<Task> {
     DupQueue::<Task>::builder()
-        .dup(cfg.basic.unique_validators_per_task)
+        .dup(cfg.basic.unique_workers_per_task)
         .ttl(cfg.basic.taskqueue_task_ttl)
         .cleanup_interval(cfg.basic.taskqueue_cleanup_interval)
         .build()
@@ -613,6 +610,7 @@ async fn init_membership(
 pub async fn start_gateway(
     mode: GatewayMode,
     config: Arc<NodeConfig>,
+    model_store: Arc<ModelConfigStore>,
     shutdown: CancellationToken,
 ) -> Result<Gateway> {
     init_crypto_provider()?;
@@ -734,7 +732,7 @@ pub async fn start_gateway(
 
     let task_manager = TaskManager::new(
         config.basic.taskmanager_initial_capacity,
-        config.basic.unique_validators_per_task,
+        config.basic.unique_workers_per_task,
         Duration::from_secs(config.basic.taskmanager_cleanup_interval),
         Duration::from_secs(config.basic.taskmanager_result_lifetime),
         metrics.clone(),
@@ -764,6 +762,7 @@ pub async fn start_gateway(
 
     let http_server = match Http3Server::run(
         Arc::clone(&config),
+        model_store,
         RustlsConfig::new(key_cert),
         gateway_state.clone(),
         task_queue.clone(),

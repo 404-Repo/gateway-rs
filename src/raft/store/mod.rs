@@ -1,7 +1,5 @@
 mod persistence;
 
-use openraft::storage::RaftStateMachine;
-use openraft::storage::Snapshot;
 use openraft::BasicNode;
 use openraft::Entry;
 use openraft::EntryPayload;
@@ -13,6 +11,8 @@ use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageIOError;
 use openraft::StoredMembership;
+use openraft::storage::RaftStateMachine;
+use openraft::storage::Snapshot;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use serde::Deserialize;
 use serde::Serialize;
@@ -20,8 +20,8 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::{Cursor, Error as IoError};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
@@ -570,24 +570,24 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
 
 #[cfg(test)]
 mod tests {
+    use crate::raft::TypeConfig;
+    use crate::raft::memstore::persistence::LOG_STORE_ARCHIVE_PREFIX;
     use crate::raft::memstore::persistence::PersistedLogState;
     use crate::raft::memstore::persistence::TypeConfigLogPersistence;
-    use crate::raft::memstore::persistence::LOG_STORE_ARCHIVE_PREFIX;
     use crate::raft::test_utils::unique_path;
-    use crate::raft::TypeConfig;
 
     use super::*;
     use anyhow::Result;
-    use openraft::storage::RaftSnapshotBuilder;
     use openraft::LeaderId;
     use openraft::LogId;
     use openraft::RaftLogId;
+    use openraft::storage::RaftSnapshotBuilder;
     use std::fs;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     fn blank_entry(leader: LeaderId<u64>, idx: u64) -> Entry<TypeConfig> {
         Entry {

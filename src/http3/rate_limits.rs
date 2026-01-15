@@ -58,16 +58,15 @@ pub async fn prepare_rate_limit_context(
         ..RateLimitContext::default()
     };
 
-    if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if key_str.len() == uuid::fmt::Hyphenated::LENGTH {
-            if let Ok(uuid) = Uuid::parse_str(key_str) {
-                context.key_is_uuid = true;
-                context.has_valid_api_key = gs.is_valid_api_key(key_str).await;
-                context.is_company_key = gs.is_company_key(key_str).await;
-                context.user_id = gs.get_user_id(key_str).await;
-                context.is_generic_key = gs.is_generic_key(&uuid).await;
-            }
-        }
+    if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+        && key_str.len() == uuid::fmt::Hyphenated::LENGTH
+        && let Ok(uuid) = Uuid::parse_str(key_str)
+    {
+        context.key_is_uuid = true;
+        context.has_valid_api_key = gs.is_valid_api_key(key_str).await;
+        context.is_company_key = gs.is_company_key(key_str).await;
+        context.user_id = gs.get_user_id(key_str).await;
+        context.is_generic_key = gs.is_generic_key(&uuid).await;
     }
 
     depot.inject(context);

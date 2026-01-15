@@ -4,11 +4,11 @@ use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use openraft::{Entry, LogId, RaftLogId, Vote};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -153,13 +153,13 @@ impl TypeConfigLogPersistence {
 
     pub(crate) fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).context(format!(
-                    "Failed to create log store parent dir: {:?}",
-                    parent
-                ))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent).context(format!(
+                "Failed to create log store parent dir: {:?}",
+                parent
+            ))?;
         }
         Ok(Self {
             path,
@@ -414,13 +414,13 @@ impl TypeConfigLogPersistence {
     fn ensure_initialized_file(&self) -> std::io::Result<()> {
         if self.path.exists() {
             let mut header = [0u8; LOG_STORE_HEADER_LEN];
-            if let Ok(mut f) = fs::File::open(&self.path) {
-                if let Ok(n) = f.read(&mut header) {
-                    if n >= LOG_STORE_HEADER_LEN && Self::is_diff_format(&header) {
-                        self.ensure_append_handle_opened()?;
-                        return Ok(());
-                    }
-                }
+            if let Ok(mut f) = fs::File::open(&self.path)
+                && let Ok(n) = f.read(&mut header)
+                && n >= LOG_STORE_HEADER_LEN
+                && Self::is_diff_format(&header)
+            {
+                self.ensure_append_handle_opened()?;
+                return Ok(());
             }
             // File exists but is not in diff format
             if let Ok((state, _raw)) = Self::read_log_store_file(&self.path) {
@@ -547,8 +547,8 @@ enum DiffRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::test_utils::unique_path;
     use crate::raft::TypeConfig;
+    use crate::raft::test_utils::unique_path;
     use openraft::EntryPayload;
     use openraft::LeaderId;
     use openraft::LogId;
@@ -594,10 +594,12 @@ mod tests {
             .expect("log store should deserialize after purge");
 
         assert_eq!(persisted.last_purged_log_id, Some(purge_id));
-        assert!(persisted
-            .log
-            .iter()
-            .all(|entry| entry.get_log_id().index > purge_id.index));
+        assert!(
+            persisted
+                .log
+                .iter()
+                .all(|entry| entry.get_log_id().index > purge_id.index)
+        );
 
         Ok(())
     }

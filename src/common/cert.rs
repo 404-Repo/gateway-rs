@@ -1,6 +1,6 @@
 use anyhow::Result;
-use quinn::{crypto::rustls::QuicServerConfig, ServerConfig};
-use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use quinn::{ServerConfig, crypto::rustls::QuicServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use salvo::conn::rustls::Keycert;
 use std::{path::Path, sync::Arc};
 

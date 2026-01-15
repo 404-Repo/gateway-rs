@@ -1,20 +1,20 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
-    use crate::raft::client::RClientBuilder;
-    use crate::raft::init_crypto_provider;
-    use crate::raft::test_utils::unique_path;
     use crate::raft::LogStore;
     use crate::raft::Network;
     use crate::raft::NodeId;
     use crate::raft::Raft;
     use crate::raft::Request;
     use crate::raft::StateMachineStore;
+    use crate::raft::client::RClientBuilder;
+    use crate::raft::init_crypto_provider;
+    use crate::raft::test_utils::unique_path;
     use crate::{
         config::RServerConfig,
         raft::{client::RClient, server::RServer},
     };
-    use anyhow::{anyhow, bail, Result};
+    use anyhow::{Result, anyhow, bail};
     use core::panic;
     use foldhash::fast::RandomState;
     use openraft::storage::RaftLogStorage;

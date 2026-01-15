@@ -1,6 +1,6 @@
 use base64_simd::STANDARD;
 use bytes::Bytes;
-use image::{guess_format, ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader, guess_format};
 use serde::Serializer;
 use std::io::Cursor;
 

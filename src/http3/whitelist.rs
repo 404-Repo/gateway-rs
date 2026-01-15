@@ -15,10 +15,10 @@ pub fn is_whitelisted_ip(req: &Request, depot: &Depot) -> bool {
         _ => None,
     };
 
-    if let Some(ip) = remote_ip {
-        if let Ok(whitelist) = depot.obtain::<AddTaskWhitelist>() {
-            return whitelist.ips.contains(&ip);
-        }
+    if let Some(ip) = remote_ip
+        && let Ok(whitelist) = depot.obtain::<AddTaskWhitelist>()
+    {
+        return whitelist.ips.contains(&ip);
     }
     false
 }

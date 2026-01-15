@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use backon::{BackoffBuilder, ConstantBuilder, Retryable};
 use quinn::{Connection, Endpoint, IdleTimeout};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::sync::Arc;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::time::Duration;
 use tracing::{error, info};
 

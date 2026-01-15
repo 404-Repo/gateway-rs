@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use foldhash::fast::RandomState;
 
+use openraft::BasicNode;
 use openraft::anyerror;
 use openraft::error::InstallSnapshotError;
 use openraft::error::NetworkError;
@@ -16,16 +17,15 @@ use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use std::error::Error as StdError;
 
 use super::NodeId;
 use crate::protocol::ConversionError;
 use crate::protocol::RaftMessageType;
+use crate::raft::TypeConfig;
 use crate::raft::client::RClient;
 use crate::raft::typ;
-use crate::raft::TypeConfig;
 
 #[derive(Debug)]
 struct NetworkStringError(String);

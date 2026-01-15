@@ -1,5 +1,5 @@
 use super::store::Request;
-use super::store::{rate_limit_key, RateLimitDelta, RateLimitWindow, Subject};
+use super::store::{RateLimitDelta, RateLimitWindow, Subject, rate_limit_key};
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
@@ -17,8 +17,8 @@ use rmp_serde;
 use scc::Queue;
 use serde::Serialize;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tracing::{error, info};
@@ -299,7 +299,7 @@ impl GatewayState {
                         "Failed to forward to leader: {} {:?}",
                         status,
                         String::from_utf8_lossy(&body)
-                    ))
+                    ));
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
             }
@@ -392,56 +392,54 @@ impl GatewayState {
         let current_node_id = self.internal.config.network.node_id;
 
         let forwarded = (|| async {
-            if let Some(leader_id) = self.leader().await {
-                if leader_id != current_node_id {
-                    let leader_info = self
-                        .gateway(leader_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
+            if let Some(leader_id) = self.leader().await
+                && leader_id != current_node_id
+            {
+                let leader_info = self
+                    .gateway(leader_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
 
-                    let client_storage;
-                    let client = match client {
-                        Some(client) => client,
-                        None => {
-                            client_storage = self.build_leader_client(&leader_info).await?;
-                            &client_storage
-                        }
-                    };
-                    let url = self.leader_write_url(&leader_info);
-
-                    let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitDeltas {
-                        request_id,
-                        deltas: deltas.as_slice(),
-                    })
-                    .map_err(|e| anyhow::anyhow!("Failed to serialize deltas: {}", e))?;
-
-                    let admin_key = self.admin_key();
-                    let headers = [("x-admin-key", admin_key.as_str())];
-                    match client
-                        .post(
-                            &url,
-                            Bytes::from(payload),
-                            Some(&headers),
-                            Some(Duration::from_secs(
-                                self.internal.config.http.forward_timeout_sec,
-                            )),
-                        )
-                        .await
-                    {
-                        Ok((status, _body)) if status.is_success() => {
-                            return Ok(true);
-                        }
-                        Ok((status, body)) => {
-                            return Err(anyhow::anyhow!(
-                                "Failed to forward to leader: {} {:?}",
-                                status,
-                                String::from_utf8_lossy(&body)
-                            ));
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e))
-                        }
+                let client_storage;
+                let client = match client {
+                    Some(client) => client,
+                    None => {
+                        client_storage = self.build_leader_client(&leader_info).await?;
+                        &client_storage
                     }
+                };
+                let url = self.leader_write_url(&leader_info);
+
+                let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitDeltas {
+                    request_id,
+                    deltas: deltas.as_slice(),
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to serialize deltas: {}", e))?;
+
+                let admin_key = self.admin_key();
+                let headers = [("x-admin-key", admin_key.as_str())];
+                match client
+                    .post(
+                        &url,
+                        Bytes::from(payload),
+                        Some(&headers),
+                        Some(Duration::from_secs(
+                            self.internal.config.http.forward_timeout_sec,
+                        )),
+                    )
+                    .await
+                {
+                    Ok((status, _body)) if status.is_success() => {
+                        return Ok(true);
+                    }
+                    Ok((status, body)) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to forward to leader: {} {:?}",
+                            status,
+                            String::from_utf8_lossy(&body)
+                        ));
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
                 }
             }
 

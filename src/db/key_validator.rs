@@ -3,15 +3,15 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use foldhash::fast::RandomState;
 use foldhash::{HashMap as FoldHashMap, HashSet as FoldHashSet};
 use moka::future::Cache;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
 use super::Database;
-use crate::common::crypto_provider::ApiKeyHasher;
+use crate::crypto::crypto_provider::ApiKeyHasher;
 
 pub struct ApiKeyValidator {
     db: Arc<Database>,

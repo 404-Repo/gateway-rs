@@ -1,8 +1,8 @@
 use crate::{common::cert::generate_self_signed_config, config::RServerConfig, protocol::Protocol};
 use anyhow::Result;
 use quinn::{
-    crypto::rustls::QuicServerConfig, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream,
-    ServerConfig, TransportConfig, WriteError,
+    Endpoint, IdleTimeout, Incoming, RecvStream, SendStream, ServerConfig, TransportConfig,
+    WriteError, crypto::rustls::QuicServerConfig,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -181,7 +181,7 @@ impl RServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{network::Network, LogStore, StateMachineStore};
+    use crate::raft::{LogStore, StateMachineStore, network::Network};
     use anyhow::Result;
     use foldhash::fast::RandomState;
     use openraft::Config;

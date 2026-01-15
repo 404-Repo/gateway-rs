@@ -3,16 +3,16 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use chrono::Utc;
 use tracing::warn;
 
 use crate::common::fs::write_atomic;
+use crate::raft::SNAPSHOT_COMPRESSION_LVL;
 use crate::raft::archive;
 use crate::raft::memstore::persistence::{
-    TypeConfigLogPersistence, LOG_STORE_ARCHIVE_PREFIX, LOG_STORE_ARCHIVE_SUFFIX,
+    LOG_STORE_ARCHIVE_PREFIX, LOG_STORE_ARCHIVE_SUFFIX, TypeConfigLogPersistence,
 };
-use crate::raft::SNAPSHOT_COMPRESSION_LVL;
 
 use super::{RateLimitKey, RateLimitWindow, SnapshotPayload, StateMachineData, StoredSnapshot};
 
@@ -39,12 +39,11 @@ impl SnapshotPersistence {
     ) -> anyhow::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let retention = retention.max(1);
-        if let Some(parent) = dir.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create snapshot parent dir: {:?}", parent)
-                })?;
-            }
+        if let Some(parent) = dir.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create snapshot parent dir: {:?}", parent))?;
         }
         if !dir.exists() {
             fs::create_dir_all(&dir)

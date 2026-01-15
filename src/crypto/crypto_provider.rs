@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use blake3::Hash;
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;

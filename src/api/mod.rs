@@ -23,6 +23,9 @@ pub struct Task {
         serialize_with = "serialize_image_base64"
     )]
     pub image: Option<Bytes>,
+    // The model selector
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 pub trait HasUuid {

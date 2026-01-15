@@ -1,6 +1,4 @@
-use std::time::Duration;
-
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use regex::Regex;
 use rustls::SupportedProtocolVersion;
 use salvo::catcher::Catcher;
@@ -13,12 +11,10 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::api::Task;
-use crate::bittensor::hotkey::Hotkey;
-use crate::bittensor::subnet_state::SubnetState;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
-use crate::config::NodeConfig;
-use crate::http3::distributed_rate_limiter::{enforce_rate_limit, DistributedRateLimiter};
+use crate::config::{ModelConfigStore, NodeConfig};
+use crate::http3::distributed_rate_limiter::{DistributedRateLimiter, enforce_rate_limit};
 use crate::http3::handlers::admin::{
     admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
 };
@@ -28,7 +24,7 @@ use crate::http3::handlers::common::{
 };
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
-use crate::http3::rate_limits::{prepare_rate_limit_context, RateLimits};
+use crate::http3::rate_limits::{RateLimits, prepare_rate_limit_context};
 use crate::http3::response::custom_response;
 use crate::http3::whitelist::AddTaskWhitelist;
 use crate::metrics::Metrics;
@@ -65,7 +61,6 @@ fn map_tls_versions_to_static(list: &[String]) -> &'static [&'static SupportedPr
 
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
-    subnet_state: SubnetState,
 }
 
 async fn resolve_domain_ips(domains: &[&str]) -> Result<HashSet<IpAddr>> {
@@ -76,6 +71,7 @@ async fn resolve_domain_ips(domains: &[&str]) -> Result<HashSet<IpAddr>> {
 impl Http3Server {
     pub async fn run(
         config: Arc<NodeConfig>,
+        model_store: Arc<ModelConfigStore>,
         tls_config: RustlsConfig,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
@@ -86,18 +82,6 @@ impl Http3Server {
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| anyhow!("Invalid listen address {}: {}", addr_str, e))?;
-
-        let validator_whitelist: foldhash::HashSet<Hotkey> =
-            config.http.validator_whitelist.iter().cloned().collect();
-        let subnet_state = SubnetState::new(
-            config.http.wss_bittensor.clone(),
-            config.http.subnet_number,
-            None,
-            Duration::from_secs(config.http.subnet_poll_interval_sec),
-            config.http.wss_max_message_size,
-            shutdown.child_token(),
-            validator_whitelist,
-        );
 
         let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
         let mut domains: Vec<&str> = Vec::new();
@@ -132,15 +116,15 @@ impl Http3Server {
             .map(|s| s.as_str())
             .filter(|d| d != self_domain)
             .collect();
-        if !peer_domains.is_empty() {
-            if let Ok(resolved) = resolve_domain_ips(&peer_domains).await {
-                cluster_ips.extend(resolved);
-            }
+        if !peer_domains.is_empty()
+            && let Ok(resolved) = resolve_domain_ips(&peer_domains).await
+        {
+            cluster_ips.extend(resolved);
         }
 
         let router = Self::setup_router(
             config.clone(),
-            &subnet_state,
+            model_store,
             &gateway_state,
             &task_queue,
             &metrics,
@@ -170,15 +154,12 @@ impl Http3Server {
             }
         });
 
-        Ok(Self {
-            join_handle,
-            subnet_state,
-        })
+        Ok(Self { join_handle })
     }
 
     fn setup_router(
         config: Arc<NodeConfig>,
-        subnet_state: &SubnetState,
+        model_store: Arc<ModelConfigStore>,
         gateway_state: &GatewayState,
         task_queue: &DupQueue<Task>,
         metrics: &Metrics,
@@ -219,13 +200,13 @@ impl Http3Server {
         Ok(router
             .hoop(affix_state::inject(task_queue.clone()))
             .hoop(affix_state::inject(gateway_state.clone()))
-            .hoop(affix_state::inject(subnet_state.clone()))
             .hoop(affix_state::inject(http_config.clone()))
             .hoop(affix_state::inject(add_task_whitelist))
             .hoop(affix_state::inject(config.network.node_id as usize))
             .hoop(affix_state::inject(metrics.clone()))
             .hoop(affix_state::inject(prompt_config.clone()))
             .hoop(affix_state::inject(image_config.clone()))
+            .hoop(affix_state::inject(model_store))
             .hoop(affix_state::inject(prompt_regex))
             .hoop(affix_state::inject(cluster_ips))
             .hoop(affix_state::inject(distributed_limiter))
@@ -318,7 +299,6 @@ impl Http3Server {
 
     pub fn abort(&self) {
         self.join_handle.abort();
-        self.subnet_state.abort();
     }
 
     pub async fn wait(&mut self) -> Result<(), tokio::task::JoinError> {
