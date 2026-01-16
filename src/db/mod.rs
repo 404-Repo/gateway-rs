@@ -1,6 +1,6 @@
 mod key_validator;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
 use foldhash::fast::RandomState;
 use rustls::{ClientConfig, RootCertStore};
@@ -9,10 +9,10 @@ use sdd::{AtomicOwned, Guard, Owned, Tag};
 use std::error::Error as _;
 use std::io;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::{fs, task::JoinHandle};
-use tokio_postgres::{types::ToSql, Client, Config, Error, Row, Statement};
+use tokio_postgres::{Client, Config, Error, Row, Statement, types::ToSql};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{error, info};
 
@@ -491,16 +491,16 @@ DO UPDATE SET
             return true;
         }
 
-        if let Some(src) = e.source() {
-            if let Some(io_err) = src.downcast_ref::<io::Error>() {
-                return matches!(
-                    io_err.kind(),
-                    io::ErrorKind::TimedOut
-                        | io::ErrorKind::ConnectionRefused
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::ConnectionAborted
-                );
-            }
+        if let Some(src) = e.source()
+            && let Some(io_err) = src.downcast_ref::<io::Error>()
+        {
+            return matches!(
+                io_err.kind(),
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            );
         }
 
         false

@@ -1,15 +1,15 @@
-use foldhash::fast::RandomState;
 use foldhash::HashSetExt as _;
+use foldhash::fast::RandomState;
 use scc::{HashMap, Queue};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::{self, JoinHandle};
 use uuid::Uuid;
 
 use crate::api::HasUuid;
-use crate::bittensor::hotkey::Hotkey;
+use crate::crypto::hotkey::Hotkey;
 
 const SENTMAP_START_CAPACITY: usize = 1024;
 const EXPIREDMAP_START_CAPACITY: usize = 8;
@@ -130,6 +130,18 @@ where
     }
 
     pub fn pop(&self, num: usize, hotkey: &Hotkey) -> Vec<(T, Option<Duration>)> {
+        self.pop_with_filter(num, hotkey, |_| true)
+    }
+
+    pub fn pop_with_filter<F>(
+        &self,
+        num: usize,
+        hotkey: &Hotkey,
+        filter: F,
+    ) -> Vec<(T, Option<Duration>)>
+    where
+        F: Fn(&T) -> bool,
+    {
         let mut result = Vec::with_capacity(num);
 
         // Capture the current queue length once so we don't iterate indefinitely
@@ -148,6 +160,13 @@ where
             self.inner.len.fetch_sub(1, Ordering::Relaxed);
 
             let mut entry = (*shared).clone();
+
+            if !filter(&entry.item) {
+                // Rotate non-matching entries to the back during this pass.
+                self.inner.len.fetch_add(1, Ordering::Relaxed);
+                self.inner.q.push((*entry).clone());
+                continue;
+            }
             let key = (*entry.item.id(), hotkey.clone());
 
             // Deliver to this hotkey only once
@@ -184,11 +203,11 @@ where
 mod tests {
     use super::DupQueue;
     use crate::api::Task;
-    use crate::bittensor::hotkey::Hotkey;
+    use crate::crypto::hotkey::Hotkey;
     use std::collections::HashSet;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::sync::Barrier;
     use tokio::task;
@@ -199,6 +218,7 @@ mod tests {
             id: Uuid::new_v4(),
             prompt: Some(Arc::new(prompt.to_string())),
             image: None,
+            model: None,
         }
     }
 
@@ -246,6 +266,37 @@ mod tests {
         // Duplication allowance exhausted; new hotkey "d" gets nothing.
         let hk_d: Hotkey = Hotkey::from_bytes(&[4u8; 32]);
         assert!(queue.pop(3, &hk_d).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pop_with_model_filter() {
+        let queue = Arc::new(DupQueue::<Task>::builder().dup(1).ttl(300).build());
+
+        let task_a = Task {
+            id: Uuid::new_v4(),
+            prompt: Some(Arc::new("Task A".to_string())),
+            image: None,
+            model: Some("404-3dgs".to_string()),
+        };
+        let task_b = Task {
+            id: Uuid::new_v4(),
+            prompt: Some(Arc::new("Task B".to_string())),
+            image: None,
+            model: Some("404-mesh".to_string()),
+        };
+
+        queue.push(task_a.clone());
+        queue.push(task_b.clone());
+
+        let hk: Hotkey = Hotkey::from_bytes(&[9u8; 32]);
+        let res = queue.pop_with_filter(2, &hk, |task| task.model.as_deref() == Some("404-mesh"));
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, task_b);
+
+        let res_remaining =
+            queue.pop_with_filter(2, &hk, |task| task.model.as_deref() == Some("404-3dgs"));
+        assert_eq!(res_remaining.len(), 1);
+        assert_eq!(res_remaining[0].0, task_a);
     }
 
     #[tokio::test]

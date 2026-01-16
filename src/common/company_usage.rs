@@ -108,10 +108,10 @@ impl CompanyUsageRecorder {
                     .await
                     .and_modify(|v| *v += count)
                     .or_insert(count);
-            } else if let scc::hash_map::Entry::Occupied(entry) = buffer.entry_async(key).await {
-                if *entry.get() == 0 {
-                    let _ = entry.remove_entry();
-                }
+            } else if let scc::hash_map::Entry::Occupied(entry) = buffer.entry_async(key).await
+                && *entry.get() == 0
+            {
+                let _ = entry.remove_entry();
             }
         }
 

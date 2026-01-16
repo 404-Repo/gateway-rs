@@ -1,11 +1,11 @@
 use foldhash::fast::RandomState;
 use prometheus::{
-    opts, Counter, CounterVec, Gauge, GaugeVec, IntGauge, IntGaugeVec, Opts, Registry,
+    Counter, CounterVec, Gauge, GaugeVec, IntGauge, IntGaugeVec, Opts, Registry, opts,
 };
 use scc::HashMap;
 use std::sync::Arc;
 
-/// Per-validator metrics
+/// Per-worker metrics
 pub struct MetricsEntry {
     pub completion_time_avg: Gauge,
     pub completion_time_max: Gauge,
@@ -83,13 +83,13 @@ impl Metrics {
         registry.register(Box::new(queue_time_avg.clone()))?;
         registry.register(Box::new(queue_time_max.clone()))?;
 
-        // Per-validator metric vectors
+        // Per-worker metric vectors
         let completion_time_avg = GaugeVec::new(
             Opts::new(
                 "completion_time_avg",
-                "Per-validator EWMA of seconds between assignment and successful completion",
+                "Per-worker EWMA of seconds between assignment and successful completion",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let completed_tasks_by_kind = CounterVec::new(
             Opts::new(
@@ -108,51 +108,51 @@ impl Metrics {
         let completion_time_max = GaugeVec::new(
             Opts::new(
                 "completion_time_max",
-                "Per-validator longest observed completion time in seconds",
+                "Per-worker longest observed completion time in seconds",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let completed_tasks = CounterVec::new(
             Opts::new(
                 "completed_tasks_total",
-                "Per-validator count of successful task submissions accepted by the gateway",
+                "Per-worker count of successful task submissions accepted by the gateway",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let failed_tasks = CounterVec::new(
             Opts::new(
                 "failed_tasks_total",
-                "Per-validator count of submissions marked as failures",
+                "Per-worker count of submissions marked as failures",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let timeout_failed_tasks = CounterVec::new(
             Opts::new(
                 "timeout_failures_total",
-                "Per-validator count of assigned tasks that timed out without a result",
+                "Per-worker count of assigned tasks that timed out without a result",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let tasks_received = CounterVec::new(
             Opts::new(
                 "tasks_received_total",
-                "Per-validator count of tasks assigned when responding to get_tasks",
+                "Per-worker count of tasks assigned when responding to get_tasks",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let best_completed_tasks = GaugeVec::new(
             Opts::new(
                 "best_completed_tasks",
-                "Per-validator count of wins where this validator's result was selected as best",
+                "Per-worker count of wins where this worker's result was selected as best",
             ),
-            &["validator"],
+            &["worker"],
         )?;
         let tasks_in_progress = IntGaugeVec::new(
             Opts::new(
                 "tasks_in_progress",
-                "Per-validator count of assigned tasks awaiting completion, failure, or timeout",
+                "Per-worker count of assigned tasks awaiting completion, failure, or timeout",
             ),
-            &["validator"],
+            &["worker"],
         )?;
 
         registry.register(Box::new(completion_time_avg.clone()))?;

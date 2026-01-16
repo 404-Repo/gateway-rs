@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use foldhash::fast::RandomState;
-use salvo::{handler, Depot, Request};
+use salvo::{Depot, Request, handler};
 use scc::HashCache;
 
 use crate::config::HTTPConfig;
@@ -88,19 +88,19 @@ impl DistributedRateLimiter {
                 }
 
                 // Drop local pending counts already reflected in the cluster snapshot
-                if let Some(delta) = cluster_hour.checked_sub(w.cluster_hour_seen) {
-                    if delta > 0 {
-                        let to_sub = delta.min(w.hour as u64) as u32;
-                        w.hour = w.hour.saturating_sub(to_sub);
-                        w.cluster_hour_seen = cluster_hour;
-                    }
+                if let Some(delta) = cluster_hour.checked_sub(w.cluster_hour_seen)
+                    && delta > 0
+                {
+                    let to_sub = delta.min(w.hour as u64) as u32;
+                    w.hour = w.hour.saturating_sub(to_sub);
+                    w.cluster_hour_seen = cluster_hour;
                 }
-                if let Some(delta) = cluster_day.checked_sub(w.cluster_day_seen) {
-                    if delta > 0 {
-                        let to_sub = delta.min(w.day as u64) as u32;
-                        w.day = w.day.saturating_sub(to_sub);
-                        w.cluster_day_seen = cluster_day;
-                    }
+                if let Some(delta) = cluster_day.checked_sub(w.cluster_day_seen)
+                    && delta > 0
+                {
+                    let to_sub = delta.min(w.day as u64) as u32;
+                    w.day = w.day.saturating_sub(to_sub);
+                    w.cluster_day_seen = cluster_day;
                 }
 
                 // Combine cluster totals with remaining local increments
@@ -244,27 +244,26 @@ pub async fn enforce_rate_limit(depot: &mut Depot, req: &mut Request) -> Result<
     let epochs = DistributedRateLimiter::current_epochs();
 
     // Company keys first, enforce their limits if the header matches
-    if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if let Some((cid, (_name, hourly_limit, daily_limit))) =
+    if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
+        && let Some((cid, (_name, hourly_limit, daily_limit))) =
             gs.get_company_info_from_key(key_str).await
-        {
-            enforce_subject(
-                limiter,
-                gs,
-                epochs,
-                SubjectParams {
-                    subject: Subject::Company,
-                    id: cid.as_u128(),
-                    hourly_limit,
-                    daily_limit,
-                    add_day: 1,
-                    error_msg: "Company rate limit exceeded",
-                    require_day_match: true,
-                },
-            )
-            .await?;
-            return Ok(());
-        }
+    {
+        enforce_subject(
+            limiter,
+            gs,
+            epochs,
+            SubjectParams {
+                subject: Subject::Company,
+                id: cid.as_u128(),
+                hourly_limit,
+                daily_limit,
+                add_day: 1,
+                error_msg: "Company rate limit exceeded",
+                require_day_match: true,
+            },
+        )
+        .await?;
+        return Ok(());
     }
 
     // Otherwise fall back to per-user quota when we have a user id

@@ -1,7 +1,8 @@
 mod api;
-mod bittensor;
 mod common;
 mod config;
+mod config_model;
+mod crypto;
 mod db;
 mod http3;
 mod metrics;
@@ -14,8 +15,8 @@ use clap::ValueEnum;
 use common::log::{init_tracing, log_app_config, log_build_information};
 use std::{env, sync::Arc, time::Duration};
 
-use config::read_config;
-use raft::{start_gateway, GatewayExit, GatewayMode};
+use config::{ModelConfigStore, read_config, resolve_config_path};
+use raft::{GatewayExit, GatewayMode, start_gateway};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -26,7 +27,7 @@ const RESTART_DELAY_SECS: u64 = 5;
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> std::io::Result<()> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigterm = signal(SignalKind::terminate())?;
 
@@ -92,11 +93,34 @@ async fn main() {
     let env_config = env::var("GATEWAY_CONFIG").ok();
     let config_path: Option<&String> = cli.config.as_ref().or(env_config.as_ref());
 
+    let resolved_path = match resolve_config_path(config_path) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Failed to resolve config file path: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let node_config = match read_config(config_path).await {
         Ok(config) => Arc::new(config),
         Err(e) => {
             eprintln!("Failed to load config file: {e}");
             std::process::exit(1);
+        }
+    };
+    let model_store =
+        match ModelConfigStore::new(resolved_path, node_config.model_config.clone()).await {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                eprintln!("Failed to initialize model config store: {e}");
+                std::process::exit(1);
+            }
+        };
+    let _model_watcher = match model_store.start_watcher(tokio::runtime::Handle::current()) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            warn!("Failed to start model config watcher: {e}");
+            None
         }
     };
 
@@ -143,7 +167,14 @@ async fn main() {
             break;
         }
 
-        match start_gateway(gateway_mode, Arc::clone(&node_config), shutdown.clone()).await {
+        match start_gateway(
+            gateway_mode,
+            Arc::clone(&node_config),
+            Arc::clone(&model_store),
+            shutdown.clone(),
+        )
+        .await
+        {
             Ok(gateway) => {
                 let exit = gateway.wait_for_exit().await;
                 if shutdown.is_cancelled() {
@@ -201,9 +232,9 @@ async fn main() {
     if !signal_listener.is_finished() {
         signal_listener.abort();
     }
-    if let Err(e) = signal_listener.await {
-        if !e.is_cancelled() {
-            error!("Shutdown listener failed: {e}");
-        }
+    if let Err(e) = signal_listener.await
+        && !e.is_cancelled()
+    {
+        error!("Shutdown listener failed: {e}");
     }
 }

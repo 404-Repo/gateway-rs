@@ -1,4 +1,4 @@
-use crate::bittensor::crypto::ss58_decode;
+use crate::crypto::ss58_decode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::ops::Deref;
 use std::str::FromStr;
@@ -57,7 +57,7 @@ impl<'de> Deserialize<'de> for Hotkey {
 
 impl Hotkey {
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
-        Hotkey(crate::bittensor::crypto::ss58_encode(bytes).into())
+        Hotkey(crate::crypto::ss58_encode(bytes).into())
     }
 }
 

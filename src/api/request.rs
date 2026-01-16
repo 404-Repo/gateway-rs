@@ -4,19 +4,22 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use super::response::GatewayInfo;
-use crate::bittensor::hotkey::Hotkey;
+use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
     pub prompt: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetTasksRequest {
-    pub validator_hotkey: Hotkey,
+    #[serde(alias = "validator_hotkey")]
+    pub worker_hotkey: Hotkey,
     pub signature: String,
     pub timestamp: String,
     pub requested_task_count: usize,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,7 +27,10 @@ pub struct GetTaskResultRequest {
     pub id: Uuid,
     #[serde(default)]
     pub all: bool,
+    // Legacy: format=ply is deprecated in favor of compress=0.
     pub format: Option<String>,
+    // Accepts 1/0/true/false. Only applies to 3DGS output.
+    pub compress: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,7 +40,8 @@ pub struct GetTaskStatus {
 
 #[derive(Deserialize)]
 pub struct AddTaskResultRequest {
-    pub validator_hotkey: Hotkey,
+    #[serde(alias = "validator_hotkey")]
+    pub worker_hotkey: Hotkey,
     pub miner_hotkey: Option<Hotkey>,
     pub miner_uid: Option<u32>,
     pub miner_rating: Option<f32>,

@@ -17,8 +17,8 @@ use openraft::Vote;
 
 use super::persistence::{PersistedLogState, TypeConfigLogPersistence};
 use crate::raft::TypeConfig;
-use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
 
 /// RaftLogStore implementation with a in-memory storage
 pub struct LogStore<C: RaftTypeConfig> {
@@ -127,10 +127,10 @@ impl<C: RaftTypeConfig> Default for LogStoreInner<C> {
 
 impl<C: RaftTypeConfig> LogStoreInner<C> {
     fn ensure_not_compacted(&self, index: u64) -> Result<(), Box<StorageError<C::NodeId>>> {
-        if let Some(last_purged) = &self.last_purged_log_id {
-            if index <= last_purged.index {
-                return Err(Box::new(self.compacted_error(Some(index))));
-            }
+        if let Some(last_purged) = &self.last_purged_log_id
+            && index <= last_purged.index
+        {
+            return Err(Box::new(self.compacted_error(Some(index))));
         }
         Ok(())
     }
@@ -152,9 +152,9 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
                 "requested log range overlaps compacted logs (last purged: {:?}, first available: {:?})",
                 last, first_log_id
             ),
-            (Some(idx), None) => format!(
-                "log entry at index {idx} is unavailable; no compaction metadata recorded"
-            ),
+            (Some(idx), None) => {
+                format!("log entry at index {idx} is unavailable; no compaction metadata recorded")
+            }
             (None, None) => {
                 "requested log range is unavailable; compaction metadata missing".to_string()
             }
@@ -201,12 +201,10 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         }
 
         if response.is_empty() {
-            if let (Some(start), Some(len)) = (start_index, expected_len) {
-                if len > 0 {
-                    return Err(
-                        self.missing_log_error(format!("missing log entry at index {start}"))
-                    );
-                }
+            if let (Some(start), Some(len)) = (start_index, expected_len)
+                && len > 0
+            {
+                return Err(self.missing_log_error(format!("missing log entry at index {start}")));
             }
             return Ok(response);
         }
@@ -224,13 +222,13 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
                 expected = expected.saturating_add(1);
             }
 
-            if let Some(end) = end_index {
-                if expected < end {
-                    self.ensure_not_compacted(expected).map_err(|e| *e)?;
-                    return Err(self.missing_log_error(format!(
-                        "missing log entries in range [{start}, {end}) starting at index {expected}"
-                    )));
-                }
+            if let Some(end) = end_index
+                && expected < end
+            {
+                self.ensure_not_compacted(expected).map_err(|e| *e)?;
+                return Err(self.missing_log_error(format!(
+                    "missing log entries in range [{start}, {end}) starting at index {expected}"
+                )));
             }
         }
 
@@ -295,14 +293,14 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
     async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
         {
             let ld = &mut self.last_purged_log_id;
-            if let Some(current) = ld.as_ref() {
-                if log_id < *current {
-                    let io_err = IoError::other(format!(
-                        "purge log id {:?} is older than last purged {:?}",
-                        log_id, current
-                    ));
-                    return Err(StorageIOError::write_logs(&io_err).into());
-                }
+            if let Some(current) = ld.as_ref()
+                && log_id < *current
+            {
+                let io_err = IoError::other(format!(
+                    "purge log id {:?} is older than last purged {:?}",
+                    log_id, current
+                ));
+                return Err(StorageIOError::write_logs(&io_err).into());
             }
             *ld = Some(log_id.clone());
         }
@@ -324,11 +322,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
 impl<C: RaftTypeConfig> LogStore<C> {
     fn persist_op_if_needed(&self, op: Option<PersistOp<C>>) -> Option<PersistOp<C>> {
         // Persist only if worker sender exists
-        if self.worker.is_some() {
-            op
-        } else {
-            None
-        }
+        if self.worker.is_some() { op } else { None }
     }
 
     async fn persist_if_needed(
@@ -413,14 +407,16 @@ impl LogStore<TypeConfig> {
         ) = std::sync::mpsc::channel();
 
         let worker_fn = Arc::clone(&persistence_fn);
-        let handle = thread::spawn(move || loop {
-            match op_rx.recv() {
-                Ok(PersistMsg::Op(op, resp_tx)) => {
-                    let res = (worker_fn)(op);
-                    let _ = resp_tx.send(res);
+        let handle = thread::spawn(move || {
+            loop {
+                match op_rx.recv() {
+                    Ok(PersistMsg::Op(op, resp_tx)) => {
+                        let res = (worker_fn)(op);
+                        let _ = resp_tx.send(res);
+                    }
+                    Ok(PersistMsg::Shutdown) => break,
+                    Err(_) => break,
                 }
-                Ok(PersistMsg::Shutdown) => break,
-                Err(_) => break,
             }
         });
 
@@ -459,14 +455,14 @@ mod impl_log_store {
     use std::fmt::Debug;
     use std::ops::RangeBounds;
 
-    use openraft::storage::LogFlushed;
-    use openraft::storage::RaftLogStorage;
     use openraft::LogId;
     use openraft::LogState;
     use openraft::RaftLogReader;
     use openraft::RaftTypeConfig;
     use openraft::StorageError;
     use openraft::Vote;
+    use openraft::storage::LogFlushed;
+    use openraft::storage::RaftLogStorage;
 
     use crate::raft::memstore::log_store::LogStore;
 
@@ -580,8 +576,8 @@ mod impl_log_store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::test_utils::unique_path;
     use crate::raft::TypeConfig;
+    use crate::raft::test_utils::unique_path;
     use openraft::Entry;
     use openraft::EntryPayload;
     use openraft::LeaderId;

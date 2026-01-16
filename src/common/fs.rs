@@ -5,10 +5,10 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));

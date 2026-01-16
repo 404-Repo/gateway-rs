@@ -1,19 +1,20 @@
-use anyhow::anyhow;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
-use std::{fmt, path::Path};
+use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
-use crate::bittensor::hotkey::Hotkey;
+pub use crate::config_model::{ModelConfig, ModelConfigStore, ModelOutput, ModelResolveError};
+use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
     pub update_gateway_info_ms: u64,
-    pub unique_validators_per_task: usize,
+    #[serde(alias = "unique_validators_per_task")]
+    pub unique_workers_per_task: usize,
     pub taskmanager_initial_capacity: usize,
     pub taskmanager_cleanup_interval: u64,
     pub taskmanager_result_lifetime: u64,
@@ -108,8 +109,6 @@ pub struct HTTPConfig {
     pub add_task_basic_per_ip_rate_limit: usize,
     #[serde(default)]
     pub add_task_whitelist: HashSet<String>,
-    #[serde(default)]
-    pub validator_whitelist: HashSet<Hotkey>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,
@@ -117,17 +116,14 @@ pub struct HTTPConfig {
     pub leader_rate_limit: usize,
     pub metric_rate_limit: usize,
     pub get_status_rate_limit: usize,
+    #[serde(default)]
+    pub worker_whitelist: HashSet<Hotkey>,
     // Size limit for the request
     pub add_task_size_limit: u64,
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,
     pub raft_write_size_limit: u64,
-    pub wss_bittensor: String,
-    pub wss_max_message_size: usize,
     pub signature_freshness_threshold: u64,
-    // Subnet state updater settings
-    pub subnet_number: u16,
-    pub subnet_poll_interval_sec: u64,
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
     pub generic_key: Option<Uuid>,
@@ -217,6 +213,7 @@ pub struct Certificate {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
+    pub model_config: ModelConfig,
     pub basic: BasicConfig,
     pub network: NetworkConfig,
     pub rserver: RServerConfig,
@@ -337,25 +334,13 @@ impl fmt::Display for NodeConfig {
 }
 
 pub async fn read_config(path: Option<&String>) -> Result<NodeConfig> {
-    if let Some(provided_path) = path {
-        let provided_path = Path::new(&provided_path);
-        if provided_path.exists() {
-            return read_config_from_file(provided_path).await;
-        } else {
-            return Err(anyhow!("Provided configuration file path does not exist"));
-        }
-    }
-
-    let toml_path = Path::new("config.toml");
-    let json_path = Path::new("config.json");
-
-    if toml_path.exists() {
-        read_config_from_file(toml_path).await
-    } else if json_path.exists() {
-        read_config_from_file(json_path).await
-    } else {
-        Err(anyhow!("No configuration file found"))
-    }
+    let path = resolve_config_path(path)?;
+    let config = read_config_from_file(&path).await?;
+    config
+        .model_config
+        .validate()
+        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+    Ok(config)
 }
 
 async fn read_config_from_file<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
@@ -371,5 +356,27 @@ async fn read_config_from_file<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
             Ok(config)
         }
         _ => Err(anyhow!("Unsupported file format")),
+    }
+}
+
+pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
+    if let Some(provided_path) = path {
+        let provided_path = Path::new(&provided_path);
+        if provided_path.exists() {
+            return Ok(provided_path.to_path_buf());
+        } else {
+            return Err(anyhow!("Provided configuration file path does not exist"));
+        }
+    }
+
+    let toml_path = Path::new("config.toml");
+    let json_path = Path::new("config.json");
+
+    if toml_path.exists() {
+        Ok(toml_path.to_path_buf())
+    } else if json_path.exists() {
+        Ok(json_path.to_path_buf())
+    } else {
+        Err(anyhow!("No configuration file found"))
     }
 }

@@ -9,26 +9,66 @@ use tokio_util::io::StreamReader;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::api::Task;
 use crate::api::request::{AddTaskRequest, GetTasksRequest};
 use crate::api::response::{GetTasksResponse, LoadResponse};
-use crate::api::Task;
-use crate::bittensor::crypto::verify_hotkey;
-use crate::bittensor::subnet_state::SubnetState;
 use crate::common::image::validate_image;
 use crate::common::queue::DupQueue;
-use crate::config::{HTTPConfig, ImageConfig, PromptConfig};
+use crate::config::{HTTPConfig, ImageConfig, ModelConfigStore, ModelResolveError, PromptConfig};
+use crate::crypto::verify_hotkey;
 use crate::http3::error::ServerError;
-use crate::http3::handlers::common::{DepotExt, BOUNDARY_PREFIX, MULTIPART_PREFIX};
+use crate::http3::handlers::common::{BOUNDARY_PREFIX, DepotExt, MULTIPART_PREFIX};
 use crate::http3::rate_limits::RateLimitContext;
 use crate::metrics::{Metrics, TaskKind};
 use crate::raft::gateway_state::GatewayState;
 use regex::Regex;
+use serde_json::json;
 
 fn extract_origin(req: &Request) -> &str {
     req.headers()
         .get("x-client-origin")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
+}
+
+fn format_known_models(known: &[String]) -> String {
+    if known.is_empty() {
+        "none configured".to_string()
+    } else {
+        known.join(", ")
+    }
+}
+
+fn model_error_to_server_error(err: ModelResolveError) -> ServerError {
+    match err {
+        ModelResolveError::UnknownModel { model, known } => {
+            let message = format!(
+                "Invalid value '{}'. Expected one of: {}",
+                model,
+                format_known_models(&known)
+            );
+            ServerError::BadRequestJson(json!({
+                "error": "invalid_field",
+                "field": "model",
+                "message": message,
+            }))
+        }
+        ModelResolveError::EmptyConfig => {
+            ServerError::Internal("Model configuration is empty".to_string())
+        }
+        ModelResolveError::MissingDefault {
+            default_model,
+            known,
+        } => ServerError::Internal(format!(
+            "Default model '{}' not configured (known models: {})",
+            default_model,
+            format_known_models(&known)
+        )),
+        ModelResolveError::InvalidOutput { model, output } => ServerError::Internal(format!(
+            "Invalid output '{}' configured for model '{}'",
+            output, model
+        )),
+    }
 }
 
 #[inline(always)]
@@ -45,6 +85,7 @@ async fn read_text_field(
 struct AddTaskMultipartData {
     prompt: Option<String>,
     image: Option<Bytes>,
+    model: Option<String>,
 }
 
 async fn parse_add_task_multipart(
@@ -69,16 +110,18 @@ async fn parse_add_task_multipart(
     let prompt_cfg = depot.require::<PromptConfig>()?;
 
     let constraints = Constraints::new()
-        .allowed_fields(vec!["prompt", "image"])
+        .allowed_fields(vec!["prompt", "image", "model"])
         .size_limit(
             SizeLimit::new()
                 .for_field("image", image_cfg.max_size_bytes as u64)
-                .for_field("prompt", prompt_cfg.max_len as u64),
+                .for_field("prompt", prompt_cfg.max_len as u64)
+                .for_field("model", 64),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
     let mut prompt = None;
     let mut image = None;
+    let mut model = None;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -125,11 +168,18 @@ async fn parse_add_task_multipart(
                 }
                 image = Some(content.freeze());
             }
+            "model" => {
+                model = Some(read_text_field(field, "model").await?);
+            }
             _ => continue,
         }
     }
 
-    Ok(AddTaskMultipartData { prompt, image })
+    Ok(AddTaskMultipartData {
+        prompt,
+        image,
+        model,
+    })
 }
 
 // curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
@@ -172,6 +222,7 @@ pub async fn add_task_handler(
         AddTaskMultipartData {
             prompt: add_task.prompt,
             image: None,
+            model: add_task.model,
         }
     };
 
@@ -214,6 +265,8 @@ pub async fn add_task_handler(
     let queue = depot.require::<DupQueue<Task>>()?;
     let metrics = depot.require::<Metrics>()?;
     let http_cfg = depot.require::<HTTPConfig>()?;
+    let model_store = depot.require::<Arc<ModelConfigStore>>()?.clone();
+    let model_cfg = model_store.get().await;
     let is_company_request = depot.require::<RateLimitContext>()?.is_company_key;
 
     // Determine and validate origin
@@ -229,6 +282,10 @@ pub async fn add_task_handler(
     if queue.len() >= http_cfg.max_task_queue_len {
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
+
+    let resolved_model = model_cfg
+        .resolve_model(add_task.model.as_deref())
+        .map_err(model_error_to_server_error)?;
 
     // Validate image if provided
     let validated_image = if let Some(image_data) = add_task.image {
@@ -258,6 +315,7 @@ pub async fn add_task_handler(
         id: task_id,
         prompt: add_task.prompt.map(Arc::new),
         image: validated_image.as_ref().map(|img| img.data.clone()),
+        model: Some(resolved_model.model),
     };
 
     queue.push(task.clone());
@@ -270,18 +328,16 @@ pub async fn add_task_handler(
 
     gateway_state.task_manager().add_task(task).await;
 
-    if is_company_request {
-        if let Some(api_key) = req
+    if is_company_request
+        && let Some(api_key) = req
             .headers()
             .get("x-api-key")
             .and_then(|value| value.to_str().ok())
-        {
-            if let Some((company_id, _)) = gateway_state.get_company_info_from_key(api_key).await {
-                gateway_state
-                    .record_company_usage(company_id, task_kind)
-                    .await;
-            }
-        }
+        && let Some((company_id, _)) = gateway_state.get_company_info_from_key(api_key).await
+    {
+        gateway_state
+            .record_company_usage(company_id, task_kind)
+            .await;
     }
 
     res.render(Json(serde_json::json!({
@@ -305,6 +361,8 @@ pub async fn get_tasks_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let http_cfg = depot.require::<HTTPConfig>()?;
+    let model_store = depot.require::<Arc<ModelConfigStore>>()?.clone();
+    let model_cfg = model_store.get().await;
     let gateway_state = depot.require::<GatewayState>()?;
     let queue = depot.require::<DupQueue<Task>>()?;
     let metrics = depot.require::<Metrics>()?;
@@ -314,37 +372,61 @@ pub async fn get_tasks_handler(
         .await
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
 
-    let subnet_state = depot.require::<SubnetState>()?;
-
-    subnet_state
-        .validate_hotkey(&get_tasks.validator_hotkey)
-        .await
-        .map_err(|e| {
-            ServerError::Internal(format!("Hotkey is not registered in the subnet: {:?}", e))
-        })?;
-
     verify_hotkey(
         &get_tasks.timestamp,
-        &get_tasks.validator_hotkey,
+        &get_tasks.worker_hotkey,
         &get_tasks.signature,
         http_cfg.signature_freshness_threshold,
     )
     .map_err(|e| ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e)))?;
+    if !http_cfg.worker_whitelist.is_empty()
+        && !http_cfg.worker_whitelist.contains(&get_tasks.worker_hotkey)
+    {
+        return Err(ServerError::Unauthorized(
+            "Worker hotkey is not whitelisted".to_string(),
+        ));
+    }
 
     info!(
-        "Validator {} has requested {} tasks.",
-        get_tasks.validator_hotkey, get_tasks.requested_task_count
+        "Worker {} has requested {} tasks.",
+        get_tasks.worker_hotkey, get_tasks.requested_task_count
     );
+
+    let model_filter = if let Some(model) = get_tasks.model.as_deref() {
+        model_cfg
+            .output_for(model)
+            .map_err(model_error_to_server_error)?;
+        Some(model.to_string())
+    } else {
+        None
+    };
 
     let mut tasks = Vec::new();
     let task_manager = gateway_state.task_manager();
-    for (t, d) in queue.pop(get_tasks.requested_task_count, &get_tasks.validator_hotkey) {
-        task_manager
-            .record_assignment(t.id, get_tasks.validator_hotkey.clone())
-            .await;
-        tasks.push(t);
-        if let Some(dur) = d {
-            metrics.record_queue_time(dur.as_secs_f64());
+    if let Some(model) = model_filter {
+        let default_model = model_cfg.default_model.clone();
+        for (t, d) in queue.pop_with_filter(
+            get_tasks.requested_task_count,
+            &get_tasks.worker_hotkey,
+            |task| task.model.as_deref().unwrap_or(default_model.as_str()) == model.as_str(),
+        ) {
+            task_manager
+                .record_assignment(t.id, get_tasks.worker_hotkey.clone())
+                .await;
+            tasks.push(t);
+            if let Some(dur) = d {
+                metrics.record_queue_time(dur.as_secs_f64());
+            }
+        }
+    } else {
+        for (t, d) in queue.pop(get_tasks.requested_task_count, &get_tasks.worker_hotkey) {
+            task_manager
+                .record_assignment(t.id, get_tasks.worker_hotkey.clone())
+                .await;
+            tasks.push(t);
+            if let Some(dur) = d {
+                metrics.record_queue_time(dur.as_secs_f64());
+            }
         }
     }
 
@@ -358,13 +440,13 @@ pub async fn get_tasks_handler(
     })?;
 
     metrics
-        .inc_tasks_received(&get_tasks.validator_hotkey, tasks.len())
+        .inc_tasks_received(&get_tasks.worker_hotkey, tasks.len())
         .await;
 
     if !tasks.is_empty() {
         info!(
-            "Validator {} received {} tasks",
-            get_tasks.validator_hotkey,
+            "Worker {} received {} tasks",
+            get_tasks.worker_hotkey,
             tasks.len()
         );
     }

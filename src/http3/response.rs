@@ -25,7 +25,9 @@ fn log_error(status: StatusCode, client_ip: String, req: &Request, body: &salvo:
     let path = req.uri().path();
     if let salvo::http::ResBody::Error(e) = body {
         let reason = e.detail.as_deref().unwrap_or(&e.brief);
-        error!("Error handling request from {ip}: {method} {path} - Status: {status}, Reason: {reason}");
+        error!(
+            "Error handling request from {ip}: {method} {path} - Status: {status}, Reason: {reason}"
+        );
     } else {
         error!("Error handling request from {ip}: {method} {path} - Status: {status}");
     }

@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use base64_simd::{AsOut, STANDARD};
 use blake2::{Blake2b512, Digest};
 use parity_scale_codec::{Decode, Encode};
-use schnorrkel::{context::signing_context, PublicKey, Signature};
+use schnorrkel::{PublicKey, Signature, context::signing_context};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::hotkey::Hotkey;
+use crate::crypto::hotkey::Hotkey;
 
 const GATEWAY: &str = "404_GATEWAY_";
 const SIGNING_CTX: &[u8] = b"substrate";
@@ -112,7 +112,7 @@ pub fn verify_signature(
 
 pub fn verify_hotkey(
     timestamp: &str,
-    validator_hotkey: &Hotkey,
+    worker_hotkey: &Hotkey,
     signature: &str,
     freshness_threshold_sec: u64,
 ) -> Result<()> {
@@ -146,7 +146,7 @@ pub fn verify_hotkey(
 
     // Decode hotkey and signature.
     let hotkey =
-        ss58_decode(validator_hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
+        ss58_decode(worker_hotkey).map_err(|e| anyhow!("Failed to decode hotkey: {}", e))?;
 
     let mut signature_bytes = [0u8; 64];
     let decoded = STANDARD
@@ -167,9 +167,9 @@ pub fn verify_hotkey(
 #[cfg(test)]
 mod tests {
     use super::ss58_encode;
-    use crate::bittensor::crypto::{verify_hotkey, GATEWAY, SIGNING_CTX};
+    use super::{GATEWAY, SIGNING_CTX, verify_hotkey};
     use base64_simd::STANDARD;
-    use schnorrkel::{context::signing_context, ExpansionMode, MiniSecretKey};
+    use schnorrkel::{ExpansionMode, MiniSecretKey, context::signing_context};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn current_timestamp() -> u64 {
@@ -189,13 +189,15 @@ mod tests {
         let timestamp_string = format!("{}{}", GATEWAY, ts);
         let ctx = signing_context(SIGNING_CTX);
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
-        assert!(verify_hotkey(
-            &timestamp_string,
-            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &STANDARD.encode_to_string(signature.to_bytes()),
-            300
-        )
-        .is_ok());
+        assert!(
+            verify_hotkey(
+                &timestamp_string,
+                &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
+                &STANDARD.encode_to_string(signature.to_bytes()),
+                300
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -209,13 +211,15 @@ mod tests {
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
         let mut sig_bytes = signature.to_bytes();
         sig_bytes[0] ^= 0x01; // Tamper with the signature.
-        assert!(verify_hotkey(
-            &timestamp_string,
-            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &STANDARD.encode_to_string(sig_bytes),
-            300
-        )
-        .is_err());
+        assert!(
+            verify_hotkey(
+                &timestamp_string,
+                &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
+                &STANDARD.encode_to_string(sig_bytes),
+                300
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -228,25 +232,29 @@ mod tests {
         let timestamp_string = format!("{}{}", GATEWAY, ts);
         let ctx = signing_context(SIGNING_CTX);
         let signature = keypair.sign(ctx.bytes(timestamp_string.as_bytes()));
-        assert!(verify_hotkey(
-            &timestamp_string,
-            &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
-            &STANDARD.encode_to_string(signature.to_bytes()),
-            300
-        )
-        .is_err());
+        assert!(
+            verify_hotkey(
+                &timestamp_string,
+                &ss58_encode(&keypair.public.to_bytes()).parse().unwrap(),
+                &STANDARD.encode_to_string(signature.to_bytes()),
+                300
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_invalid_timestamp_format() {
         // Timestamp string without the required prefix.
         let bad_timestamp = "dead_code_123456".to_string();
-        assert!(verify_hotkey(
-            &bad_timestamp,
-            &ss58_encode(&[0u8; 32]).parse().unwrap(),
-            &STANDARD.encode_to_string([0u8; 64]),
-            300
-        )
-        .is_err());
+        assert!(
+            verify_hotkey(
+                &bad_timestamp,
+                &ss58_encode(&[0u8; 32]).parse().unwrap(),
+                &STANDARD.encode_to_string([0u8; 64]),
+                300
+            )
+            .is_err()
+        );
     }
 }

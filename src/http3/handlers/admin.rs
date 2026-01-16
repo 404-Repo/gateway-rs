@@ -87,10 +87,10 @@ pub async fn cluster_check(depot: &mut Depot, req: &mut Request) -> Result<(), S
             salvo::conn::SocketAddr::IPv6(addr) => Some(IpAddr::V6(*addr.ip())),
             _ => None,
         };
-        if let Some(ip) = remote_ip_opt {
-            if cluster_ips.contains(&ip) {
-                return Ok(());
-            }
+        if let Some(ip) = remote_ip_opt
+            && cluster_ips.contains(&ip)
+        {
+            return Ok(());
         }
     }
     Err(ServerError::Unauthorized("Not in cluster".to_string()))

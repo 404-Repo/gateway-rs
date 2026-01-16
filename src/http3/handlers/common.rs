@@ -61,7 +61,7 @@ pub async fn write_handler(
                 return Err(ServerError::BadRequest(format!(
                     "Unsupported raft write request: {:?}",
                     other
-                )))
+                )));
             }
         }
     }

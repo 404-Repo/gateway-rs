@@ -1,4 +1,4 @@
-FROM rust:1.92.0-alpine3.22 AS builder
+FROM rust:1.92.0-alpine3.23 AS builder
 
 RUN apk add --no-cache build-base alpine-sdk musl-dev openssl linux-headers
 
@@ -15,7 +15,7 @@ RUN mkdir -p /app/certs && \
     openssl ecparam -name prime256v1 -genkey -noout -out /app/certs/key.pem && \
     openssl req -new -x509 -key /app/certs/key.pem -out /app/certs/cert.pem -days 1825 -subj "/CN=localhost"
 
-FROM alpine:3.22
+FROM alpine:3.23
 RUN apk add --no-cache libstdc++
 COPY --from=builder /app/target/release/gateway /usr/local/bin/
 COPY --from=builder /app/certs /etc/certs
