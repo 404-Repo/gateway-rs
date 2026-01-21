@@ -14,9 +14,9 @@ use crate::raft::memstore::persistence::{
     LOG_STORE_ARCHIVE_PREFIX, LOG_STORE_ARCHIVE_SUFFIX, TypeConfigLogPersistence,
 };
 
-use super::{RateLimitKey, RateLimitWindow, SnapshotPayload, StateMachineData, StoredSnapshot};
+use super::{RateLimitSnapshot, SnapshotPayload, StateMachineData, StoredSnapshot};
 
-type RateLimitsMap = std::collections::BTreeMap<RateLimitKey, RateLimitWindow>;
+type RateLimitsMap = RateLimitSnapshot;
 type LoadLatestResult = (StateMachineData, RateLimitsMap, u64, Option<StoredSnapshot>);
 type ReadSnapshotResult = (StateMachineData, RateLimitsMap, StoredSnapshot);
 
@@ -108,7 +108,12 @@ impl SnapshotPersistence {
             warn!("no valid snapshot could be loaded from disk; starting from empty state");
         }
 
-        Ok((StateMachineData::default(), RateLimitsMap::new(), 0, None))
+        Ok((
+            StateMachineData::default(),
+            RateLimitSnapshot::default(),
+            0,
+            None,
+        ))
     }
 
     fn read_snapshot_file(path: &Path) -> anyhow::Result<ReadSnapshotResult> {

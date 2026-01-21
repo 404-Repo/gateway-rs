@@ -129,6 +129,7 @@ where
         self.inner.len.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn pop(&self, num: usize, hotkey: &Hotkey) -> Vec<(T, Option<Duration>)> {
         self.pop_with_filter(num, hotkey, |_| true)
     }
@@ -196,6 +197,11 @@ where
 
     pub fn len(&self) -> usize {
         self.inner.len.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

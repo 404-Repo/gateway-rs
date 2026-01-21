@@ -13,6 +13,8 @@ use crate::crypto::hotkey::Hotkey;
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
     pub update_gateway_info_ms: u64,
+    #[serde(default = "default_max_rate_limit_deltas_per_batch")]
+    pub max_rate_limit_deltas_per_batch: usize,
     #[serde(alias = "unique_validators_per_task")]
     pub unique_workers_per_task: usize,
     pub taskmanager_initial_capacity: usize,
@@ -88,6 +90,8 @@ pub struct RaftConfig {
     pub compaction_threshold_bytes: u64,
     #[serde(default = "default_compaction_ops")]
     pub compaction_ops: u64,
+    #[serde(default = "default_log_store_flush_interval_ms")]
+    pub log_store_flush_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +103,8 @@ pub struct HTTPConfig {
     pub tls_versions: Vec<String>,
     #[serde(default)]
     pub allowed_origins: HashSet<String>,
+    #[serde(default = "default_max_concurrent_image_uploads")]
+    pub max_concurrent_image_uploads: usize,
     // Rate limits
     pub basic_rate_limit: usize,
     pub update_key_rate_limit: usize,
@@ -107,8 +113,8 @@ pub struct HTTPConfig {
     pub add_task_user_id_global_hourly_rate_limit: usize,
     pub add_task_user_id_per_user_hourly_rate_limit: usize,
     pub add_task_basic_per_ip_rate_limit: usize,
-    #[serde(default)]
-    pub add_task_whitelist: HashSet<String>,
+    #[serde(default, alias = "add_task_whitelist")]
+    pub add_task_rate_limit_allowlist: HashSet<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,
@@ -168,20 +174,40 @@ pub struct DbConfig {
     pub keys_cache_max_capacity: u64,
     #[serde(default = "default_deleted_keys_ttl_minutes")]
     pub deleted_keys_ttl_minutes: u64,
-    #[serde(default = "default_company_usage_flush_interval_sec")]
-    pub company_usage_flush_interval_sec: u64,
+    #[serde(default = "default_events_flush_interval_sec")]
+    pub events_flush_interval_sec: u64,
+    #[serde(default = "default_events_copy_batch_size")]
+    pub events_copy_batch_size: usize,
+    #[serde(default = "default_events_queue_capacity")]
+    pub events_queue_capacity: usize,
 }
 
 fn default_deleted_keys_ttl_minutes() -> u64 {
     60
 }
 
-fn default_company_usage_flush_interval_sec() -> u64 {
+fn default_events_flush_interval_sec() -> u64 {
     5
+}
+
+fn default_events_copy_batch_size() -> usize {
+    1000
+}
+
+fn default_events_queue_capacity() -> usize {
+    50_000
+}
+
+fn default_max_concurrent_image_uploads() -> usize {
+    1024
 }
 
 fn default_distributed_rate_limiter_max_capacity() -> usize {
     4096
+}
+
+fn default_max_rate_limit_deltas_per_batch() -> usize {
+    16_384
 }
 
 fn default_snapshot_dir() -> String {
@@ -198,6 +224,10 @@ fn default_compaction_threshold_bytes() -> u64 {
 
 fn default_compaction_ops() -> u64 {
     4096
+}
+
+fn default_log_store_flush_interval_ms() -> u64 {
+    200
 }
 
 fn default_tls_versions() -> Vec<String> {

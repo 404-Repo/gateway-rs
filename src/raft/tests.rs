@@ -220,13 +220,13 @@ mod tests {
     async fn wait_for_snapshot_file(dir: &Path, timeout: Duration) -> anyhow::Result<PathBuf> {
         let start = Instant::now();
         loop {
-            if dir.exists() {
-                if let Ok(entries) = fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            return Ok(path);
-                        }
+            if dir.exists()
+                && let Ok(entries) = fs::read_dir(dir)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        return Ok(path);
                     }
                 }
             }
@@ -405,10 +405,8 @@ mod tests {
                 }
             }
 
-            if all_agree {
-                if let Some(final_leader) = maybe_leader {
-                    return Ok(final_leader);
-                }
+            if all_agree && let Some(final_leader) = maybe_leader {
+                return Ok(final_leader);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -450,10 +448,8 @@ mod tests {
                 }
             }
 
-            if all_agree {
-                if let Some(final_leader) = maybe_leader {
-                    return Ok(final_leader);
-                }
+            if all_agree && let Some(final_leader) = maybe_leader {
+                return Ok(final_leader);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;

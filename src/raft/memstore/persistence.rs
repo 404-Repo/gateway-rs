@@ -5,7 +5,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow};
@@ -25,6 +25,8 @@ pub(crate) const LOG_STORE_ARCHIVE_SUFFIX: &str = ".bin.zst";
 const LOG_STORE_MAGIC: [u8; 8] = *b"LOGDIF01";
 const LOG_STORE_VERSION: u32 = 1;
 const LOG_STORE_HEADER_LEN: usize = LOG_STORE_MAGIC.len() + std::mem::size_of::<u32>();
+#[cfg(test)]
+static FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 // Defaults are defined in config::PersistenceConfig. These are only used to seed the
 // internal config when callers use `new()` instead of `with_config()` (e.g., tests).
 const DEFAULT_LOG_STORE_COMPACTION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
@@ -120,6 +122,7 @@ pub(crate) struct TypeConfigLogPersistence {
     bytes_since_compaction: AtomicU64,
     compaction_threshold_bytes: u64,
     compaction_ops: u64,
+    dirty: AtomicBool,
     // Buffered append handle, created lazily and rotated on full rewrites
     append_handle: StdMutex<Option<BufWriter<fs::File>>>,
 }
@@ -134,7 +137,15 @@ impl TypeConfigLogPersistence {
     fn ensure_append_handle_opened(&self) -> std::io::Result<()> {
         let mut guard = self.append_handle.lock().unwrap();
         if guard.is_none() {
-            *guard = Some(BufWriter::new(self.open_append_file()?));
+            match self.open_append_file() {
+                Ok(file) => {
+                    *guard = Some(BufWriter::new(file));
+                }
+                Err(err) => {
+                    self.dirty.store(true, Ordering::Release);
+                    return Err(err);
+                }
+            }
         }
         Ok(())
     }
@@ -168,6 +179,7 @@ impl TypeConfigLogPersistence {
             bytes_since_compaction: AtomicU64::new(0),
             compaction_threshold_bytes: DEFAULT_LOG_STORE_COMPACTION_THRESHOLD_BYTES,
             compaction_ops: DEFAULT_LOG_STORE_COMPACTION_OPS,
+            dirty: AtomicBool::new(false),
             append_handle: StdMutex::new(None),
         })
     }
@@ -322,32 +334,32 @@ impl TypeConfigLogPersistence {
     // ---- Append-only per-op API used by LogStore to avoid cloning full state ----
 
     pub(crate) fn append_vote(&self, vote: &Option<Vote<NodeId>>) -> std::io::Result<()> {
-        self.persist_record(DiffRecord::VoteSet(*vote))
+        self.persist_record(DiffRecord::VoteSet(*vote), true)
     }
 
     pub(crate) fn append_committed(
         &self,
         committed: &Option<LogId<NodeId>>,
     ) -> std::io::Result<()> {
-        self.persist_record(DiffRecord::CommittedSet(*committed))
+        self.persist_record(DiffRecord::CommittedSet(*committed), true)
     }
 
     pub(crate) fn append_purge_to(&self, id: &LogId<NodeId>) -> std::io::Result<()> {
-        self.persist_record(DiffRecord::PurgeTo(*id))
+        self.persist_record(DiffRecord::PurgeTo(*id), true)
     }
 
     pub(crate) fn append_truncate_from(&self, start: u64) -> std::io::Result<()> {
-        self.persist_record(DiffRecord::TruncateFrom(start))
+        self.persist_record(DiffRecord::TruncateFrom(start), true)
     }
 
     pub(crate) fn append_append(&self, entries: &[Entry<TypeConfig>]) -> std::io::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        self.persist_record(DiffRecord::Append(entries.to_vec()))
+        self.persist_record(DiffRecord::Append(entries.to_vec()), false)
     }
 
-    fn persist_record(&self, record: DiffRecord) -> std::io::Result<()> {
+    fn persist_record(&self, record: DiffRecord, force_sync: bool) -> std::io::Result<()> {
         let _guard = self.lock.lock().expect("log persistence lock poisoned");
         self.ensure_initialized_file()?;
 
@@ -363,13 +375,17 @@ impl TypeConfigLogPersistence {
             let snapshot: PersistedLogState = (&cache).into();
             self.ops_since_compaction.store(0, Ordering::Relaxed);
             self.bytes_since_compaction.store(0, Ordering::Relaxed);
-            self.rewrite_full_locked(&snapshot)
+            let res = self.rewrite_full_locked(&snapshot);
+            if res.is_ok() {
+                self.dirty.store(false, Ordering::Release);
+            }
+            res
         } else {
             let mut buf = Vec::with_capacity(256);
             Self::append_record(&mut buf, &record)
                 .map_err(|e| std::io::Error::other(format!("encode diff record: {e}")))?;
             let appended_len = buf.len();
-            self.append_and_sync(&buf)?;
+            self.append_and_sync(&buf, force_sync)?;
 
             self.maybe_compact_locked(appended_len)
         }
@@ -395,7 +411,11 @@ impl TypeConfigLogPersistence {
             let state = self.read_current_state().map_err(|e| {
                 std::io::Error::other(format!("read current state for compaction: {e}"))
             })?;
-            self.rewrite_full_locked(&state)
+            let res = self.rewrite_full_locked(&state);
+            if res.is_ok() {
+                self.dirty.store(false, Ordering::Release);
+            }
+            res
         } else {
             Ok(())
         }
@@ -438,7 +458,7 @@ impl TypeConfigLogPersistence {
         Ok(())
     }
 
-    fn append_and_sync(&self, buf: &[u8]) -> std::io::Result<()> {
+    fn append_and_sync(&self, buf: &[u8], force_sync: bool) -> std::io::Result<()> {
         {
             let mut guard = self.append_handle.lock().unwrap();
             if guard.is_none() {
@@ -447,10 +467,40 @@ impl TypeConfigLogPersistence {
             let writer = guard.as_mut().unwrap();
             writer.write_all(buf)?;
             writer.flush()?;
-            // fdatasync (sync_data) is sufficient for appends
-            writer.get_ref().sync_data()?;
+            if force_sync {
+                // fdatasync (sync_data) is sufficient for appends
+                writer.get_ref().sync_data()?;
+                self.dirty.store(false, Ordering::Release);
+            } else {
+                self.dirty.store(true, Ordering::Release);
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn flush_if_dirty(&self) -> std::io::Result<()> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut guard = self.append_handle.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(BufWriter::new(self.open_append_file()?));
+        }
+        let writer = guard.as_mut().unwrap();
+        if let Err(err) = writer.flush().and_then(|_| writer.get_ref().sync_data()) {
+            self.dirty.store(true, Ordering::Release);
+            return Err(err);
+        }
+        #[cfg(test)]
+        {
+            FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_count() -> u64 {
+        FLUSH_COUNT.load(Ordering::Relaxed)
     }
 
     fn is_diff_format(bytes: &[u8]) -> bool {

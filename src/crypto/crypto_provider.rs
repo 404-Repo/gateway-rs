@@ -4,13 +4,12 @@ use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 
 pub fn init_crypto_provider() -> Result<()> {
+    if CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .or_else(|_| {
-            CryptoProvider::get_default()
-                .map(|_| ())
-                .ok_or_else(|| anyhow::anyhow!("Failed to locate any crypto provider"))
-        })?;
+        .map_err(|_| anyhow::anyhow!("Failed to install aws-lc-rs as default provider"))?;
     Ok(())
 }
 

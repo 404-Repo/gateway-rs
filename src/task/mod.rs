@@ -1,10 +1,12 @@
 use bytes::Bytes;
+use foldhash::HashMap as FoldHashMap;
 use foldhash::HashSet;
 use foldhash::fast::RandomState;
 use scc::{HashMap, hash_map::Entry};
 use serde::Serialize;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fmt;
-use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task;
@@ -13,69 +15,120 @@ use uuid::Uuid;
 
 use crate::api::request::AddTaskResultRequest;
 use crate::crypto::hotkey::Hotkey;
+use crate::db::EventRecorder;
 use crate::metrics::{Metrics, TaskInProgressGuard};
 
 struct TaskManagerInner {
-    completed: HashMap<Uuid, Vec<AddTaskResultRequest>, RandomState>,
+    tasks: HashMap<Uuid, TaskState, RandomState>,
     expected_results: usize,
-    execution_time: HashMap<Uuid, Instant, RandomState>,
-    prompts: HashMap<Uuid, Arc<String>, RandomState>,
-    images: HashMap<Uuid, Bytes, RandomState>,
-    models: HashMap<Uuid, String, RandomState>,
-    assigned_workers: HashMap<Uuid, HashSet<Hotkey>, RandomState>,
-    in_progress: HashMap<(Uuid, Hotkey), TaskInProgressGuard, RandomState>,
+    result_lifetime: Duration,
     metrics: Metrics,
+    worker_event_recorder: Option<EventRecorder>,
+    expiration_queue: scc::Queue<ExpirationEvent>,
+}
+
+struct TaskState {
+    execution_start: Option<Instant>,
+    task_expires_at: Option<Instant>,
+    last_result_instant: Option<Instant>,
+    results_expires_at: Option<Instant>,
+    prompt: Option<Arc<String>>,
+    image: Option<Bytes>,
+    model: Option<String>,
+    results: Vec<AddTaskResultRequest>,
+    success_count: usize,
+    last_failure_reason: Option<Arc<str>>,
+    first_success_worker_id: Option<Arc<str>>,
+    assigned_workers: HashSet<Hotkey>,
+    assigned_worker_ids: FoldHashMap<Hotkey, Arc<str>>,
+    in_progress: FoldHashMap<Hotkey, TaskInProgressGuard>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ExpirationKind {
+    Task = 0,
+    Results = 1,
+}
+
+struct ExpirationEvent {
+    task_id: Uuid,
+    when: Instant,
+    kind: ExpirationKind,
 }
 
 impl TaskManagerInner {
-    fn new(initial_capacity: usize, expected_results: usize, metrics: Metrics) -> Self {
+    fn new(
+        initial_capacity: usize,
+        expected_results: usize,
+        result_lifetime: Duration,
+        expiration_queue: scc::Queue<ExpirationEvent>,
+        metrics: Metrics,
+        worker_event_recorder: Option<EventRecorder>,
+    ) -> Self {
         Self {
-            completed: Self::hash_map(initial_capacity),
             expected_results,
-            execution_time: Self::hash_map(initial_capacity),
-            prompts: Self::hash_map(initial_capacity),
-            images: Self::hash_map(initial_capacity),
-            models: Self::hash_map(initial_capacity),
-            assigned_workers: Self::hash_map(initial_capacity),
-            in_progress: Self::hash_map(initial_capacity),
+            result_lifetime,
             metrics,
+            worker_event_recorder,
+            tasks: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
+            expiration_queue,
         }
     }
 
-    fn hash_map<K, V>(capacity: usize) -> HashMap<K, V, RandomState>
-    where
-        K: Eq + Hash,
-    {
-        HashMap::with_capacity_and_hasher(capacity, RandomState::default())
+    fn schedule_task_expiration(&self, task_id: Uuid, when: Instant) {
+        self.expiration_queue.push(ExpirationEvent {
+            task_id,
+            when,
+            kind: ExpirationKind::Task,
+        });
     }
 
-    async fn finish_task(&self, task_id: Uuid, worker: &Hotkey) {
-        let key = (task_id, worker.clone());
-        let _ = self.in_progress.remove_async(&key).await;
+    fn schedule_results_expiration(&self, task_id: Uuid, when: Instant) {
+        self.expiration_queue.push(ExpirationEvent {
+            task_id,
+            when,
+            kind: ExpirationKind::Results,
+        });
     }
+}
 
-    async fn complete_assignment(&self, task_id: Uuid, worker: &Hotkey) -> bool {
-        match self.assigned_workers.entry_async(task_id).await {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().remove(worker);
-                if entry.get().is_empty() {
-                    let _ = entry.remove_entry();
-                    true
-                } else {
-                    false
-                }
-            }
-            Entry::Vacant(_) => true,
+impl TaskState {
+    fn new(task: &crate::api::Task, now: Instant, result_lifetime: Duration) -> Self {
+        Self {
+            execution_start: Some(now),
+            task_expires_at: Some(now + result_lifetime),
+            last_result_instant: None,
+            results_expires_at: None,
+            prompt: task.prompt.as_ref().map(Arc::clone),
+            image: task.image.clone(),
+            model: task.model.clone(),
+            results: Vec::new(),
+            success_count: 0,
+            last_failure_reason: None,
+            first_success_worker_id: None,
+            assigned_workers: HashSet::default(),
+            assigned_worker_ids: FoldHashMap::default(),
+            in_progress: FoldHashMap::default(),
         }
     }
 
-    async fn cleanup_task_payload(&self, task_id: Uuid) {
-        self.prompts.remove_async(&task_id).await;
-        self.images.remove_async(&task_id).await;
-    }
-
-    async fn cleanup_task_metadata(&self, task_id: Uuid) {
-        self.models.remove_async(&task_id).await;
+    fn empty() -> Self {
+        Self {
+            execution_start: None,
+            task_expires_at: None,
+            last_result_instant: None,
+            results_expires_at: None,
+            prompt: None,
+            image: None,
+            model: None,
+            results: Vec::new(),
+            success_count: 0,
+            last_failure_reason: None,
+            first_success_worker_id: None,
+            assigned_workers: HashSet::default(),
+            assigned_worker_ids: FoldHashMap::default(),
+            in_progress: FoldHashMap::default(),
+        }
     }
 }
 
@@ -90,13 +143,11 @@ pub enum TaskStatus {
     #[default]
     NoResult,
     Failure {
-        reason: String,
+        reason: Arc<str>,
     },
     PartialResult(usize),
     Success {
-        miner_hotkey: Option<Hotkey>,
-        miner_uid: Option<u32>,
-        miner_rating: Option<f32>,
+        worker_id: Arc<str>,
     },
 }
 
@@ -108,6 +159,15 @@ pub struct TaskResultBundle {
 #[derive(Debug)]
 pub enum AddResultError {
     NotAssigned,
+}
+
+#[derive(Debug, Clone)]
+pub struct AddResultOutcome {
+    pub completed: bool,
+    pub worker_hotkey: Hotkey,
+    pub worker_id: Arc<str>,
+    pub reason: Option<Arc<str>>,
+    pub is_success: bool,
 }
 
 impl fmt::Display for TaskStatus {
@@ -128,21 +188,20 @@ impl TaskManager {
         cleanup_interval: Duration,
         result_lifetime: Duration,
         metrics: Metrics,
+        worker_event_recorder: Option<EventRecorder>,
     ) -> Self {
         let inner = Arc::new(TaskManagerInner::new(
             initial_capacity,
             expected_results,
+            result_lifetime,
+            scc::Queue::default(),
             metrics,
+            worker_event_recorder,
         ));
 
         let cancel_token = CancellationToken::new();
         let token_child = cancel_token.child_token();
-        let handle = Self::spawn_cleanup(
-            Arc::clone(&inner),
-            token_child,
-            cleanup_interval,
-            result_lifetime,
-        );
+        let handle = Self::spawn_cleanup(Arc::clone(&inner), token_child, cleanup_interval);
 
         Self {
             inner,
@@ -155,69 +214,128 @@ impl TaskManager {
         inner: Arc<TaskManagerInner>,
         token_child: CancellationToken,
         cleanup_interval: Duration,
-        result_lifetime: Duration,
     ) -> tokio::task::JoinHandle<()> {
         task::spawn(async move {
-            let mut expired_ids: Vec<Uuid> = Vec::new();
-            let mut expired_results: Vec<Uuid> = Vec::new();
+            let mut heap: BinaryHeap<Reverse<(Instant, u8, u128)>> = BinaryHeap::new();
             loop {
                 tokio::select! {
-                _ = token_child.cancelled() => break,
-                _ = tokio::time::sleep(cleanup_interval) => {
-                    let now = Instant::now();
-                    expired_results.clear();
-                    inner.completed.retain_async(|task_id, results| {
-                        let keep = results
-                            .last()
-                            .is_some_and(|last| now.duration_since(last.instant) < result_lifetime);
-                        if !keep {
-                            expired_results.push(*task_id);
-                        }
-                        keep
-                    }).await;
-                    for task_id in &expired_results {
-                        inner.cleanup_task_metadata(*task_id).await;
-                    }
-
-                    // Determine expired task ids based on execution_time and drop them
-                    expired_ids.clear();
-                    inner
-                        .execution_time
-                            .retain_async(|task_id, start| {
-                                let keep = now.duration_since(*start) < result_lifetime;
-                                if !keep {
-                                    expired_ids.push(*task_id);
-                                }
-                                keep
-                            }).await;
-
-                        // For expired tasks, increment timeout failures for workers that did not submit any result
-                        for &task_id in &expired_ids {
-                            if let Some((_, workers)) = inner.assigned_workers.remove_async(&task_id).await {
-                                let had_results = inner.completed.get_async(&task_id).await;
-                                for worker in workers {
-                                    if !Self::has_result(&had_results, &worker) {
-                                        inner.metrics.inc_timeout_failed(worker.as_ref()).await;
+                                _ = token_child.cancelled() => break,
+                                _ = tokio::time::sleep(cleanup_interval) => {
+                                    while let Some(entry) = inner.expiration_queue.pop() {
+                                        let event = &**entry;
+                                        heap.push(Reverse((event.when, event.kind as u8, event.task_id.as_u128())));
                                     }
-                                    inner.finish_task(task_id, &worker).await;
+                                    let now = Instant::now();
+                                    loop {
+                                        let next = match heap.peek().copied() {
+                                            Some(Reverse((when, kind, id))) if when <= now => {
+                                                heap.pop();
+                                                Some((when, kind, id))
+                                            }
+                                            _ => None,
+                                        };
+
+                                        let Some((when, kind, id)) = next else {
+                                            break;
+                                        };
+                                        let task_id = Uuid::from_u128(id);
+                                        let is_task_expiration = kind == ExpirationKind::Task as u8;
+                                        match inner.tasks.entry_async(task_id).await {
+                                            Entry::Occupied(mut entry) => {
+                                                let state = entry.get_mut();
+                                                if is_task_expiration {
+                                                    let Some(expires_at) = state.task_expires_at else {
+                                                        continue;
+                                                    };
+                                                    if expires_at != when {
+                                                        if expires_at > now {
+                                                            heap.push(Reverse((
+                                                                expires_at,
+                                                                ExpirationKind::Task as u8,
+                                                                task_id.as_u128(),
+                                                            )));
+                                                        }
+                                                        continue;
+                                                    }
+                                                    if expires_at > now {
+                                                        heap.push(Reverse((
+                                                            expires_at,
+                                                            ExpirationKind::Task as u8,
+                                                            task_id.as_u128(),
+                                                        )));
+                                                        continue;
+                                                    }
+                                                    let task_kind = if state.image.is_some() {
+                                                        "img3d"
+                                                    } else if state.prompt.is_some() {
+                                                        "txt3d"
+                                                    } else {
+                                                        "unknown"
+                                                    };
+                                                    let assigned_workers = std::mem::take(&mut state.assigned_workers);
+                                                    let mut assigned_worker_ids =
+                                                        std::mem::take(&mut state.assigned_worker_ids);
+                                                    for worker in assigned_workers {
+                                                        let worker_hotkey: &str = worker.as_ref();
+                                                        inner.metrics
+                                                            .inc_timeout_failed(worker_hotkey)
+                                                            .await;
+                                                        if let Some(recorder) = inner.worker_event_recorder.as_ref() {
+                                                            let worker_id =
+                                                                assigned_worker_ids.remove(&worker);
+                                                            recorder.record_worker_event(
+                                                                Some(task_id),
+                                                                worker_id.as_deref(),
+                                                                "timeout",
+                                                                task_kind,
+                                                                None,
+                                                            );
+                                                        }
+                                                    }
+                                                    state.in_progress.clear();
+                                                    state.prompt = None;
+                                                    state.image = None;
+                                                    state.model = None;
+                                                    state.execution_start = None;
+                                                    state.task_expires_at = None;
+                                                } else {
+                                                    let Some(expires_at) = state.results_expires_at else {
+                                                        continue;
+                                                    };
+                                                    if expires_at != when {
+                                                        if expires_at > now {
+                                                            heap.push(Reverse((
+                                                                expires_at,
+                                                                ExpirationKind::Results as u8,
+                                                                task_id.as_u128(),
+                                                            )));
+                                                        }
+                                                        continue;
+                                                    }
+                                                    if expires_at > now {
+                                                        heap.push(Reverse((
+                                                            expires_at,
+                                                            ExpirationKind::Results as u8,
+                                                            task_id.as_u128(),
+                                                        )));
+                                                        continue;
+                                                    }
+                                                    state.results.clear();
+                                                    state.success_count = 0;
+                                                    state.last_failure_reason = None;
+                                                    state.first_success_worker_id = None;
+                                                    state.last_result_instant = None;
+                                                    state.results_expires_at = None;
+                                                    state.model = None;
+                                                }
+                                            }
+                                            Entry::Vacant(_) => {}
+                                        }
+                                    }
                                 }
-                            }
-                            inner.cleanup_task_payload(task_id).await;
-                            inner.cleanup_task_metadata(task_id).await;
-                        }
-                    }
                 }
             }
         })
-    }
-
-    fn has_result(
-        results: &Option<impl std::ops::Deref<Target = Vec<AddTaskResultRequest>>>,
-        worker: &Hotkey,
-    ) -> bool {
-        results
-            .as_ref()
-            .is_some_and(|vec| vec.iter().any(|r| &r.worker_hotkey == worker))
     }
 
     pub fn abort(&self) {
@@ -228,165 +346,189 @@ impl TaskManager {
         &self,
         task_id: Uuid,
         result: AddTaskResultRequest,
-    ) -> Result<bool, AddResultError> {
-        let worker = result.worker_hotkey.clone();
-        let is_assigned = self
-            .inner
-            .assigned_workers
-            .read_async(&task_id, |_, workers| workers.contains(&worker))
-            .await
-            .unwrap_or(false);
-        if !is_assigned {
-            return Err(AddResultError::NotAssigned);
+    ) -> Result<AddResultOutcome, AddResultError> {
+        let outcome = AddResultOutcome {
+            completed: false,
+            worker_hotkey: result.worker_hotkey.clone(),
+            worker_id: result.worker_id.clone(),
+            reason: result.reason.clone(),
+            is_success: result.is_success(),
+        };
+        let worker = &result.worker_hotkey;
+        let (completed, results_expires_at) = match self.inner.tasks.entry_async(task_id).await {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if !state.assigned_workers.contains(worker) {
+                    return Err(AddResultError::NotAssigned);
+                }
+                state.assigned_workers.remove(worker);
+                state.assigned_worker_ids.remove(worker);
+                state.in_progress.remove(worker);
+                if result.is_success() {
+                    state.success_count += 1;
+                    if state.first_success_worker_id.is_none() {
+                        state.first_success_worker_id = Some(result.worker_id.clone());
+                    }
+                } else if let Some(reason) = result.reason.as_ref() {
+                    state.last_failure_reason = Some(Arc::clone(reason));
+                }
+                state.last_result_instant = Some(result.instant);
+                state.results_expires_at = Some(result.instant + self.inner.result_lifetime);
+                state.results.push(result);
+                (state.assigned_workers.is_empty(), state.results_expires_at)
+            }
+            Entry::Vacant(_) => {
+                return Err(AddResultError::NotAssigned);
+            }
+        };
+        if let Some(when) = results_expires_at {
+            self.inner.schedule_results_expiration(task_id, when);
         }
-        self.inner
-            .completed
-            .entry_async(task_id)
-            .await
-            .or_default()
-            .push(result);
-        self.inner.finish_task(task_id, &worker).await;
-        Ok(self.inner.complete_assignment(task_id, &worker).await)
+        Ok(AddResultOutcome {
+            completed,
+            ..outcome
+        })
     }
 
     pub async fn get_status(&self, task_id: Uuid) -> TaskStatus {
-        let Some(results) = self.inner.completed.get_async(&task_id).await else {
+        let Some(state) = self.inner.tasks.get_async(&task_id).await else {
             return TaskStatus::NoResult;
         };
 
-        if results.is_empty() {
+        if state.results.is_empty() {
             return TaskStatus::NoResult;
         }
 
-        if let Some(reason) = results.iter().rev().find_map(|r| r.reason.clone()) {
+        if let Some(reason) = state.last_failure_reason.clone() {
             return TaskStatus::Failure { reason };
         }
 
-        let (success_count, best_index) = results
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.is_success())
-            .fold(
-                (0, None),
-                |(count, best): (usize, Option<(usize, f32)>), (idx, result)| {
-                    let score = result.get_score().unwrap_or(0.0);
-                    let new_best = match best {
-                        Some((_, best_score)) if score < best_score => best,
-                        _ => Some((idx, score)),
-                    };
-                    (count + 1, new_best)
-                },
-            );
-
-        if success_count < self.inner.expected_results {
-            TaskStatus::PartialResult(success_count)
-        } else if let Some((index, _)) = best_index {
-            let best = &results[index];
-            TaskStatus::Success {
-                miner_hotkey: best.miner_hotkey.clone(),
-                miner_uid: best.miner_uid,
-                miner_rating: best.miner_rating,
-            }
+        if state.success_count < self.inner.expected_results {
+            TaskStatus::PartialResult(state.success_count)
+        } else if let Some(worker_id) = state.first_success_worker_id.clone() {
+            TaskStatus::Success { worker_id }
         } else {
             TaskStatus::Failure {
-                reason: "No successful result found".to_string(),
+                reason: Arc::<str>::from("No successful result found"),
             }
         }
     }
 
     pub async fn get_result(&self, task_id: Uuid) -> Option<TaskResultBundle> {
-        let results = self
-            .inner
-            .completed
-            .remove_async(&task_id)
-            .await
-            .map(|(_, value)| value)?;
-        let model = self
-            .inner
-            .models
-            .remove_async(&task_id)
-            .await
-            .map(|(_, value)| value);
-        Some(TaskResultBundle { results, model })
+        match self.inner.tasks.entry_async(task_id).await {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                let results = std::mem::take(&mut state.results);
+                if results.is_empty() {
+                    return None;
+                }
+                state.success_count = 0;
+                state.last_failure_reason = None;
+                state.first_success_worker_id = None;
+                state.last_result_instant = None;
+                state.results_expires_at = None;
+                let model = state.model.take();
+                Some(TaskResultBundle { results, model })
+            }
+            Entry::Vacant(_) => None,
+        }
     }
 
     pub async fn add_task(&self, task: crate::api::Task) {
-        let _ = self
-            .inner
-            .execution_time
-            .insert_async(task.id, Instant::now())
-            .await;
-        if let Some(prompt) = &task.prompt {
-            let _ = self
-                .inner
-                .prompts
-                .insert_async(task.id, Arc::clone(prompt))
-                .await;
+        let now = Instant::now();
+        match self.inner.tasks.entry_async(task.id).await {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.prompt = task.prompt.as_ref().map(Arc::clone);
+                state.image = task.image.clone();
+                state.model = task.model.clone();
+                state.execution_start = Some(now);
+                state.task_expires_at = Some(now + self.inner.result_lifetime);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert_entry(TaskState::new(&task, now, self.inner.result_lifetime));
+            }
         }
-        if let Some(image) = &task.image {
-            let _ = self.inner.images.insert_async(task.id, image.clone()).await;
-        }
-        if let Some(model) = &task.model {
-            let _ = self.inner.models.insert_async(task.id, model.clone()).await;
-        }
+        self.inner
+            .schedule_task_expiration(task.id, now + self.inner.result_lifetime);
     }
 
     #[cfg(test)]
     pub async fn get_model(&self, task_id: Uuid) -> Option<String> {
         self.inner
-            .models
+            .tasks
             .get_async(&task_id)
             .await
-            .map(|entry| entry.get().clone())
+            .and_then(|entry| entry.model.clone())
     }
 
-    pub async fn record_assignment(&self, task_id: Uuid, worker: Hotkey) {
-        let should_track = {
-            let mut entry = self
-                .inner
-                .assigned_workers
-                .entry_async(task_id)
-                .await
-                .or_default();
-            entry.get_mut().insert(worker.clone())
+    pub async fn record_assignment(&self, task_id: Uuid, worker: Hotkey, worker_id: Arc<str>) {
+        let should_track = match self.inner.tasks.entry_async(task_id).await {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state
+                    .assigned_worker_ids
+                    .insert(worker.clone(), worker_id.clone());
+
+                state.assigned_workers.insert(worker.clone())
+            }
+            Entry::Vacant(entry) => {
+                let mut state = TaskState::empty();
+                state.assigned_worker_ids.insert(worker.clone(), worker_id);
+                let inserted = state.assigned_workers.insert(worker.clone());
+                entry.insert_entry(state);
+                inserted
+            }
         };
-        if should_track {
-            let guard = self.inner.metrics.start_task(worker.as_ref()).await;
-            let _ = self
-                .inner
-                .in_progress
-                .insert_async((task_id, worker), guard)
-                .await;
+        if !should_track {
+            return;
+        }
+
+        let guard = self.inner.metrics.start_task(worker.as_ref()).await;
+        if let Entry::Occupied(mut entry) = self.inner.tasks.entry_async(task_id).await {
+            let state = entry.get_mut();
+            if state.assigned_workers.contains(&worker) {
+                state.in_progress.insert(worker, guard);
+            }
         }
     }
 
     pub async fn get_prompt(&self, task_id: Uuid) -> Option<Arc<String>> {
         self.inner
-            .prompts
+            .tasks
             .get_async(&task_id)
             .await
-            .map(|e| Arc::clone(e.get()))
+            .and_then(|entry| entry.prompt.as_ref().map(Arc::clone))
     }
 
     pub async fn get_image(&self, task_id: Uuid) -> Option<Bytes> {
         self.inner
-            .images
+            .tasks
             .get_async(&task_id)
             .await
-            .map(|e| e.get().clone())
+            .and_then(|entry| entry.image.clone())
     }
 
     pub async fn get_time(&self, task_id: Uuid) -> Option<f64> {
         self.inner
-            .execution_time
+            .tasks
             .get_async(&task_id)
             .await
-            .map(|e| e.elapsed().as_secs_f64())
+            .and_then(|entry| {
+                entry
+                    .execution_start
+                    .map(|start| start.elapsed().as_secs_f64())
+            })
     }
 
     pub async fn finalize_task(&self, task_id: Uuid) {
-        self.inner.execution_time.remove_async(&task_id).await;
-        self.inner.cleanup_task_payload(task_id).await;
+        if let Entry::Occupied(mut entry) = self.inner.tasks.entry_async(task_id).await {
+            let state = entry.get_mut();
+            state.prompt = None;
+            state.image = None;
+            state.execution_start = None;
+            state.task_expires_at = None;
+        }
     }
 }
 

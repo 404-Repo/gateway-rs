@@ -26,14 +26,11 @@ fn tasks_in_progress_total(metrics: &Metrics) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn make_result(worker: &str, miner: &str, score: f32, instant: Instant) -> AddTaskResultRequest {
+fn make_result(worker: &str, worker_id: &str, instant: Instant) -> AddTaskResultRequest {
     AddTaskResultRequest {
         worker_hotkey: worker.parse().unwrap(),
-        miner_hotkey: Some(miner.parse().unwrap()),
-        miner_uid: None,
-        miner_rating: None,
+        worker_id: worker_id.to_string().into(),
         asset: Some(vec![]),
-        score: Some(score),
         reason: None,
         instant,
     }
@@ -52,6 +49,7 @@ async fn test_cleanup() {
         CLEANUP_INTERVAL,
         RESULT_LIFETIME,
         Metrics::new(0.05).unwrap(),
+        None,
     )
     .await;
     let now = Instant::now();
@@ -62,10 +60,10 @@ async fn test_cleanup() {
 
     let task_id1 = Uuid::new_v4();
     task_manager
-        .record_assignment(task_id1, worker1.clone())
+        .record_assignment(task_id1, worker1.clone(), worker1.to_string().into())
         .await;
     task_manager
-        .record_assignment(task_id1, worker2.clone())
+        .record_assignment(task_id1, worker2.clone(), worker2.to_string().into())
         .await;
     task_manager
         .add_result(
@@ -73,7 +71,6 @@ async fn test_cleanup() {
             make_result(
                 worker1_str.as_str(),
                 worker1_str.as_str(),
-                0.5,
                 now - Duration::from_millis(600),
             ),
         )
@@ -82,10 +79,10 @@ async fn test_cleanup() {
 
     let task_id2 = Uuid::new_v4();
     task_manager
-        .record_assignment(task_id2, worker1.clone())
+        .record_assignment(task_id2, worker1.clone(), worker1.to_string().into())
         .await;
     task_manager
-        .record_assignment(task_id2, worker2.clone())
+        .record_assignment(task_id2, worker2.clone(), worker2.to_string().into())
         .await;
     task_manager
         .add_result(
@@ -93,7 +90,6 @@ async fn test_cleanup() {
             make_result(
                 worker1_str.as_str(),
                 worker1_str.as_str(),
-                0.6,
                 now - Duration::from_millis(600),
             ),
         )
@@ -105,7 +101,6 @@ async fn test_cleanup() {
             make_result(
                 worker2_str.as_str(),
                 worker2_str.as_str(),
-                0.7,
                 now - Duration::from_millis(200),
             ),
         )
@@ -114,10 +109,10 @@ async fn test_cleanup() {
 
     let task_id3 = Uuid::new_v4();
     task_manager
-        .record_assignment(task_id3, worker1.clone())
+        .record_assignment(task_id3, worker1.clone(), worker1.to_string().into())
         .await;
     task_manager
-        .record_assignment(task_id3, worker2.clone())
+        .record_assignment(task_id3, worker2.clone(), worker2.to_string().into())
         .await;
     task_manager
         .add_result(
@@ -125,7 +120,6 @@ async fn test_cleanup() {
             make_result(
                 worker1_str.as_str(),
                 worker1_str.as_str(),
-                0.8,
                 now - Duration::from_millis(100),
             ),
         )
@@ -137,7 +131,6 @@ async fn test_cleanup() {
             make_result(
                 worker2_str.as_str(),
                 worker2_str.as_str(),
-                0.9,
                 now - Duration::from_millis(100),
             ),
         )
@@ -179,7 +172,8 @@ async fn image_task_persists_until_all_assignments_complete() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let task_manager = TaskManager::new(4, 2, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics).await;
+    let task_manager =
+        TaskManager::new(4, 2, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics, None).await;
 
     let task_id = Uuid::new_v4();
     let image = Bytes::from_static(b"image-bytes");
@@ -195,29 +189,34 @@ async fn image_task_persists_until_all_assignments_complete() {
     let second_worker: Hotkey = Hotkey::from_bytes(&[2u8; 32]);
 
     task_manager
-        .record_assignment(task_id, first_worker.clone())
+        .record_assignment(
+            task_id,
+            first_worker.clone(),
+            first_worker.to_string().into(),
+        )
         .await;
     task_manager
-        .record_assignment(task_id, second_worker.clone())
+        .record_assignment(
+            task_id,
+            second_worker.clone(),
+            second_worker.to_string().into(),
+        )
         .await;
 
     let first_result = AddTaskResultRequest {
         worker_hotkey: first_worker.clone(),
-        miner_hotkey: Some(first_worker.clone()),
-        miner_uid: None,
-        miner_rating: None,
+        worker_id: first_worker.to_string().into(),
         asset: Some(vec![]),
-        score: Some(0.4),
         reason: None,
         instant: Instant::now(),
     };
 
-    let complete_after_first = task_manager
+    let outcome_after_first = task_manager
         .add_result(task_id, first_result)
         .await
         .unwrap();
     assert!(
-        !complete_after_first,
+        !outcome_after_first.completed,
         "task should wait for all assignments before cleanup"
     );
     assert!(
@@ -227,21 +226,18 @@ async fn image_task_persists_until_all_assignments_complete() {
 
     let second_result = AddTaskResultRequest {
         worker_hotkey: second_worker.clone(),
-        miner_hotkey: Some(second_worker),
-        miner_uid: None,
-        miner_rating: None,
+        worker_id: second_worker.to_string().into(),
         asset: Some(vec![]),
-        score: Some(0.5),
         reason: None,
         instant: Instant::now(),
     };
 
-    let complete_after_second = task_manager
+    let outcome_after_second = task_manager
         .add_result(task_id, second_result)
         .await
         .unwrap();
     assert!(
-        complete_after_second,
+        outcome_after_second.completed,
         "last worker should allow cleanup to proceed"
     );
     task_manager.finalize_task(task_id).await;
@@ -258,7 +254,8 @@ async fn model_persists_until_result_retrieval() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let task_manager = TaskManager::new(2, 1, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics).await;
+    let task_manager =
+        TaskManager::new(2, 1, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics, None).await;
 
     let task_id = Uuid::new_v4();
     let task = Task {
@@ -271,26 +268,23 @@ async fn model_persists_until_result_retrieval() {
 
     let worker: Hotkey = Hotkey::from_bytes(&[3u8; 32]);
     task_manager
-        .record_assignment(task_id, worker.clone())
+        .record_assignment(task_id, worker.clone(), worker.to_string().into())
         .await;
 
-    let complete = task_manager
+    let outcome = task_manager
         .add_result(
             task_id,
             AddTaskResultRequest {
                 worker_hotkey: worker.clone(),
-                miner_hotkey: Some(worker.clone()),
-                miner_uid: None,
-                miner_rating: None,
+                worker_id: worker.to_string().into(),
                 asset: Some(vec![]),
-                score: Some(0.9),
                 reason: None,
                 instant: Instant::now(),
             },
         )
         .await
         .unwrap();
-    assert!(complete, "single result should complete the task");
+    assert!(outcome.completed, "single result should complete the task");
     task_manager.finalize_task(task_id).await;
 
     assert_eq!(
@@ -313,8 +307,15 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let task_manager =
-        TaskManager::new(2, 1, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics.clone()).await;
+    let task_manager = TaskManager::new(
+        2,
+        1,
+        CLEANUP_INTERVAL,
+        RESULT_LIFETIME,
+        metrics.clone(),
+        None,
+    )
+    .await;
 
     let task_id = Uuid::new_v4();
     let worker: Hotkey = Hotkey::from_bytes(&[7u8; 32]);
@@ -326,7 +327,7 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
     };
     task_manager.add_task(task).await;
     task_manager
-        .record_assignment(task_id, worker.clone())
+        .record_assignment(task_id, worker.clone(), worker.to_string().into())
         .await;
 
     let mut in_progress = None;
@@ -354,11 +355,8 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
             task_id,
             AddTaskResultRequest {
                 worker_hotkey: worker.clone(),
-                miner_hotkey: Some(worker.clone()),
-                miner_uid: None,
-                miner_rating: None,
+                worker_id: worker.to_string().into(),
                 asset: Some(vec![]),
-                score: Some(0.2),
                 reason: None,
                 instant: Instant::now(),
             },
@@ -403,6 +401,7 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
         CLEANUP_INTERVAL,
         RESULT_LIFETIME,
         metrics.clone(),
+        None,
     )
     .await;
 
@@ -418,7 +417,9 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
     let mut workers = Vec::with_capacity(assignment_count);
     for idx in 0..assignment_count {
         let v: Hotkey = Hotkey::from_bytes(&[(idx as u8) + 1; 32]);
-        task_manager.record_assignment(task_id, v.clone()).await;
+        task_manager
+            .record_assignment(task_id, v.clone(), v.to_string().into())
+            .await;
         workers.push(v);
     }
 
@@ -429,23 +430,21 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
     );
 
     let mut completed = false;
-    for (i, v) in workers.iter().enumerate() {
-        completed = task_manager
+    for v in workers.iter() {
+        let outcome = task_manager
             .add_result(
                 task_id,
                 AddTaskResultRequest {
                     worker_hotkey: v.clone(),
-                    miner_hotkey: Some(v.clone()),
-                    miner_uid: None,
-                    miner_rating: None,
+                    worker_id: v.to_string().into(),
                     asset: Some(vec![]),
-                    score: Some(i as f32 + 0.1),
                     reason: None,
                     instant: Instant::now(),
                 },
             )
             .await
             .unwrap();
+        completed = outcome.completed;
     }
     assert!(
         completed,
@@ -466,8 +465,15 @@ async fn test_timeout_increments_metric() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(120);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let task_manager =
-        TaskManager::new(8, 1, CLEANUP_INTERVAL, RESULT_LIFETIME, metrics.clone()).await;
+    let task_manager = TaskManager::new(
+        8,
+        1,
+        CLEANUP_INTERVAL,
+        RESULT_LIFETIME,
+        metrics.clone(),
+        None,
+    )
+    .await;
 
     let task_id = Uuid::new_v4();
     let task = Task {
@@ -480,7 +486,7 @@ async fn test_timeout_increments_metric() {
 
     let worker: Hotkey = Hotkey::from_bytes(&[42u8; 32]);
     task_manager
-        .record_assignment(task_id, worker.clone())
+        .record_assignment(task_id, worker.clone(), worker.to_string().into())
         .await;
 
     tokio::time::sleep(Duration::from_millis(

@@ -16,6 +16,7 @@ use backon::BackoffBuilder;
 use backon::ConstantBuilder;
 use backon::Retryable;
 use bytes::Bytes;
+use foldhash::HashMap as FoldHashMap;
 use foldhash::fast::RandomState;
 use futures_util::future::try_join_all;
 use gateway_state::{GatewayState, GatewayStateInit};
@@ -24,6 +25,7 @@ use network::Network;
 use openraft::BasicNode;
 use salvo::conn::rustls::Keycert;
 use salvo::conn::rustls::RustlsConfig;
+use scc::Queue;
 use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -48,24 +50,21 @@ use crate::api::response::GatewayInfoRef;
 use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
-use crate::common::company_usage::CompanyUsageRecorder;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_hosts_ips;
 use crate::config::{ModelConfigStore, NodeConfig};
 use crate::crypto::crypto_provider::init_crypto_provider;
-use crate::db::ApiKeyValidator;
-use crate::db::DatabaseBuilder;
+use crate::db::{ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle};
 use crate::http3::client::Http3Client;
 use crate::http3::client::Http3ClientBuilder;
 use crate::http3::server::Http3Server;
 use crate::metrics::Metrics;
 use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
-use crate::raft::store::RateLimitDelta;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
+use crate::raft::store::{RateLimitDelta, Subject};
 use crate::task::TaskManager;
-use scc::Queue;
 use tokio_util::sync::CancellationToken;
 
 pub type NodeId = u64;
@@ -74,7 +73,6 @@ pub type StateMachineStore = store::StateMachineStore;
 pub type Raft = openraft::Raft<TypeConfig>;
 
 pub(crate) const SNAPSHOT_COMPRESSION_LVL: i32 = 1;
-const MAX_DELTAS_IN_BATCH: usize = 8192;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum GatewayMode {
@@ -142,6 +140,7 @@ impl Gateway {
         let mut client: Option<Http3Client> = None;
         let post_timeout = Duration::from_secs(config.http.post_timeout_sec);
         let update_interval = Duration::from_millis(config.basic.update_gateway_info_ms);
+        let max_deltas_in_batch = config.basic.max_rate_limit_deltas_per_batch.max(1);
 
         loop {
             tokio::select! {
@@ -157,12 +156,43 @@ impl Gateway {
                 }
             };
 
-            // Drain any pending rate limit deltas
-            let mut deltas = Vec::new();
+            // Drain and coalesce any pending rate limit deltas
+            let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (u64, u64)> =
+                FoldHashMap::with_capacity_and_hasher(
+                    max_deltas_in_batch.min(1024),
+                    RandomState::default(),
+                );
+            let mut raw_count = 0usize;
             while let Some(entry) = rate_limit_queue.pop() {
-                deltas.push(**entry);
-                if deltas.len() == MAX_DELTAS_IN_BATCH {
+                let delta = **entry;
+                raw_count += 1;
+                let key = (delta.subject, delta.id, delta.hour_epoch, delta.day_epoch);
+                aggregated
+                    .entry(key)
+                    .and_modify(|acc| {
+                        acc.0 = acc.0.saturating_add(delta.add_hour as u64);
+                        acc.1 = acc.1.saturating_add(delta.add_day as u64);
+                    })
+                    .or_insert((delta.add_hour as u64, delta.add_day as u64));
+                if raw_count == max_deltas_in_batch {
                     break;
+                }
+            }
+            let mut deltas = Vec::with_capacity(aggregated.len());
+            for ((subject, id, hour_epoch, day_epoch), (mut add_hour, mut add_day)) in aggregated {
+                while add_hour > 0 || add_day > 0 {
+                    let hour_chunk = add_hour.min(u32::MAX as u64) as u32;
+                    let day_chunk = add_day.min(u32::MAX as u64) as u32;
+                    deltas.push(RateLimitDelta {
+                        subject,
+                        id,
+                        hour_epoch,
+                        day_epoch,
+                        add_hour: hour_chunk,
+                        add_day: day_chunk,
+                    });
+                    add_hour -= hour_chunk as u64;
+                    add_day -= day_chunk as u64;
                 }
             }
 
@@ -630,6 +660,7 @@ pub async fn start_gateway(
         &log_store_path,
         config.raft.compaction_threshold_bytes,
         config.raft.compaction_ops,
+        config.raft.log_store_flush_interval_ms,
     )?;
     let state_machine_store = Arc::new(StateMachineStore::with_persistence(
         &snapshot_dir,
@@ -717,10 +748,14 @@ pub async fn start_gateway(
         config.db.deleted_keys_ttl_minutes,
     )?;
     let api_key_validator = Arc::new(api_key_validator);
-    let flush_interval = config.db.company_usage_flush_interval_sec.max(1);
-    let company_usage_recorder = CompanyUsageRecorder::new(
-        Arc::clone(&db),
-        Duration::from_secs(flush_interval),
+    let events_flush_interval = config.db.events_flush_interval_sec.max(1);
+    let events_queue_capacity = config.db.events_queue_capacity.max(1);
+    let event_sink = Arc::new(EventSinkHandle::Database(Arc::clone(&db)));
+    let event_recorder = EventRecorder::new(
+        event_sink,
+        Arc::from(config.network.name.as_str()),
+        Duration::from_secs(events_flush_interval),
+        events_queue_capacity,
         gateway_shutdown.clone(),
     );
 
@@ -736,6 +771,7 @@ pub async fn start_gateway(
         Duration::from_secs(config.basic.taskmanager_cleanup_interval),
         Duration::from_secs(config.basic.taskmanager_result_lifetime),
         metrics.clone(),
+        Some(event_recorder.clone()),
     )
     .await;
 
@@ -749,7 +785,7 @@ pub async fn start_gateway(
         task_manager: task_manager.clone(),
         config: Arc::clone(&config),
         rate_limit_queue: rate_limit_queue.clone(),
-        usage_recorder: company_usage_recorder.clone(),
+        event_recorder: event_recorder.clone(),
     });
 
     let key_cert = if use_cert_files {

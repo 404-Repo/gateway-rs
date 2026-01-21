@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -13,13 +14,30 @@ pub struct AddTaskRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ModelFilter {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ModelFilter {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            ModelFilter::One(value) => vec![value.clone()],
+            ModelFilter::Many(values) => values.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct GetTasksRequest {
     #[serde(alias = "validator_hotkey")]
     pub worker_hotkey: Hotkey,
+    pub worker_id: Arc<str>,
     pub signature: String,
     pub timestamp: String,
     pub requested_task_count: usize,
-    pub model: Option<String>,
+    pub model: ModelFilter,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,27 +60,16 @@ pub struct GetTaskStatus {
 pub struct AddTaskResultRequest {
     #[serde(alias = "validator_hotkey")]
     pub worker_hotkey: Hotkey,
-    pub miner_hotkey: Option<Hotkey>,
-    pub miner_uid: Option<u32>,
-    pub miner_rating: Option<f32>,
+    pub worker_id: Arc<str>,
     pub asset: Option<Vec<u8>>,
-    pub score: Option<f32>,
-    pub reason: Option<String>,
+    pub reason: Option<Arc<str>>,
     #[serde(skip_deserializing, default = "Instant::now")]
     pub instant: Instant,
 }
 
 impl AddTaskResultRequest {
-    pub fn get_score(&self) -> Option<f32> {
-        self.score
-    }
-
     pub fn get_asset(&mut self) -> Option<Vec<u8>> {
         self.asset.take()
-    }
-
-    pub fn into_asset(self) -> Option<Vec<u8>> {
-        self.asset
     }
 
     pub fn is_success(&self) -> bool {
