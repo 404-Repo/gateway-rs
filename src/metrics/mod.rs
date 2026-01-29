@@ -48,7 +48,7 @@ struct MetricsInner {
     queue_time_max: Gauge,
 
     completed_tasks_by_kind: CounterVec,
-    // Count requests by origin/type label (e.g. blender, unity, discord, unknown)
+    // Count requests by origin/type label (e.g. blender, unity, discord, api)
     requests_by_origin: CounterVec,
 
     completion_time_avg: GaugeVec,

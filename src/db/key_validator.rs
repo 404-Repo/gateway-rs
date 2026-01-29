@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::Database;
@@ -17,10 +17,12 @@ pub struct ApiKeyValidator {
     db: Arc<Database>,
     // mapping from user_id -> list of api_key_hashes
     users: scc::HashMap<Uuid, Vec<[u8; 32]>, RandomState>,
+    // mapping from user_id -> email
+    user_emails: scc::HashMap<Uuid, Arc<str>, RandomState>,
     // reverse mapping: api_key_hash -> user_id
     api_key_hashes: scc::HashMap<[u8; 32], Uuid, RandomState>,
     // mapping from company_id -> (name, hourly, daily) rate limits
-    companies: scc::HashMap<Uuid, (String, u64, u64), RandomState>,
+    companies: scc::HashMap<Uuid, (Arc<str>, u64, u64), RandomState>,
     // forward mapping: company_id -> list of api_key_hashes
     company_keys: scc::HashMap<Uuid, Vec<[u8; 32]>, RandomState>,
     // reverse mapping: company_api_key_hash -> company_id
@@ -38,6 +40,14 @@ pub struct ApiKeyValidator {
     last_company_keys_sync_sec: AtomicU64,
     // TTL for physically removing soft-deleted keys
     deleted_keys_ttl_minutes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyLookup {
+    pub user_id: Option<Uuid>,
+    pub user_email: Option<Arc<str>>,
+    pub company_id: Option<Uuid>,
+    pub company_info: Option<(Arc<str>, u64, u64)>,
 }
 
 impl ApiKeyValidator {
@@ -69,6 +79,7 @@ impl ApiKeyValidator {
         Ok(Self {
             db,
             users: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
+            user_emails: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
             api_key_hashes: scc::HashMap::with_capacity_and_hasher(4096, RandomState::default()),
             companies,
             company_keys,
@@ -218,14 +229,18 @@ impl ApiKeyValidator {
             let since = DateTime::<Utc>::from_timestamp(last_sync_sec as i64, 0)
                 .unwrap_or_else(|| now - ChronoDuration::seconds(1));
             let deltas = self.db.fetch_delta_user_key_hashes(since, now).await?;
-            let total_new = deltas.iter().map(|(_, v)| v.len()).sum::<usize>();
+            let total_new = deltas.iter().map(|(_, _, v)| v.len()).sum::<usize>();
             info!(
                 "Fetched {} user API key hashes for {} users (delta)",
                 total_new,
                 deltas.len()
             );
-            for (user_id, new_hashes) in deltas {
+            for (user_id, email, new_hashes) in deltas {
                 let converted = Self::convert_hashes(new_hashes);
+                let _ = self
+                    .user_emails
+                    .insert_async(user_id, Arc::<str>::from(email))
+                    .await;
                 self.apply_user_hashes(user_id, converted).await;
             }
         } else {
@@ -233,7 +248,7 @@ impl ApiKeyValidator {
             let all = self.db.fetch_all_user_key_hashes().await?;
             info!(
                 "Retrieved {} API key hashes for {} users from the database",
-                all.iter().map(|(_, v)| v.len()).sum::<usize>(),
+                all.iter().map(|(_, _, v)| v.len()).sum::<usize>(),
                 all.len()
             );
 
@@ -241,12 +256,17 @@ impl ApiKeyValidator {
             self.validated_api_key_cache.invalidate_all();
             self.api_key_hashes.clear_async().await;
             self.users.clear_async().await;
-            for (user_id, hashes) in all {
+            self.user_emails.clear_async().await;
+            for (user_id, email, hashes) in all {
                 let list = Self::convert_hashes(hashes);
                 for hash in &list {
                     let _ = self.api_key_hashes.insert_async(*hash, user_id).await;
                 }
                 let _ = self.users.insert_async(user_id, list).await;
+                let _ = self
+                    .user_emails
+                    .insert_async(user_id, Arc::<str>::from(email))
+                    .await;
             }
         }
 
@@ -263,13 +283,26 @@ impl ApiKeyValidator {
                 .unwrap_or_else(|| now - ChronoDuration::seconds(1));
             let deltas = self.db.fetch_delta_companies_meta(since, now).await?;
             for (cid, limits) in deltas {
-                let _ = self.companies.insert_async(cid, limits).await;
+                let (name, hourly, daily) = limits;
+                let value = (Arc::<str>::from(name), hourly, daily);
+                match self.companies.entry_async(cid).await {
+                    scc::hash_map::Entry::Occupied(mut entry) => {
+                        *entry.get_mut() = value;
+                    }
+                    scc::hash_map::Entry::Vacant(entry) => {
+                        entry.insert_entry(value);
+                    }
+                }
             }
         } else {
             let all = self.db.fetch_full_companies_meta().await?;
             self.companies.clear_async().await;
             for (cid, limits) in all {
-                let _ = self.companies.insert_async(cid, limits).await;
+                let (name, hourly, daily) = limits;
+                let _ = self
+                    .companies
+                    .insert_async(cid, (Arc::<str>::from(name), hourly, daily))
+                    .await;
             }
         }
 
@@ -324,64 +357,95 @@ impl ApiKeyValidator {
         Ok(())
     }
 
-    #[inline]
-    async fn find_id_for_api_key(
-        &self,
-        api_key: &str,
-        cache: &Cache<[u8; 32], Uuid, RandomState>,
-        hashes: &scc::HashMap<[u8; 32], Uuid, RandomState>,
-    ) -> Option<Uuid> {
+    pub async fn lookup(&self, api_key: &str) -> ApiKeyLookup {
         let key_hash = self.hasher.compute_hash_array(api_key);
-        if let Some(id) = cache.get(&key_hash).await {
-            return Some(id);
-        }
 
-        if let Some(entry) = hashes.get_async(&key_hash).await {
+        let user_id = if let Some(id) = self.validated_api_key_cache.get(&key_hash).await {
+            Some(id)
+        } else if let Some(entry) = self.api_key_hashes.get_async(&key_hash).await {
             let id = *entry.get();
-            cache.insert(key_hash, id).await;
-            return Some(id);
-        }
+            self.validated_api_key_cache.insert(key_hash, id).await;
+            Some(id)
+        } else {
+            None
+        };
 
-        None
-    }
+        let company_id = if let Some(id) = self.validated_company_key_cache.get(&key_hash).await {
+            Some(id)
+        } else if let Some(entry) = self.company_api_key_hashes.get_async(&key_hash).await {
+            let id = *entry.get();
+            self.validated_company_key_cache.insert(key_hash, id).await;
+            Some(id)
+        } else {
+            None
+        };
 
-    async fn find_user_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        self.find_id_for_api_key(api_key, &self.validated_api_key_cache, &self.api_key_hashes)
-            .await
-    }
-
-    async fn find_company_for_api_key(&self, api_key: &str) -> Option<Uuid> {
-        self.find_id_for_api_key(
-            api_key,
-            &self.validated_company_key_cache,
-            &self.company_api_key_hashes,
-        )
-        .await
-    }
-
-    pub async fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
-        self.find_user_for_api_key(api_key).await
-    }
-
-    pub async fn is_valid_api_key(&self, api_key: &str) -> bool {
-        self.find_user_for_api_key(api_key).await.is_some()
-    }
-
-    pub async fn is_company_key(&self, api_key: &str) -> bool {
-        self.find_company_for_api_key(api_key).await.is_some()
-    }
-
-    pub async fn get_company_info_from_key(
-        &self,
-        api_key: &str,
-    ) -> Option<(Uuid, (String, u64, u64))> {
-        if let Some(cid) = self.find_company_for_api_key(api_key).await {
+        let company_info = if let Some(cid) = company_id {
             self.companies
                 .get_async(&cid)
                 .await
-                .map(|company_info| (cid, company_info.get().clone()))
+                .map(|entry| entry.get().clone())
         } else {
             None
+        };
+
+        let user_email = if let Some(uid) = user_id {
+            if let Some(entry) = self.user_emails.get_async(&uid).await {
+                Some(entry.get().clone())
+            } else {
+                match self.db.fetch_user_email(uid).await {
+                    Ok(Some(email)) => {
+                        let email = Arc::<str>::from(email);
+                        let _ = self.user_emails.insert_async(uid, email.clone()).await;
+                        Some(email)
+                    }
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!("Failed to fetch user email for {}: {:?}", uid, err);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        ApiKeyLookup {
+            user_id,
+            user_email,
+            company_id,
+            company_info,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(dead_code)]
+    pub async fn seed_company_key(
+        &self,
+        api_key: &str,
+        company_id: Uuid,
+        company_name: &str,
+        hourly_limit: u64,
+        daily_limit: u64,
+    ) {
+        let key_hash = self.hasher.compute_hash_array(api_key);
+        let _ = self
+            .company_api_key_hashes
+            .insert_async(key_hash, company_id)
+            .await;
+        let _ = self
+            .companies
+            .insert_async(
+                company_id,
+                (Arc::<str>::from(company_name), hourly_limit, daily_limit),
+            )
+            .await;
+        let _ = self
+            .company_keys
+            .insert_async(company_id, vec![key_hash])
+            .await;
+        self.validated_company_key_cache
+            .insert(key_hash, company_id)
+            .await;
     }
 }

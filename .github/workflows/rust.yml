@@ -67,7 +67,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - run: cargo test
+      - name: Run unit tests
+        run: cargo test
+      - name: Run integration tests (test-support)
+        run: cargo test --tests --features test-support
 
   fmt:
     name: Rustfmt

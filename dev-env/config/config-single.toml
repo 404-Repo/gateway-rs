@@ -2,8 +2,8 @@
 default_model = "404-3dgs"
 
 [model_config.models]
-404-3dgs = { output = "ply" }
-404-mesh = { output = "glb" }
+404-3dgs = { output = "ply", supports_txt3d = true, supports_img3d = true }
+404-mesh = { output = "glb", supports_txt3d = false, supports_img3d = true }
 
 [network]
 node_id = 1
@@ -35,7 +35,7 @@ metric_rate_limit = 5
 get_status_rate_limit = 600
 request_size_limit = 4096
 request_file_size_limit = 31457280
-raft_write_size_limit = 262144
+raft_write_size_limit = 2097152
 add_result_rate_limit = 300
 signature_freshness_threshold = 30
 max_task_queue_len = 500
@@ -47,10 +47,10 @@ forward_timeout_sec = 3
 get_timeout_sec = 2
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
-add_task_whitelist = []
+add_task_rate_limit_allowlist = []
 worker_whitelist = []
 distributed_rate_limiter_max_capacity = 4096
-allowed_origins = ["discord", "unity", "blender"]
+allowed_origins = ["discord", "unity", "blender", "gen.404.xyz", "api"]
 
 [db]
 host = "db"
@@ -66,7 +66,8 @@ keys_cache_ttl_sec = 43200
 keys_cache_initial_capacity = 16000
 keys_cache_max_capacity = 32000
 deleted_keys_ttl_minutes = 60
-company_usage_flush_interval_sec = 5
+events_flush_interval_sec = 5
+events_copy_batch_size = 1000
 
 [cert]
 dangerous_skip_verification = true
@@ -75,7 +76,8 @@ key_file_path = "/etc/certs/key.pem"
 
 [basic]
 max_restart_attempts = 2
-update_gateway_info_ms = 500
+update_gateway_info_ms = 250
+max_rate_limit_deltas_per_batch = 8192
 unique_workers_per_task = 3
 taskmanager_initial_capacity = 1024
 taskmanager_cleanup_interval = 30
@@ -112,6 +114,7 @@ snapshot_dir = "/var/lib/gateway/snapshots"
 max_snapshots_to_keep = 5
 compaction_threshold_bytes = 4194304
 compaction_ops = 4096
+log_store_flush_interval_ms = 200
 
 [prompt]
 min_len = 3

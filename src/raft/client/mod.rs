@@ -128,6 +128,12 @@ impl RClientBuilder {
     }
 }
 
+impl Default for RClientBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 struct RClientInner {
     endpoint: AtomicOwned<Endpoint>,

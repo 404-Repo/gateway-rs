@@ -5,9 +5,10 @@ use sdd::{AtomicOwned, Guard, Owned, Tag};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -16,6 +17,10 @@ use crate::config::NodeConfig;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelDefinition {
     pub output: String,
+    #[serde(default = "default_true")]
+    pub supports_txt3d: bool,
+    #[serde(default = "default_true")]
+    pub supports_img3d: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,6 +50,13 @@ pub enum ModelResolveError {
         model: String,
         output: String,
     },
+    UnsupportedInput {
+        model: String,
+        input: String,
+    },
+    InvalidInputSupport {
+        model: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -53,18 +65,22 @@ pub struct ResolvedModel {
 }
 
 impl ModelOutput {
-    pub fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "ply" => Some(Self::Ply),
-            "glb" => Some(Self::Glb),
-            _ => None,
-        }
-    }
-
     pub fn content_type(self) -> &'static str {
         match self {
             Self::Ply => "application/octet-stream",
             Self::Glb => "model/gltf-binary",
+        }
+    }
+}
+
+impl FromStr for ModelOutput {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ply" => Ok(Self::Ply),
+            "glb" => Ok(Self::Glb),
+            _ => Err(()),
         }
     }
 }
@@ -83,10 +99,15 @@ impl ModelConfig {
         }
 
         for (model, definition) in &self.models {
-            if ModelOutput::from_str(&definition.output).is_none() {
+            if ModelOutput::from_str(&definition.output).is_err() {
                 return Err(ModelResolveError::InvalidOutput {
                     model: model.clone(),
                     output: definition.output.clone(),
+                });
+            }
+            if !definition.supports_txt3d && !definition.supports_img3d {
+                return Err(ModelResolveError::InvalidInputSupport {
+                    model: model.clone(),
                 });
             }
         }
@@ -130,7 +151,7 @@ impl ModelConfig {
                 known: self.known_models(),
             })?;
 
-        let output = ModelOutput::from_str(def.output.as_str()).ok_or_else(|| {
+        let output = ModelOutput::from_str(def.output.as_str()).map_err(|_| {
             ModelResolveError::InvalidOutput {
                 model: model.to_string(),
                 output: def.output.clone(),
@@ -138,6 +159,36 @@ impl ModelConfig {
         })?;
 
         Ok(output)
+    }
+
+    pub fn validate_input_support(
+        &self,
+        model: &str,
+        has_prompt: bool,
+        has_image: bool,
+    ) -> Result<(), ModelResolveError> {
+        let def = self
+            .models
+            .get(model)
+            .ok_or_else(|| ModelResolveError::UnknownModel {
+                model: model.to_string(),
+                known: self.known_models(),
+            })?;
+
+        if has_prompt && !def.supports_txt3d {
+            return Err(ModelResolveError::UnsupportedInput {
+                model: model.to_string(),
+                input: "txt3d".to_string(),
+            });
+        }
+        if has_image && !def.supports_img3d {
+            return Err(ModelResolveError::UnsupportedInput {
+                model: model.to_string(),
+                input: "img3d".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     pub fn known_models(&self) -> Vec<String> {
@@ -167,8 +218,9 @@ fn system_time_millis(time: SystemTime) -> Option<u64> {
 
 pub struct ModelConfigStore {
     path: PathBuf,
-    inner: AtomicOwned<ModelConfig>,
+    inner: AtomicOwned<Arc<ModelConfig>>,
     last_modified_millis: AtomicU64,
+    watcher_active: AtomicBool,
 }
 
 impl ModelConfigStore {
@@ -187,13 +239,16 @@ impl ModelConfigStore {
 
         Ok(Self {
             path,
-            inner: AtomicOwned::new(initial),
+            inner: AtomicOwned::new(Arc::new(initial)),
             last_modified_millis: AtomicU64::new(last_modified_millis),
+            watcher_active: AtomicBool::new(false),
         })
     }
 
-    pub async fn get(&self) -> ModelConfig {
-        self.maybe_reload().await;
+    pub async fn get(&self) -> Arc<ModelConfig> {
+        if !self.watcher_active.load(Acquire) {
+            self.maybe_reload().await;
+        }
         let guard = Guard::new();
         self.inner
             .load(Acquire, &guard)
@@ -212,6 +267,7 @@ impl ModelConfigStore {
             while rx.recv().await.is_some() {
                 store.reload_from_disk().await;
             }
+            store.watcher_active.store(false, Release);
         });
 
         let path = self.path.clone();
@@ -231,6 +287,7 @@ impl ModelConfigStore {
             })?;
 
         watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        self.watcher_active.store(true, Release);
         Ok(ModelConfigWatcher {
             _watcher: watcher,
             task_handle,
@@ -275,7 +332,7 @@ impl ModelConfigStore {
 
         let previous = self
             .inner
-            .swap((Some(Owned::new(config)), Tag::None), AcqRel)
+            .swap((Some(Owned::new(Arc::new(config))), Tag::None), AcqRel)
             .0;
         drop(previous);
         if let Some(modified_millis) = modified_millis {
@@ -340,8 +397,18 @@ impl fmt::Display for ModelResolveError {
                     output, model
                 )
             }
+            ModelResolveError::UnsupportedInput { model, input } => {
+                write!(f, "model '{}' does not support {} input", model, input)
+            }
+            ModelResolveError::InvalidInputSupport { model } => {
+                write!(f, "model '{}' must support at least one input mode", model)
+            }
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl std::error::Error for ModelResolveError {}
@@ -370,7 +437,7 @@ mod tests {
                 .await?;
 
         let initial = store.get().await;
-        assert_eq!(initial.default_model, "404-3dgs");
+        assert_eq!(initial.default_model.as_str(), "404-3dgs");
 
         let updated = BASE_CONFIG.replace(
             "default_model = \"404-3dgs\"",
@@ -381,7 +448,7 @@ mod tests {
         assert!(store.reload_from_disk().await);
 
         let refreshed = store.get().await;
-        assert_eq!(refreshed.default_model, "404-mesh");
+        assert_eq!(refreshed.default_model.as_str(), "404-mesh");
 
         Ok(())
     }
@@ -397,7 +464,7 @@ mod tests {
                 .await?;
 
         let initial = store.get().await;
-        assert_eq!(initial.default_model, "404-3dgs");
+        assert_eq!(initial.default_model.as_str(), "404-3dgs");
 
         let invalid = BASE_CONFIG.replace(
             "default_model = \"404-3dgs\"",
@@ -408,7 +475,7 @@ mod tests {
         assert!(!store.reload_from_disk().await);
 
         let refreshed = store.get().await;
-        assert_eq!(refreshed.default_model, "404-3dgs");
+        assert_eq!(refreshed.default_model.as_str(), "404-3dgs");
 
         Ok(())
     }

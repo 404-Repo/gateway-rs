@@ -1,11 +1,10 @@
 use crate::api::request::GatewayInfoExt;
 use crate::api::response::{GatewayInfoRef, LeaderResponse};
 use crate::common::log::get_build_information;
-use crate::config::HTTPConfig;
+use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::rate_limits::RateLimitContext;
-use crate::metrics::Metrics;
-use crate::raft::gateway_state::GatewayState;
+use crate::http3::state::HttpState;
 use crate::raft::store::Request as RaftRequest;
 use http::HeaderValue;
 use itoa::Buffer;
@@ -15,34 +14,19 @@ use salvo::prelude::*;
 pub const MULTIPART_PREFIX: &str = "multipart/form-data";
 pub const BOUNDARY_PREFIX: &str = "boundary=";
 
-pub(crate) trait DepotExt {
-    fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError>;
-}
-
-impl DepotExt for salvo::Depot {
-    fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError> {
-        self.obtain::<T>().map_err(|e| {
-            ServerError::Internal(format!(
-                "Failed to obtain {}: {:?}",
-                std::any::type_name::<T>(),
-                e
-            ))
-        })
-    }
-}
-
 #[handler]
 pub async fn write_handler(
     depot: &mut Depot,
     req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
     let body = req
-        .payload_with_max_size(depot.require::<HTTPConfig>()?.raft_write_size_limit as usize)
+        .payload_with_max_size(state.http_config().raft_write_size_limit as usize)
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-    let gateway_state = depot.require::<GatewayState>()?;
+    let gateway_state = state.gateway_state().clone();
 
     if let Ok(request) = rmp_serde::from_slice::<RaftRequest>(body.as_ref()) {
         match request {
@@ -97,7 +81,8 @@ pub async fn get_leader_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let gateway_state = depot.require::<GatewayState>()?;
+    let state = depot.require::<HttpState>()?.clone();
+    let gateway_state = state.gateway_state().clone();
     let leader_id = match gateway_state.leader().await {
         Some(id) => id,
         None => {
@@ -131,7 +116,8 @@ pub async fn id_handler(
     _req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let node_id = *depot.require::<usize>()?;
+    let state = depot.require::<HttpState>()?;
+    let node_id = state.node_id();
 
     let mut buffer = Buffer::new();
     res.render(buffer.format(node_id).to_owned());
@@ -164,7 +150,8 @@ pub async fn api_or_generic_key_check(
 
 #[handler]
 pub async fn metrics_handler(depot: &mut Depot, res: &mut Response) -> Result<(), ServerError> {
-    let metrics = depot.require::<Metrics>()?;
+    let state = depot.require::<HttpState>()?.clone();
+    let metrics = state.metrics();
 
     let metric_families = metrics.registry().gather();
     let encoder = prometheus::TextEncoder::new();

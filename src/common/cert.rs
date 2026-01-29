@@ -31,11 +31,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &provider.signature_verification_algorithms,
         )
     }
 
@@ -45,16 +46,17 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -93,10 +95,11 @@ pub fn generate_self_signed_config() -> Result<ServerConfig> {
     let key = rcgen_cert.signing_key.serialize_der();
     let cert_der: CertificateDer<'static> = rcgen_cert.cert.der().to_vec().into();
 
-    let mut rustls_config =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key.into()))?;
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut rustls_config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key.into()))?;
 
     rustls_config.alpn_protocols = vec![b"h3".to_vec()];
 

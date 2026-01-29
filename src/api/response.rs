@@ -2,7 +2,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::crypto::hotkey::Hotkey;
 use crate::task::TaskStatus;
 
 use super::Task;
@@ -54,11 +53,7 @@ pub struct GetTaskStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub miner_hotkey: Option<Hotkey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub miner_uid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub miner_rating: Option<f32>,
+    pub worker_id: Option<String>,
 }
 
 impl From<TaskStatus> for GetTaskStatusResponse {
@@ -67,28 +62,18 @@ impl From<TaskStatus> for GetTaskStatusResponse {
         match status {
             TaskStatus::Failure { reason } => Self {
                 status: status_str,
-                reason: Some(reason),
-                miner_hotkey: None,
-                miner_uid: None,
-                miner_rating: None,
+                reason: Some(reason.to_string()),
+                worker_id: None,
             },
-            TaskStatus::Success {
-                miner_hotkey,
-                miner_uid,
-                miner_rating,
-            } => Self {
+            TaskStatus::Success { worker_id } => Self {
                 status: status_str,
                 reason: None,
-                miner_hotkey,
-                miner_uid,
-                miner_rating,
+                worker_id: Some(worker_id.to_string()),
             },
             _ => Self {
                 status: status_str,
                 reason: None,
-                miner_hotkey: None,
-                miner_uid: None,
-                miner_rating: None,
+                worker_id: None,
             },
         }
     }
@@ -106,6 +91,7 @@ pub struct LeaderResponse {
 mod tests {
     use super::*;
     use crate::task::TaskStatus;
+    use std::sync::Arc;
 
     #[test]
     fn converts_no_result() {
@@ -119,29 +105,15 @@ mod tests {
     #[test]
     fn converts_success() {
         let resp: GetTaskStatusResponse = TaskStatus::Success {
-            miner_hotkey: Some(
-                "5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7"
-                    .parse()
-                    .unwrap(),
-            ),
-            miner_uid: Some(123),
-            miner_rating: Some(1500.50),
+            worker_id: Arc::<str>::from("worker-123"),
         }
         .into();
         assert_eq!(resp.status, "Success");
         assert!(resp.reason.is_none());
-        assert_eq!(
-            resp.miner_hotkey.as_deref(),
-            Some("5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7")
-        );
-        assert_eq!(resp.miner_uid, Some(123));
-        assert_eq!(resp.miner_rating, Some(1500.50));
+        assert_eq!(resp.worker_id.as_deref(), Some("worker-123"));
 
         let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(
-            json,
-            r#"{"status":"Success","miner_hotkey":"5GTmkzxbXSFh8ApLU24fzWUu2asZs89V5eJnN3ufubTg9Pj7","miner_uid":123,"miner_rating":1500.5}"#
-        );
+        assert_eq!(json, r#"{"status":"Success","worker_id":"worker-123"}"#);
     }
 
     #[test]
@@ -156,7 +128,7 @@ mod tests {
     #[test]
     fn converts_failure_with_reason() {
         let resp: GetTaskStatusResponse = TaskStatus::Failure {
-            reason: "boom".into(),
+            reason: Arc::<str>::from("boom"),
         }
         .into();
         assert_eq!(resp.status, "Failure");

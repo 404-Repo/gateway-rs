@@ -10,6 +10,7 @@ mod protocol;
 mod raft;
 mod task;
 
+use anyhow::Error;
 use clap::Parser;
 use clap::ValueEnum;
 use common::log::{init_tracing, log_app_config, log_build_information};
@@ -24,6 +25,13 @@ use tracing::{error, info, warn};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const RESTART_DELAY_SECS: u64 = 5;
+
+fn log_error_chain(context: &str, err: &Error) {
+    error!("{context}: {err}");
+    for (idx, cause) in err.chain().skip(1).enumerate() {
+        error!("{context}: caused by ({}) {}", idx + 1, cause);
+    }
+}
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> std::io::Result<()> {
@@ -215,10 +223,11 @@ async fn main() {
                     &shutdown,
                     restart_delay_secs,
                     |attempts, max_attempts| {
-                        error!(
-                            "Failed to start gateway: {e}, attempt {}/{}",
+                        let context = format!(
+                            "Failed to start gateway, attempt {}/{}",
                             attempts, max_attempts
                         );
+                        log_error_chain(&context, &e);
                     },
                 )
                 .await;

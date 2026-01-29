@@ -29,11 +29,11 @@ impl RServer {
     ) -> Result<Self> {
         let mut server_config = match cert {
             Some((cert_chain, key)) => {
-                let mut rustls_config = rustls::ServerConfig::builder_with_protocol_versions(&[
-                    &rustls::version::TLS13,
-                ])
-                .with_no_client_auth()
-                .with_single_cert(cert_chain, key)?;
+                let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+                let mut rustls_config = rustls::ServerConfig::builder_with_provider(provider)
+                    .with_protocol_versions(&[&rustls::version::TLS13])?
+                    .with_no_client_auth()
+                    .with_single_cert(cert_chain, key)?;
                 rustls_config.alpn_protocols = vec![b"h3".to_vec()];
                 let quic_server_config = QuicServerConfig::try_from(rustls_config)?;
                 quinn::ServerConfig::with_crypto(Arc::new(quic_server_config))

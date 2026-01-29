@@ -1,13 +1,16 @@
 use salvo::prelude::*;
-use salvo::rate_limiter::{
-    BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter, RemoteIpIssuer,
-};
+use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::config::HTTPConfig;
+use crate::http3::depot_ext::DepotExt;
+use crate::http3::distributed_rate_limiter::DistributedRateLimiter;
 use crate::http3::error::ServerError;
+use crate::http3::state::HttpState;
 use crate::http3::whitelist::is_whitelisted_ip;
 use crate::raft::gateway_state::GatewayState;
+use crate::raft::store::{RateLimitDelta, Subject};
 
 #[derive(Clone, Debug, Default)]
 pub struct RateLimitContext {
@@ -16,23 +19,83 @@ pub struct RateLimitContext {
     pub is_generic_key: bool,
     pub is_company_key: bool,
     pub user_id: Option<Uuid>,
+    pub user_email: Option<Arc<str>>,
     pub key_is_uuid: bool,
+    pub company: Option<CompanyRateLimit>,
+    pub decimal_ip: Option<Arc<str>>,
 }
 
-fn decimal_ip_from_req(req: &mut Request) -> Option<String> {
+#[derive(Clone, Debug)]
+pub struct CompanyRateLimit {
+    pub id: Uuid,
+    pub name: Arc<str>,
+    pub hourly_limit: u64,
+    pub daily_limit: u64,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct RateLimitPolicies {
+    pub user_hourly_limit: u64,
+}
+
+impl RateLimitPolicies {
+    fn from_config(cfg: &HTTPConfig) -> Self {
+        Self {
+            user_hourly_limit: cfg.add_task_user_id_per_user_hourly_rate_limit as u64,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RateLimitService {
+    distributed: DistributedRateLimiter,
+    policies: RateLimitPolicies,
+}
+
+impl RateLimitService {
+    pub fn new(http_config: &HTTPConfig) -> (Self, RateLimiters) {
+        let service = Self {
+            distributed: DistributedRateLimiter::new(
+                http_config.distributed_rate_limiter_max_capacity,
+            ),
+            policies: RateLimitPolicies::from_config(http_config),
+        };
+        let limiters = RateLimiters::new(http_config);
+        (service, limiters)
+    }
+
+    pub fn distributed(&self) -> &DistributedRateLimiter {
+        &self.distributed
+    }
+
+    pub fn policies(&self) -> RateLimitPolicies {
+        self.policies
+    }
+}
+
+fn decimal_ip_from_req(req: &mut Request) -> Option<Arc<str>> {
     match req.remote_addr() {
         salvo::conn::SocketAddr::IPv4(addr) => {
             let bits = addr.ip().to_bits();
             let mut buf = itoa::Buffer::new();
-            Some(buf.format(bits).to_owned())
+            Some(Arc::<str>::from(buf.format(bits)))
         }
         salvo::conn::SocketAddr::IPv6(addr) => {
             let bits = addr.ip().to_bits();
             let mut buf = itoa::Buffer::new();
-            Some(buf.format(bits).to_owned())
+            Some(Arc::<str>::from(buf.format(bits)))
         }
         _ => None,
     }
+}
+
+fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
+    if let Ok(ctx) = depot.obtain::<RateLimitContext>()
+        && let Some(ip) = ctx.decimal_ip.as_ref()
+    {
+        return Some(Arc::clone(ip));
+    }
+    decimal_ip_from_req(req)
 }
 
 impl RateLimitContext {
@@ -49,24 +112,34 @@ pub async fn prepare_rate_limit_context(
     depot: &mut Depot,
     req: &mut Request,
 ) -> Result<(), ServerError> {
-    let gs = depot
-        .obtain::<GatewayState>()
-        .map_err(|e| ServerError::Internal(format!("Failed to obtain GatewayState: {:?}", e)))?;
+    let state = depot.require::<HttpState>()?.clone();
+    let gateway_state = state.gateway_state().clone();
 
     let mut context = RateLimitContext {
-        is_whitelisted_ip: is_whitelisted_ip(req, depot),
+        is_whitelisted_ip: is_whitelisted_ip(req, &state),
         ..RateLimitContext::default()
     };
+    context.decimal_ip = decimal_ip_from_req(req);
 
     if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
         && key_str.len() == uuid::fmt::Hyphenated::LENGTH
         && let Ok(uuid) = Uuid::parse_str(key_str)
     {
         context.key_is_uuid = true;
-        context.has_valid_api_key = gs.is_valid_api_key(key_str).await;
-        context.is_company_key = gs.is_company_key(key_str).await;
-        context.user_id = gs.get_user_id(key_str).await;
-        context.is_generic_key = gs.is_generic_key(&uuid).await;
+        let lookup = gateway_state.lookup_api_key(key_str).await;
+        context.has_valid_api_key = lookup.user_id.is_some();
+        context.is_company_key = lookup.company_id.is_some();
+        context.user_id = lookup.user_id;
+        context.user_email = lookup.user_email;
+        if let (Some(cid), Some((name, hourly, daily))) = (lookup.company_id, lookup.company_info) {
+            context.company = Some(CompanyRateLimit {
+                id: cid,
+                name,
+                hourly_limit: hourly,
+                daily_limit: daily,
+            });
+        }
+        context.is_generic_key = gateway_state.is_generic_key(&uuid).await;
     }
 
     depot.inject(context);
@@ -75,8 +148,8 @@ pub async fn prepare_rate_limit_context(
 
 pub type PerIPRateLimiter = RateLimiter<
     FixedGuard,
-    MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
-    RemoteIpIssuer,
+    MokaStore<<CachedIpIssuer as RateIssuer>::Key, FixedGuard>,
+    CachedIpIssuer,
     BasicQuota,
 >;
 
@@ -106,11 +179,11 @@ pub struct GenericKeyPerIpIssuer;
 impl RateIssuer for GenericKeyPerIpIssuer {
     type Key = String;
 
-    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
-        let ip_dec = decimal_ip_from_req(req)?;
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        let ip_dec = cached_decimal_ip(req, depot)?;
         let mut key = String::with_capacity(2 + ip_dec.len());
         key.push_str("g_");
-        key.push_str(&ip_dec);
+        key.push_str(ip_dec.as_ref());
         Some(key)
     }
 }
@@ -127,15 +200,24 @@ impl RateIssuer for GlobalGenericKeyIssuer {
 pub struct UnauthorizedOnlyIssuer;
 
 impl RateIssuer for UnauthorizedOnlyIssuer {
-    type Key = String;
+    type Key = Arc<str>;
 
-    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
-        let ip = decimal_ip_from_req(req)?;
-        Some(ip)
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        cached_decimal_ip(req, depot)
     }
 }
 
-pub struct RateLimits {
+pub struct CachedIpIssuer;
+
+impl RateIssuer for CachedIpIssuer {
+    type Key = Arc<str>;
+
+    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
+        cached_decimal_ip(req, depot)
+    }
+}
+
+pub struct RateLimiters {
     pub basic_limiter: PerIPRateLimiter,
     pub update_limiter: PerIPRateLimiter,
     // This only prevents spam per IP (for unauthenticated users).
@@ -150,7 +232,7 @@ pub struct RateLimits {
     pub status_limiter: PerIPRateLimiter,
 }
 
-impl RateLimits {
+impl RateLimiters {
     pub fn new(http_config: &HTTPConfig) -> Self {
         let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
         let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
@@ -217,15 +299,149 @@ impl RateLimits {
         quota: usize,
     ) -> RateLimiter<
         FixedGuard,
-        MokaStore<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>,
-        RemoteIpIssuer,
+        MokaStore<<CachedIpIssuer as RateIssuer>::Key, FixedGuard>,
+        CachedIpIssuer,
         BasicQuota,
     > {
         RateLimiter::new(
             FixedGuard::new(),
-            MokaStore::<<RemoteIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
-            RemoteIpIssuer,
+            MokaStore::<<CachedIpIssuer as RateIssuer>::Key, FixedGuard>::new(),
+            CachedIpIssuer,
             BasicQuota::per_minute(quota),
         )
     }
+}
+
+struct SubjectParams<'a> {
+    subject: Subject,
+    id: u128,
+    hourly_limit: u64,
+    daily_limit: u64,
+    add_day: u16,
+    error_msg: &'a str,
+    require_day_match: bool,
+}
+
+async fn enforce_subject(
+    limiter: &DistributedRateLimiter,
+    gs: &GatewayState,
+    epochs: (u64, u64),
+    params: SubjectParams<'_>,
+) -> Result<(), ServerError> {
+    let SubjectParams {
+        subject,
+        id,
+        hourly_limit,
+        daily_limit,
+        add_day,
+        error_msg,
+        require_day_match,
+    } = params;
+
+    let (hour_epoch, day_epoch) = epochs;
+    let has_limits = hourly_limit > 0 || daily_limit > 0;
+    let (cluster_hour, cluster_day) = if has_limits {
+        limiter
+            .cluster_usage(
+                gs,
+                crate::http3::distributed_rate_limiter::ClusterUsageParams {
+                    subject,
+                    id,
+                    hourly_limit,
+                    daily_limit,
+                    require_day_match,
+                    epochs,
+                },
+            )
+            .await
+    } else {
+        (0, 0)
+    };
+
+    if !limiter
+        .check_and_incr(
+            crate::http3::distributed_rate_limiter::ClientKey { subject, id },
+            hourly_limit,
+            daily_limit,
+            cluster_hour,
+            cluster_day,
+            (hour_epoch, day_epoch),
+        )
+        .await
+    {
+        return Err(ServerError::TooManyRequests(error_msg.to_string()));
+    }
+
+    if has_limits {
+        let delta = RateLimitDelta {
+            subject,
+            id,
+            hour_epoch,
+            day_epoch,
+            add_hour: 1,
+            add_day: add_day as u32,
+        };
+        gs.enqueue_rate_limit_delta(delta);
+    }
+
+    Ok(())
+}
+
+#[handler]
+pub async fn enforce_rate_limit(depot: &mut Depot, _req: &mut Request) -> Result<(), ServerError> {
+    let ctx = depot
+        .obtain::<RateLimitContext>()
+        .map_err(|e| ServerError::Internal(format!("RateLimitContext missing: {:?}", e)))?;
+
+    if ctx.is_whitelisted_ip {
+        return Ok(());
+    }
+
+    let state = depot.require::<HttpState>()?.clone();
+    let limiter = state.rate_limits().distributed();
+    let gs = state.gateway_state().clone();
+    let policies = state.rate_limits().policies();
+
+    let epochs = limiter.epochs();
+
+    // Company keys first, enforce their limits if present
+    if let Some(company) = ctx.company.as_ref() {
+        enforce_subject(
+            limiter,
+            &gs,
+            epochs,
+            SubjectParams {
+                subject: Subject::Company,
+                id: company.id.as_u128(),
+                hourly_limit: company.hourly_limit,
+                daily_limit: company.daily_limit,
+                add_day: 1,
+                error_msg: "Company rate limit exceeded",
+                require_day_match: true,
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Otherwise fall back to per-user quota when we have a user id
+    if let Some(user_id) = ctx.user_id {
+        enforce_subject(
+            limiter,
+            &gs,
+            epochs,
+            SubjectParams {
+                subject: Subject::User,
+                id: user_id.as_u128(),
+                hourly_limit: policies.user_hourly_limit,
+                daily_limit: 0,
+                add_day: 0,
+                error_msg: "User rate limit exceeded",
+                require_day_match: false,
+            },
+        )
+        .await?;
+    }
+
+    Ok(())
 }

@@ -1,13 +1,11 @@
 use super::store::Request;
-use super::store::{RateLimitDelta, RateLimitWindow, Subject, rate_limit_key};
+use super::store::{RateLimitDelta, Subject, rate_limit_key};
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
-use crate::common::company_usage::CompanyUsageRecorder;
 use crate::config::NodeConfig;
-use crate::db::ApiKeyValidator;
+use crate::db::{ApiKeyLookup, ApiKeyValidator, EventRecorder};
 use crate::http3::client::{Http3Client, Http3ClientBuilder};
-use crate::metrics::TaskKind;
 use crate::task::TaskManager;
 use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
@@ -70,7 +68,7 @@ struct GatewayStateInner {
     task_manager: TaskManager,
     config: Arc<NodeConfig>,
     rate_limit_queue: Arc<Queue<RateLimitDelta>>,
-    usage_recorder: CompanyUsageRecorder,
+    event_recorder: EventRecorder,
 }
 
 #[derive(Clone)]
@@ -86,7 +84,7 @@ pub struct GatewayStateInit {
     pub task_manager: TaskManager,
     pub config: Arc<NodeConfig>,
     pub rate_limit_queue: Arc<Queue<RateLimitDelta>>,
-    pub usage_recorder: CompanyUsageRecorder,
+    pub event_recorder: EventRecorder,
 }
 
 impl GatewayState {
@@ -144,7 +142,7 @@ impl GatewayState {
             task_manager,
             config,
             rate_limit_queue,
-            usage_recorder,
+            event_recorder,
         } = args;
         Self {
             internal: Arc::new(GatewayStateInner {
@@ -155,7 +153,7 @@ impl GatewayState {
                 task_manager,
                 config,
                 rate_limit_queue,
-                usage_recorder,
+                event_recorder,
             }),
         }
     }
@@ -177,16 +175,10 @@ impl GatewayState {
     }
 
     pub async fn membership(&self) -> Vec<u64> {
-        let membership_config = {
-            self.internal
-                .raft
-                .metrics()
-                .borrow()
-                .membership_config
-                .clone()
-        };
-
-        membership_config
+        let metrics = self.internal.raft.metrics();
+        let borrowed = metrics.borrow();
+        borrowed
+            .membership_config
             .membership()
             .nodes()
             .map(|(&id, _)| id)
@@ -338,26 +330,8 @@ impl GatewayState {
             .is_some_and(|generic_key| &generic_key == api_key)
     }
 
-    pub async fn is_valid_api_key(&self, api_key: &str) -> bool {
-        self.internal.key_validator.is_valid_api_key(api_key).await
-    }
-
-    pub async fn is_company_key(&self, api_key: &str) -> bool {
-        self.internal.key_validator.is_company_key(api_key).await
-    }
-
-    pub async fn get_user_id(&self, api_key: &str) -> Option<Uuid> {
-        self.internal.key_validator.get_user_id(api_key).await
-    }
-
-    pub async fn get_company_info_from_key(
-        &self,
-        api_key: &str,
-    ) -> Option<(Uuid, (String, u64, u64))> {
-        self.internal
-            .key_validator
-            .get_company_info_from_key(api_key)
-            .await
+    pub async fn lookup_api_key(&self, api_key: &str) -> ApiKeyLookup {
+        self.internal.key_validator.lookup(api_key).await
     }
 
     pub fn cluster_name(&self) -> &str {
@@ -376,11 +350,42 @@ impl GatewayState {
         self.internal.rate_limit_queue.push(delta);
     }
 
-    pub async fn record_company_usage(&self, company_id: Uuid, task_kind: TaskKind) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_activity(
+        &self,
+        user_id: Option<Uuid>,
+        user_email: Option<&str>,
+        company_id: Option<Uuid>,
+        company_name: Option<&str>,
+        action: &str,
+        tool: &str,
+        task_kind: &str,
+        task_id: Option<Uuid>,
+    ) {
+        self.internal.event_recorder.record_activity(
+            user_id,
+            user_email,
+            company_id,
+            company_name,
+            action,
+            tool,
+            task_kind,
+            task_id,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_worker_event(
+        &self,
+        task_id: Option<Uuid>,
+        worker_id: Option<&str>,
+        action: &str,
+        task_kind: &str,
+        reason: Option<&str>,
+    ) {
         self.internal
-            .usage_recorder
-            .record(company_id, task_kind)
-            .await;
+            .event_recorder
+            .record_worker_event(task_id, worker_id, action, task_kind, reason);
     }
 
     pub async fn submit_rate_limit_deltas(
@@ -479,12 +484,17 @@ impl GatewayState {
             .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))
     }
 
-    pub async fn get_cluster_rate_window(
+    pub async fn get_cluster_rate_usage(
         &self,
         subject: Subject,
         id: u128,
-    ) -> Option<RateLimitWindow> {
+        hour_epoch: u64,
+        day_epoch: u64,
+    ) -> (u64, u64) {
         let key = rate_limit_key(subject, id);
-        self.internal.state.get_rate_limit_window(&key).await
+        self.internal
+            .state
+            .get_rate_limit_usage(&key, hour_epoch, day_epoch)
+            .await
     }
 }

@@ -48,6 +48,7 @@ VALUES (
 CREATE TABLE IF NOT EXISTS companies (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name VARCHAR(255) NOT NULL UNIQUE,
+  email VARCHAR(255),
   rate_limit_hourly INT NOT NULL DEFAULT 60,
   rate_limit_daily INT NOT NULL DEFAULT 600,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -79,14 +80,78 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_user_id_created ON api_keys(user_id, cre
 CREATE INDEX IF NOT EXISTS idx_company_api_keys_company_id_updated ON company_api_keys(company_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_company_api_keys_company_id_created ON company_api_keys(company_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS company_usage_stats (
-  company_id UUID REFERENCES companies(id) ON DELETE CASCADE,
-  bucket DATE NOT NULL,
-  task_kind VARCHAR(16) NOT NULL DEFAULT 'txt3d',
-  request_count BIGINT NOT NULL DEFAULT 0,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  PRIMARY KEY (company_id, bucket, task_kind)
+-- Raw activity events for client API traffic (one row per request).
+-- Tracks: user/company, action, tool, task kind, gateway, timestamps.
+-- Optimized for: company_id/user_id + week/month/year buckets (optionally + action),
+--                tool + week/month/year buckets, and direct task_id lookup.
+-- Daily/weekly/monthly/yearly grouping is fast via generated date buckets.
+CREATE TABLE IF NOT EXISTS activity_events (
+  id BIGSERIAL PRIMARY KEY,
+  user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  user_email VARCHAR(255),
+  company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
+  company_name VARCHAR(255),
+  action VARCHAR(64) NOT NULL CHECK (char_length(action) > 0),
+  tool VARCHAR(64) NOT NULL DEFAULT 'api',
+  task_kind VARCHAR(16) NOT NULL,
+  gateway_name VARCHAR(255) NOT NULL,
+  task_id UUID,
+  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+  request_date DATE GENERATED ALWAYS AS (created_at::date) STORED,
+  request_week DATE GENERATED ALWAYS AS (date_trunc('week', created_at)::date) STORED,
+  request_month DATE GENERATED ALWAYS AS (date_trunc('month', created_at)::date) STORED,
+  request_year DATE GENERATED ALWAYS AS (date_trunc('year', created_at)::date) STORED
 );
-CREATE INDEX IF NOT EXISTS idx_company_usage_bucket ON company_usage_stats(bucket DESC, task_kind);
-CREATE INDEX IF NOT EXISTS idx_company_usage_company_bucket ON company_usage_stats(company_id, bucket DESC, task_kind);
+CREATE INDEX IF NOT EXISTS idx_activity_events_task_id ON activity_events(task_id);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_month ON activity_events(company_id, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_month ON activity_events(user_id, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_week ON activity_events(company_id, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_year ON activity_events(company_id, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_week ON activity_events(user_id, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_year ON activity_events(user_id, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_tool_week ON activity_events(tool, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_tool_month ON activity_events(tool, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_tool_year ON activity_events(tool, request_year);
+-- Composite indexes for tool filtering within company/user buckets
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_tool_week ON activity_events(company_id, tool, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_tool_month ON activity_events(company_id, tool, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_tool_year ON activity_events(company_id, tool, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_tool_week ON activity_events(user_id, tool, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_tool_month ON activity_events(user_id, tool, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_tool_year ON activity_events(user_id, tool, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_action_week ON activity_events(company_id, action, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_action_month ON activity_events(company_id, action, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_action_year ON activity_events(company_id, action, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_company_action_day ON activity_events(company_id, action, request_date);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_action_week ON activity_events(user_id, action, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_action_month ON activity_events(user_id, action, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_action_year ON activity_events(user_id, action, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_user_action_day ON activity_events(user_id, action, request_date);
+
+-- Raw worker events (per assignment/result). Use this for worker stats and averages later.
+-- Optimized for: worker_id + week/month/year buckets (optionally + action),
+--                and direct task_id lookup.
+-- Daily/weekly/monthly/yearly grouping is fast via generated date buckets.
+CREATE TABLE IF NOT EXISTS worker_events (
+  id BIGSERIAL PRIMARY KEY,
+  task_id UUID,
+  worker_id VARCHAR(128),
+  action VARCHAR(64) NOT NULL CHECK (char_length(action) > 0), -- task_assigned/result_success/result_failure/timeout
+  task_kind VARCHAR(16) NOT NULL,
+  reason TEXT,
+  gateway_name VARCHAR(255) NOT NULL,
+  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
+  bucket DATE GENERATED ALWAYS AS (created_at::date) STORED,
+  bucket_week DATE GENERATED ALWAYS AS (date_trunc('week', created_at)::date) STORED,
+  bucket_month DATE GENERATED ALWAYS AS (date_trunc('month', created_at)::date) STORED,
+  bucket_year DATE GENERATED ALWAYS AS (date_trunc('year', created_at)::date) STORED
+);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_time ON worker_events(worker_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_events_task ON worker_events(task_id);
+CREATE INDEX IF NOT EXISTS idx_worker_events_gateway_time ON worker_events(gateway_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_month ON worker_events(worker_id, bucket_month);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_week ON worker_events(worker_id, bucket_week);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_year ON worker_events(worker_id, bucket_year);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_week ON worker_events(worker_id, action, bucket_week);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_month ON worker_events(worker_id, action, bucket_month);
+CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_year ON worker_events(worker_id, action, bucket_year);

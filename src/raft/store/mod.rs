@@ -30,6 +30,7 @@ use tracing::info;
 use crate::raft::NodeId;
 use crate::raft::TypeConfig;
 
+use foldhash::HashMap as FoldHashMap;
 use foldhash::fast::RandomState;
 use persistence::SnapshotPersistence;
 use scc::hash_cache::Entry as CacheEntry;
@@ -37,52 +38,12 @@ use scc::{HashCache, HashMap};
 
 pub type LogStore = crate::raft::memstore::log_store::LogStore<TypeConfig>;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
-pub struct RateLimitWindow {
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RateLimitSnapshot {
     pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub hour: u64,
-    pub day: u64,
-}
-
-impl RateLimitWindow {
-    fn from_delta(delta: &RateLimitDelta) -> Self {
-        Self {
-            hour_epoch: delta.hour_epoch,
-            day_epoch: delta.day_epoch,
-            hour: delta.add_hour as u64,
-            day: delta.add_day as u64,
-        }
-    }
-
-    fn apply_delta(&mut self, delta: &RateLimitDelta) {
-        let mut add_hour = delta.add_hour as u64;
-        match delta.hour_epoch.cmp(&self.hour_epoch) {
-            std::cmp::Ordering::Greater => {
-                self.hour_epoch = delta.hour_epoch;
-                self.hour = 0;
-            }
-            std::cmp::Ordering::Less => {
-                add_hour = 0;
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-
-        let mut add_day = delta.add_day as u64;
-        match delta.day_epoch.cmp(&self.day_epoch) {
-            std::cmp::Ordering::Greater => {
-                self.day_epoch = delta.day_epoch;
-                self.day = 0;
-            }
-            std::cmp::Ordering::Less => {
-                add_day = 0;
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-
-        self.hour = self.hour.saturating_add(add_hour);
-        self.day = self.day.saturating_add(add_day);
-    }
+    pub hour_limits: Vec<(RateLimitKey, u64)>,
+    pub day_limits: Vec<(RateLimitKey, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
@@ -113,8 +74,8 @@ pub struct RateLimitDelta {
     pub id: u128,
     pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub add_hour: u16,
-    pub add_day: u16,
+    pub add_hour: u32,
+    pub add_day: u32,
 }
 
 impl RateLimitDelta {
@@ -159,13 +120,13 @@ pub struct StoredSnapshot {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(super) struct SnapshotPayload {
     pub data: BTreeMap<String, Vec<u8>>,
-    pub rate_limits: BTreeMap<RateLimitKey, RateLimitWindow>,
+    pub rate_limits: RateLimitSnapshot,
 }
 
 #[derive(Serialize)]
 struct SnapshotPayloadRef<'a> {
     data: &'a BTreeMap<String, Vec<u8>>,
-    rate_limits: &'a BTreeMap<RateLimitKey, RateLimitWindow>,
+    rate_limits: &'a RateLimitSnapshot,
 }
 
 impl SnapshotPayload {
@@ -200,7 +161,7 @@ pub struct StateMachineStore {
     snapshot_idx: AtomicU64,
 
     /// The last received snapshot.
-    current_snapshot: AtomicOwned<StoredSnapshot>,
+    current_snapshot: AtomicOwned<Arc<StoredSnapshot>>,
 
     /// Optional on-disk persistence configuration.
     persistence: Option<Arc<SnapshotPersistence>>,
@@ -208,8 +169,11 @@ pub struct StateMachineStore {
     /// Concurrent request-id deduplication cache to avoid re-applying idempotent requests.
     request_dedupe: HashCache<u128, Instant, RandomState>,
 
-    /// Concurrent hash map for rate limits, swapped atomically during snapshot installs.
-    rate_limits: AtomicOwned<HashMap<RateLimitKey, RateLimitWindow, RandomState>>,
+    /// Concurrent hash maps for rate limits, swapped atomically during snapshot installs.
+    rate_limits_hour: AtomicOwned<HashMap<RateLimitKey, u64, RandomState>>,
+    rate_limits_day: AtomicOwned<HashMap<RateLimitKey, u64, RandomState>>,
+    hour_epoch: AtomicU64,
+    day_epoch: AtomicU64,
 
     /// Guard to synchronize apply and snapshot building for consistent cuts.
     snapshot_guard: tokio::sync::Mutex<()>,
@@ -228,10 +192,16 @@ impl Default for StateMachineStore {
             current_snapshot: AtomicOwned::null(),
             persistence: None,
             request_dedupe: HashCache::with_capacity_and_hasher(512, 1024, RandomState::default()),
-            rate_limits: AtomicOwned::new(HashMap::with_capacity_and_hasher(
+            rate_limits_hour: AtomicOwned::new(HashMap::with_capacity_and_hasher(
                 4096,
                 RandomState::default(),
             )),
+            rate_limits_day: AtomicOwned::new(HashMap::with_capacity_and_hasher(
+                4096,
+                RandomState::default(),
+            )),
+            hour_epoch: AtomicU64::new(0),
+            day_epoch: AtomicU64::new(0),
             snapshot_guard: tokio::sync::Mutex::new(()),
         }
     }
@@ -239,8 +209,8 @@ impl Default for StateMachineStore {
 
 impl StateMachineStore {
     fn build_rate_limit_map(
-        new_limits: BTreeMap<RateLimitKey, RateLimitWindow>,
-    ) -> HashMap<RateLimitKey, RateLimitWindow, RandomState> {
+        new_limits: Vec<(RateLimitKey, u64)>,
+    ) -> HashMap<RateLimitKey, u64, RandomState> {
         let capacity = new_limits.len().max(4096);
         let map = HashMap::with_capacity_and_hasher(capacity, RandomState::default());
         for (key, value) in new_limits {
@@ -249,18 +219,34 @@ impl StateMachineStore {
         map
     }
 
-    fn current_rate_limits<'guard>(
+    fn current_rate_limits_hour<'guard>(
         &self,
         guard: &'guard Guard,
-    ) -> Option<&'guard HashMap<RateLimitKey, RateLimitWindow, RandomState>> {
-        self.rate_limits.load(Ordering::Acquire, guard).as_ref()
+    ) -> Option<&'guard HashMap<RateLimitKey, u64, RandomState>> {
+        self.rate_limits_hour
+            .load(Ordering::Acquire, guard)
+            .as_ref()
     }
 
-    fn sync_rate_limits(&self, new_limits: BTreeMap<RateLimitKey, RateLimitWindow>) {
-        let map = Self::build_rate_limit_map(new_limits);
+    fn current_rate_limits_day<'guard>(
+        &self,
+        guard: &'guard Guard,
+    ) -> Option<&'guard HashMap<RateLimitKey, u64, RandomState>> {
+        self.rate_limits_day.load(Ordering::Acquire, guard).as_ref()
+    }
+
+    fn sync_rate_limits(&self, snapshot: RateLimitSnapshot) {
+        let hour_map = Self::build_rate_limit_map(snapshot.hour_limits);
+        let day_map = Self::build_rate_limit_map(snapshot.day_limits);
         let _ = self
-            .rate_limits
-            .swap((Some(Owned::new(map)), Tag::None), Ordering::AcqRel);
+            .rate_limits_hour
+            .swap((Some(Owned::new(hour_map)), Tag::None), Ordering::AcqRel);
+        let _ = self
+            .rate_limits_day
+            .swap((Some(Owned::new(day_map)), Tag::None), Ordering::AcqRel);
+        self.hour_epoch
+            .store(snapshot.hour_epoch, Ordering::Release);
+        self.day_epoch.store(snapshot.day_epoch, Ordering::Release);
     }
 
     pub fn with_persistence<P: AsRef<Path>>(
@@ -272,18 +258,24 @@ impl StateMachineStore {
         let (state_machine_data, rate_limits_data, snapshot_idx, current_snapshot) =
             persistence.load_latest()?;
 
-        let rate_limits = Self::build_rate_limit_map(rate_limits_data);
+        let hour_epoch = rate_limits_data.hour_epoch;
+        let day_epoch = rate_limits_data.day_epoch;
+        let rate_limits_hour = Self::build_rate_limit_map(rate_limits_data.hour_limits);
+        let rate_limits_day = Self::build_rate_limit_map(rate_limits_data.day_limits);
 
         Ok(Self {
             state_machine: RwLock::new(state_machine_data),
             snapshot_idx: AtomicU64::new(snapshot_idx),
             current_snapshot: match current_snapshot {
-                Some(snapshot) => AtomicOwned::new(snapshot),
+                Some(snapshot) => AtomicOwned::new(Arc::new(snapshot)),
                 None => AtomicOwned::null(),
             },
             persistence: Some(persistence),
             request_dedupe: HashCache::with_capacity_and_hasher(256, 1024, RandomState::default()),
-            rate_limits: AtomicOwned::new(rate_limits),
+            rate_limits_hour: AtomicOwned::new(rate_limits_hour),
+            rate_limits_day: AtomicOwned::new(rate_limits_day),
+            hour_epoch: AtomicU64::new(hour_epoch),
+            day_epoch: AtomicU64::new(day_epoch),
             snapshot_guard: tokio::sync::Mutex::new(()),
         })
     }
@@ -309,37 +301,67 @@ impl StateMachineStore {
         sm.data.get(key).cloned()
     }
 
-    pub async fn get_rate_limit_window(&self, key: &RateLimitKey) -> Option<RateLimitWindow> {
+    pub async fn get_rate_limit_usage(
+        &self,
+        key: &RateLimitKey,
+        hour_epoch: u64,
+        day_epoch: u64,
+    ) -> (u64, u64) {
         let guard = Guard::new();
-        self.current_rate_limits(&guard)
-            .and_then(|map| map.read_sync(key, |_, v| *v))
+        let hour = {
+            let current = self.hour_epoch.load(Ordering::Acquire);
+            if current != hour_epoch {
+                0
+            } else {
+                let value = self
+                    .current_rate_limits_hour(&guard)
+                    .and_then(|map| map.read_sync(key, |_, v| *v))
+                    .unwrap_or(0);
+                if self.hour_epoch.load(Ordering::Acquire) != current {
+                    0
+                } else {
+                    value
+                }
+            }
+        };
+
+        let day = {
+            let current = self.day_epoch.load(Ordering::Acquire);
+            if current != day_epoch {
+                0
+            } else {
+                let value = self
+                    .current_rate_limits_day(&guard)
+                    .and_then(|map| map.read_sync(key, |_, v| *v))
+                    .unwrap_or(0);
+                if self.day_epoch.load(Ordering::Acquire) != current {
+                    0
+                } else {
+                    value
+                }
+            }
+        };
+
+        (hour, day)
     }
 
     async fn persist_snapshot(
         &self,
-        snapshot: &StoredSnapshot,
+        snapshot: Arc<StoredSnapshot>,
     ) -> Result<(), StorageError<NodeId>> {
         if let Some(persistence) = &self.persistence {
             let persistence = Arc::clone(persistence);
-            let to_store = snapshot.clone();
-            match spawn_blocking(move || persistence.store(&to_store)).await {
+            let signature = snapshot.meta.signature();
+            match spawn_blocking(move || persistence.store(snapshot.as_ref())).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    return Err(StorageIOError::write_snapshot(
-                        Some(snapshot.meta.signature()),
-                        &err,
-                    )
-                    .into());
+                    return Err(StorageIOError::write_snapshot(Some(signature), &err).into());
                 }
                 Err(join_err) => {
                     let io_err = IoError::other(format!(
                         "task join error while persisting snapshot: {join_err}"
                     ));
-                    return Err(StorageIOError::write_snapshot(
-                        Some(snapshot.meta.signature()),
-                        &io_err,
-                    )
-                    .into());
+                    return Err(StorageIOError::write_snapshot(Some(signature), &io_err).into());
                 }
             }
         }
@@ -372,16 +394,77 @@ impl StateMachineStore {
             Request::RateLimitDeltas { deltas, .. } => {
                 if !is_dup {
                     let guard = Guard::new();
-                    let map = self
-                        .current_rate_limits(&guard)
-                        .expect("rate limit map should be initialized");
+                    let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (u64, u64)> =
+                        FoldHashMap::with_capacity_and_hasher(deltas.len(), RandomState::default());
                     for d in deltas {
-                        let key = d.key();
-                        map.entry_sync(key)
-                            .and_modify(|w| {
-                                w.apply_delta(&d);
+                        let key = (d.subject, d.id, d.hour_epoch, d.day_epoch);
+                        aggregated
+                            .entry(key)
+                            .and_modify(|acc| {
+                                acc.0 = acc.0.saturating_add(d.add_hour as u64);
+                                acc.1 = acc.1.saturating_add(d.add_day as u64);
                             })
-                            .or_insert(RateLimitWindow::from_delta(&d));
+                            .or_insert((d.add_hour as u64, d.add_day as u64));
+                    }
+
+                    let mut hour_updates = Vec::with_capacity(aggregated.len());
+                    let mut day_updates = Vec::with_capacity(aggregated.len());
+                    for ((subject, id, hour_epoch, day_epoch), (add_hour, add_day)) in aggregated {
+                        if add_hour > 0 {
+                            hour_updates.push((hour_epoch, subject, id, add_hour));
+                        }
+                        if add_day > 0 {
+                            day_updates.push((day_epoch, subject, id, add_day));
+                        }
+                    }
+
+                    hour_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+                    day_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+
+                    let mut current_hour_epoch = self.hour_epoch.load(Ordering::Relaxed);
+                    for (hour_epoch, subject, id, add_hour) in hour_updates {
+                        if hour_epoch > current_hour_epoch {
+                            let new_map =
+                                HashMap::with_capacity_and_hasher(4096, RandomState::default());
+                            let _ = self
+                                .rate_limits_hour
+                                .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
+                            self.hour_epoch.store(hour_epoch, Ordering::Release);
+                            current_hour_epoch = hour_epoch;
+                        }
+                        if hour_epoch == current_hour_epoch
+                            && let Some(map) = self.current_rate_limits_hour(&guard)
+                        {
+                            let key = rate_limit_key(subject, id);
+                            map.entry_sync(key)
+                                .and_modify(|v| {
+                                    *v = v.saturating_add(add_hour);
+                                })
+                                .or_insert(add_hour);
+                        }
+                    }
+
+                    let mut current_day_epoch = self.day_epoch.load(Ordering::Relaxed);
+                    for (day_epoch, subject, id, add_day) in day_updates {
+                        if day_epoch > current_day_epoch {
+                            let new_map =
+                                HashMap::with_capacity_and_hasher(4096, RandomState::default());
+                            let _ = self
+                                .rate_limits_day
+                                .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
+                            self.day_epoch.store(day_epoch, Ordering::Release);
+                            current_day_epoch = day_epoch;
+                        }
+                        if day_epoch == current_day_epoch
+                            && let Some(map) = self.current_rate_limits_day(&guard)
+                        {
+                            let key = rate_limit_key(subject, id);
+                            map.entry_sync(key)
+                                .and_modify(|v| {
+                                    *v = v.saturating_add(add_day);
+                                })
+                                .or_insert(add_day);
+                        }
                     }
                 }
 
@@ -400,22 +483,33 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             let state_machine = self.state_machine.read().await;
 
             // Collect rate limits from the concurrent HashMap
-            let mut rate_limits = BTreeMap::new();
             let guard = Guard::new();
-            if let Some(map) = self.current_rate_limits(&guard) {
+            let mut hour_limits = Vec::new();
+            if let Some(map) = self.current_rate_limits_hour(&guard) {
                 map.iter_sync(|k, v| {
-                    rate_limits.insert(*k, *v);
+                    hour_limits.push((*k, *v));
                     true
                 });
             }
-
+            let mut day_limits = Vec::new();
+            if let Some(map) = self.current_rate_limits_day(&guard) {
+                map.iter_sync(|k, v| {
+                    day_limits.push((*k, *v));
+                    true
+                });
+            }
+            let rate_limits = RateLimitSnapshot {
+                hour_epoch: self.hour_epoch.load(Ordering::Acquire),
+                day_epoch: self.day_epoch.load(Ordering::Acquire),
+                hour_limits,
+                day_limits,
+            };
             let payload = SnapshotPayloadRef {
                 data: &state_machine.data,
                 rate_limits: &rate_limits,
             };
             let snapshot_bytes =
                 rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
-
             (
                 snapshot_bytes,
                 state_machine.last_applied_log,
@@ -436,12 +530,12 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
             snapshot_id,
         };
 
-        let snapshot = StoredSnapshot {
+        let snapshot = Arc::new(StoredSnapshot {
             meta: meta.clone(),
             data: snapshot_bytes.clone(),
-        };
+        });
 
-        self.persist_snapshot(&snapshot).await?;
+        self.persist_snapshot(Arc::clone(&snapshot)).await?;
 
         let _ = self
             .current_snapshot
@@ -514,7 +608,8 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
 
         let payload = SnapshotPayload::decode(&new_snapshot.data)
             .map_err(|e| StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e))?;
-        self.persist_snapshot(&new_snapshot).await?;
+        let new_snapshot = Arc::new(new_snapshot);
+        self.persist_snapshot(Arc::clone(&new_snapshot)).await?;
 
         // Update the state machine and rate limits under the snapshot guard.
         {
