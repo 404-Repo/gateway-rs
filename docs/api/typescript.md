@@ -7,6 +7,7 @@ Optional: include `model` in `/add_task` to select output format. For `404-3dgs`
 `/get_result` returns GLB.
 
 ## Text to 3D (TypeScript)
+Note: `model` is only sent to `/add_task`, not `/get_status` or `/get_result`.
 
 ### 1. Add task
 ```ts
@@ -101,6 +102,7 @@ console.log("Saved Text to 3D to:", outFile);
 ```
 
 ## 2D to 3D (TypeScript)
+Note: `model` is only sent to `/add_task`, not `/get_result`.
 
 ### 1. Add 2D to 3D task
 ```ts

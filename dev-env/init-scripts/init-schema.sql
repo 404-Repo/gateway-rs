@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS activity_events (
   action VARCHAR(64) NOT NULL CHECK (char_length(action) > 0),
   tool VARCHAR(64) NOT NULL DEFAULT 'api',
   task_kind VARCHAR(16) NOT NULL,
+  model VARCHAR(128),
   gateway_name VARCHAR(255) NOT NULL,
   task_id UUID,
   created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC'),
@@ -112,6 +113,10 @@ CREATE INDEX IF NOT EXISTS idx_activity_events_user_year ON activity_events(user
 CREATE INDEX IF NOT EXISTS idx_activity_events_tool_week ON activity_events(tool, request_week);
 CREATE INDEX IF NOT EXISTS idx_activity_events_tool_month ON activity_events(tool, request_month);
 CREATE INDEX IF NOT EXISTS idx_activity_events_tool_year ON activity_events(tool, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_model_week ON activity_events(model, request_week);
+CREATE INDEX IF NOT EXISTS idx_activity_events_model_month ON activity_events(model, request_month);
+CREATE INDEX IF NOT EXISTS idx_activity_events_model_year ON activity_events(model, request_year);
+CREATE INDEX IF NOT EXISTS idx_activity_events_model_day ON activity_events(model, request_date);
 -- Composite indexes for tool filtering within company/user buckets
 CREATE INDEX IF NOT EXISTS idx_activity_events_company_tool_week ON activity_events(company_id, tool, request_week);
 CREATE INDEX IF NOT EXISTS idx_activity_events_company_tool_month ON activity_events(company_id, tool, request_month);

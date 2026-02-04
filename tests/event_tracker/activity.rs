@@ -64,6 +64,7 @@ async fn records_client_activity_events() {
     assert_eq!(add_task.task_kind, "txt3d");
     assert_eq!(add_task.task_id, Some(task_id));
     assert_eq!(add_task.tool, "api");
+    assert_eq!(add_task.model.as_deref(), Some("404-3dgs"));
 
     let get_status = rows
         .iter()
@@ -72,6 +73,7 @@ async fn records_client_activity_events() {
     assert_eq!(get_status.task_kind, "unknown");
     assert_eq!(get_status.task_id, Some(task_id));
     assert_eq!(get_status.tool, "api");
+    assert!(get_status.model.is_none());
 
     let get_result = rows
         .iter()
@@ -80,6 +82,7 @@ async fn records_client_activity_events() {
     assert_eq!(get_result.task_kind, "unknown");
     assert_eq!(get_result.task_id, Some(task_id));
     assert_eq!(get_result.tool, "api");
+    assert!(get_result.model.is_none());
 }
 
 #[tokio::test]
@@ -131,6 +134,7 @@ async fn records_company_activity_with_image_task() {
     assert_eq!(add_task.tool, "blender");
     assert_eq!(add_task.company_id, Some(company_id));
     assert_eq!(add_task.company_name.as_deref(), Some("Acme"));
+    assert_eq!(add_task.model.as_deref(), Some("404-3dgs"));
 }
 
 #[tokio::test]

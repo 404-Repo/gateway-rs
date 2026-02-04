@@ -360,6 +360,7 @@ impl GatewayState {
         action: &str,
         tool: &str,
         task_kind: &str,
+        model: Option<&str>,
         task_id: Option<Uuid>,
     ) {
         self.internal.event_recorder.record_activity(
@@ -370,6 +371,7 @@ impl GatewayState {
             action,
             tool,
             task_kind,
+            model,
             task_id,
         );
     }

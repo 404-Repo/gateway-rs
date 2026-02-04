@@ -17,7 +17,7 @@ use crate::config::{ModelConfigStore, NodeConfig};
 use crate::http3::handlers::admin::{
     admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
 };
-use crate::http3::handlers::common::{
+use crate::http3::handlers::core::{
     api_or_generic_key_check, get_leader_handler, id_handler, metrics_handler, version_handler,
     write_handler,
 };

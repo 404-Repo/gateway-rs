@@ -2,25 +2,29 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use futures::{Stream, TryStreamExt};
+use bytes::Bytes;
 use multer::{Constraints, Multipart};
 use salvo::prelude::*;
-use tokio_util::codec::{BytesCodec, FramedRead};
-use tokio_util::io::StreamReader;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::api::request::{AddTaskResultRequest, GetTaskResultRequest, GetTaskStatus};
 use crate::api::response::GetTaskStatusResponse;
-use crate::config::{HTTPConfig, ModelOutput, ModelResolveError};
+use crate::config::ModelOutput;
 use crate::crypto::hotkey::Hotkey;
-use crate::crypto::verify_hotkey;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
-use crate::http3::handlers::common::{BOUNDARY_PREFIX, MULTIPART_PREFIX};
+use crate::http3::handlers::common::activity::{TaskActivityContext, record_task_activity};
+use crate::http3::handlers::common::model_errors::{
+    ModelErrorContext, model_error_to_server_error,
+};
+use crate::http3::handlers::common::multipart::{
+    is_multipart_form, multipart_stream, parse_boundary, read_binary_field, read_text_field,
+};
+use crate::http3::handlers::common::origin::normalize_origin;
+use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_worker_request};
 use crate::http3::rate_limits::RateLimitContext;
 use crate::http3::state::HttpState;
-use crate::raft::gateway_state::GatewayState;
 use crate::task::AddResultError;
 use async_zip::ZipEntryBuilder;
 use async_zip::base::write::ZipFileWriter;
@@ -32,18 +36,10 @@ use multer::SizeLimit;
 const MAX_REASON_LENGTH: u64 = u8::MAX as u64;
 
 #[inline(always)]
-async fn read_text_field(field: multer::Field<'_>, name: &str) -> Result<String, ServerError> {
-    field
-        .text()
-        .await
-        .map_err(|e| ServerError::BadRequest(format!("Failed to read {}: {}", name, e)))
-}
-
-#[inline(always)]
 async fn process_asset(asset: Vec<u8>, decompress_spz: bool) -> Result<Vec<u8>, ServerError> {
     if decompress_spz {
         let mut data = Vec::new();
-        spz_lib::decompress_async(&asset, false, &mut data)
+        spz_lib::decompress_async(Bytes::from(asset), false, &mut data)
             .await
             .map_err(|e| ServerError::Internal(format!("Failed to decompress asset: {:?}", e)))?;
         Ok(data)
@@ -52,96 +48,11 @@ async fn process_asset(asset: Vec<u8>, decompress_spz: bool) -> Result<Vec<u8>, 
     }
 }
 
-fn format_known_models(known: &[String]) -> String {
-    if known.is_empty() {
-        "none configured".to_string()
-    } else {
-        known.join(", ")
-    }
-}
-
-fn model_error_to_server_error(err: ModelResolveError) -> ServerError {
-    match err {
-        ModelResolveError::EmptyConfig => {
-            ServerError::Internal("Model configuration is empty".to_string())
-        }
-        ModelResolveError::MissingDefault {
-            default_model,
-            known,
-        } => ServerError::Internal(format!(
-            "Default model '{}' not configured (known models: {})",
-            default_model,
-            format_known_models(&known)
-        )),
-        ModelResolveError::UnknownModel { model, known } => ServerError::Internal(format!(
-            "Model '{}' not configured (known models: {})",
-            model,
-            format_known_models(&known)
-        )),
-        ModelResolveError::InvalidOutput { model, output } => ServerError::Internal(format!(
-            "Invalid output '{}' configured for model '{}'",
-            output, model
-        )),
-        ModelResolveError::UnsupportedInput { model, input } => ServerError::Internal(format!(
-            "Model '{}' does not support {} input",
-            model, input
-        )),
-        ModelResolveError::InvalidInputSupport { model } => ServerError::Internal(format!(
-            "Model '{}' must support at least one input mode",
-            model
-        )),
-    }
-}
-
 fn parse_compress_flag(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
-    }
-}
-
-fn record_origin<'a>(req: &'a Request, http_cfg: &HTTPConfig) -> &'a str {
-    let origin = req
-        .headers()
-        .get("x-client-origin")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("api");
-    if http_cfg.allowed_origins.contains(origin) {
-        origin
-    } else {
-        "api"
-    }
-}
-
-async fn record_task_activity(
-    gateway_state: &GatewayState,
-    rate_ctx: &RateLimitContext,
-    _req: &Request,
-    action: &str,
-    origin: &str,
-    task_kind: &str,
-    task_id: Option<Uuid>,
-) {
-    let mut company_id = None;
-    let mut company_name: Option<Arc<str>> = None;
-    if rate_ctx.is_company_key
-        && let Some(company) = rate_ctx.company.as_ref()
-    {
-        company_id = Some(company.id);
-        company_name = Some(company.name.clone());
-    }
-    if rate_ctx.user_id.is_some() || company_id.is_some() {
-        gateway_state.record_activity(
-            rate_ctx.user_id,
-            rate_ctx.user_email.as_deref(),
-            company_id,
-            company_name.as_deref(),
-            action,
-            origin,
-            task_kind,
-            task_id,
-        );
     }
 }
 
@@ -164,21 +75,22 @@ pub async fn get_result_handler(
 
     let state = depot.require::<HttpState>()?.clone();
     let http_cfg = state.http_config();
-    let record_origin = record_origin(req, http_cfg);
+    let record_origin = normalize_origin(req, http_cfg);
     let gateway_state = state.gateway_state().clone();
     let task_manager = gateway_state.task_manager();
     let rate_ctx = depot.require::<RateLimitContext>()?;
     let task_kind = "unknown";
     record_task_activity(
-        &gateway_state,
-        rate_ctx,
-        req,
+        TaskActivityContext {
+            gateway_state: &gateway_state,
+            rate_ctx,
+            origin: record_origin,
+            task_kind,
+            model: None,
+            task_id: Some(get_task.id),
+        },
         "get_result",
-        record_origin,
-        task_kind,
-        Some(get_task.id),
-    )
-    .await;
+    );
     let model_store = Arc::clone(state.model_store());
     let model_cfg = model_store.get().await;
 
@@ -200,7 +112,7 @@ pub async fn get_result_handler(
     let output = if let Some(model) = results_bundle.model.as_deref() {
         model_cfg
             .output_for(model)
-            .map_err(model_error_to_server_error)?
+            .map_err(|err| model_error_to_server_error(err, ModelErrorContext::Internal))?
     } else if matches!(requested_format.as_deref(), Some("ply" | "spz"))
         || requested_compress.is_some()
     {
@@ -208,7 +120,7 @@ pub async fn get_result_handler(
     } else {
         model_cfg
             .output_for(model_cfg.default_model.as_str())
-            .map_err(model_error_to_server_error)?
+            .map_err(|err| model_error_to_server_error(err, ModelErrorContext::Internal))?
     };
 
     let wants_ply = if matches!(requested_format.as_deref(), Some("ply")) {
@@ -370,22 +282,23 @@ pub async fn get_status_handler(
 
     let state = depot.require::<HttpState>()?.clone();
     let http_cfg = state.http_config();
-    let record_origin = record_origin(req, http_cfg);
+    let record_origin = normalize_origin(req, http_cfg);
     let gateway_state = state.gateway_state().clone();
     let rate_ctx = depot.require::<RateLimitContext>()?;
 
     let status = gateway_state.task_manager().get_status(get_status.id).await;
 
     record_task_activity(
-        &gateway_state,
-        rate_ctx,
-        req,
+        TaskActivityContext {
+            gateway_state: &gateway_state,
+            rate_ctx,
+            origin: record_origin,
+            task_kind: "unknown",
+            model: None,
+            task_id: Some(get_status.id),
+        },
         "get_status",
-        record_origin,
-        "unknown",
-        Some(get_status.id),
-    )
-    .await;
+    );
 
     res.render(Json(GetTaskStatusResponse::from(status)));
 
@@ -416,7 +329,7 @@ async fn parse_add_result_multipart(
     let mut asset = None;
     let mut reason = None;
 
-    while let Some(mut field) = multipart
+    while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| ServerError::BadRequest(format!("Field error: {}", e)))?
@@ -440,36 +353,7 @@ async fn parse_add_result_multipart(
             "worker_id" => worker_id = Some(read_text_field(field, "worker_id").await?),
             "status" => status = Some(read_text_field(field, "status").await?),
             "asset" => {
-                let (lower, upper) = field.size_hint();
-                let hinted = upper.or(Some(lower)).filter(|&bytes| bytes > 0);
-                let capacity = hinted.unwrap_or(64 * 1024).min(max_asset_bytes as usize);
-
-                let mut content = Vec::with_capacity(capacity);
-                let mut total = 0usize;
-                while let Some(chunk) = field.chunk().await.map_err(|e| {
-                    if let multer::Error::FieldSizeExceeded { limit, .. } = e {
-                        ServerError::BadRequest(format!(
-                            "Asset exceeds maximum allowed size ({} bytes)",
-                            limit
-                        ))
-                    } else {
-                        ServerError::BadRequest(format!("Failed to read asset chunk: {}", e))
-                    }
-                })? {
-                    total = total.checked_add(chunk.len()).ok_or_else(|| {
-                        ServerError::BadRequest("Asset size overflowed usize".to_string())
-                    })?;
-
-                    if total as u64 > max_asset_bytes {
-                        return Err(ServerError::BadRequest(format!(
-                            "Asset exceeds maximum allowed size ({} bytes)",
-                            max_asset_bytes
-                        )));
-                    }
-
-                    content.extend_from_slice(&chunk);
-                }
-                asset = Some(content);
+                asset = Some(read_binary_field(field, max_asset_bytes, "asset").await?);
             }
             "reason" => reason = Some(read_text_field(field, "reason").await?),
             _ => continue,
@@ -499,39 +383,14 @@ async fn parse_add_result_request(
         .ok_or(ServerError::BadRequest("Missing content-type".into()))?
         .to_owned();
 
-    if !content_type
-        .get(..MULTIPART_PREFIX.len())
-        .is_some_and(|s| s.eq_ignore_ascii_case(MULTIPART_PREFIX))
-    {
+    if !is_multipart_form(&content_type) {
         return Err(ServerError::BadRequest(
             "Invalid content-type, expected multipart/form-data".into(),
         ));
     }
 
-    let boundary = content_type
-        .split(';')
-        .map(|s| s.trim())
-        .find(|part| {
-            part.get(..BOUNDARY_PREFIX.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(BOUNDARY_PREFIX))
-        })
-        .and_then(|part| part.split('=').nth(1))
-        .ok_or(ServerError::BadRequest(
-            "Missing boundary in content-type".into(),
-        ))?;
-
-    let raw_stream = req
-        .take_body()
-        .into_stream()
-        .map_err(|err| std::io::Error::other(format!("Stream error: {}", err)))
-        .and_then(|frame| async move {
-            frame
-                .into_data()
-                .map_err(|_| std::io::Error::other("Frame data error".to_string()))
-        });
-
-    let stream_reader = StreamReader::new(raw_stream);
-    let byte_stream = FramedRead::new(stream_reader, BytesCodec::new()).map_ok(|b| b.freeze());
+    let boundary = parse_boundary(&content_type)?;
+    let byte_stream = multipart_stream(req);
 
     let state = depot.require::<HttpState>()?.clone();
     let http_cfg = state.http_config();
@@ -640,22 +499,13 @@ pub async fn add_result_handler(
     let (task_id, task_result, timestamp, signature) = parse_add_result_request(depot, req).await?;
     let state = depot.require::<HttpState>()?.clone();
     let http_cfg = state.http_config();
-    if !http_cfg.worker_whitelist.is_empty()
-        && !http_cfg
-            .worker_whitelist
-            .contains(&task_result.worker_hotkey)
-    {
-        return Err(ServerError::Unauthorized(
-            "Worker hotkey is not whitelisted".to_string(),
-        ));
-    }
-    verify_hotkey(
-        &timestamp,
+    validate_worker_request(
+        http_cfg,
         &task_result.worker_hotkey,
+        &timestamp,
         &signature,
-        http_cfg.signature_freshness_threshold,
-    )
-    .map_err(|e| ServerError::Internal(format!("Failed to verify AddTaskRequest: {:?}", e)))?;
+        WorkerAuthContext::AddResult,
+    )?;
 
     let gateway_state = state.gateway_state().clone();
     let manager = gateway_state.task_manager();
