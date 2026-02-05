@@ -37,6 +37,7 @@ pub struct ActivityEventRow {
     pub action: String,
     pub tool: String,
     pub task_kind: String,
+    pub model: Option<String>,
     pub gateway_name: String,
     pub task_id: Option<uuid::Uuid>,
     pub created_at: DateTime<Utc>,

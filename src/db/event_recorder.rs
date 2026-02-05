@@ -54,6 +54,7 @@ impl<S: EventSink + 'static> EventRecorder<S> {
         action: &str,
         tool: &str,
         task_kind: &str,
+        model: Option<&str>,
         task_id: Option<Uuid>,
     ) {
         let row = ActivityEventRow {
@@ -64,6 +65,7 @@ impl<S: EventSink + 'static> EventRecorder<S> {
             action: action.to_string(),
             tool: tool.to_string(),
             task_kind: task_kind.to_string(),
+            model: model.map(|v| v.to_string()),
             gateway_name: self.gateway_name.to_string(),
             task_id,
             created_at: Utc::now(),

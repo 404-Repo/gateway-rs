@@ -111,6 +111,7 @@ company_name, \
 action, \
 tool, \
 task_kind, \
+model, \
 gateway_name, \
 task_id, \
 created_at\
@@ -295,6 +296,8 @@ created_at\
                     append_copy_field(&mut buf, Some(row.tool.as_str()));
                     buf.push(b'\t');
                     append_copy_field(&mut buf, Some(row.task_kind.as_str()));
+                    buf.push(b'\t');
+                    append_copy_field(&mut buf, row.model.as_deref());
                     buf.push(b'\t');
                     append_copy_field(&mut buf, Some(row.gateway_name.as_str()));
                     buf.push(b'\t');

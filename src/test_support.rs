@@ -1,6 +1,6 @@
 pub use crate::http3::distributed_rate_limiter::DistributedRateLimiter;
-pub use crate::http3::handlers::common::api_or_generic_key_check;
-pub use crate::http3::handlers::common::{id_handler, version_handler};
+pub use crate::http3::handlers::core::api_or_generic_key_check;
+pub use crate::http3::handlers::core::{id_handler, version_handler};
 pub use crate::http3::handlers::result::add_result_handler;
 pub use crate::http3::handlers::result::{get_result_handler, get_status_handler};
 pub use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};

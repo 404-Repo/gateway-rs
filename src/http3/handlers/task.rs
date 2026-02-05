@@ -1,12 +1,11 @@
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use multer::{Constraints, Multipart, SizeLimit};
 use salvo::prelude::*;
+use serde_json::json;
 use std::{collections::HashSet, sync::Arc};
 use tokio::sync::OwnedSemaphorePermit;
-use tokio_util::codec::{BytesCodec, FramedRead};
-use tokio_util::io::StreamReader;
 use tracing::info;
 use uuid::Uuid;
 
@@ -14,32 +13,22 @@ use crate::api::Task;
 use crate::api::request::{AddTaskRequest, GetTasksRequest};
 use crate::api::response::{GetTasksResponse, LoadResponse};
 use crate::common::image::validate_image;
-use crate::config::ModelResolveError;
-use crate::crypto::verify_hotkey;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
-use crate::http3::handlers::common::{BOUNDARY_PREFIX, MULTIPART_PREFIX};
+use crate::http3::handlers::common::activity::{TaskActivityContext, record_task_activity};
+use crate::http3::handlers::common::model_errors::{
+    ModelErrorContext, model_error_to_server_error,
+};
+use crate::http3::handlers::common::multipart::{
+    is_multipart_form, multipart_stream, parse_boundary, read_binary_field, read_text_field,
+};
+use crate::http3::handlers::common::origin::normalize_origin;
+use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_worker_request};
 use crate::http3::rate_limits::RateLimitContext;
 use crate::http3::state::HttpState;
 use crate::metrics::TaskKind;
-use serde_json::json;
 
 const ASSIGNMENT_RECORD_CONCURRENCY: usize = 16;
-
-fn extract_origin(req: &Request) -> &str {
-    req.headers()
-        .get("x-client-origin")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("api")
-}
-
-fn format_known_models(known: &[String]) -> String {
-    if known.is_empty() {
-        "none configured".to_string()
-    } else {
-        known.join(", ")
-    }
-}
 
 fn task_kind_label(task: &Task) -> &'static str {
     if task.image.is_some() {
@@ -47,61 +36,6 @@ fn task_kind_label(task: &Task) -> &'static str {
     } else {
         "txt3d"
     }
-}
-
-fn model_error_to_server_error(err: ModelResolveError) -> ServerError {
-    match err {
-        ModelResolveError::UnknownModel { model, known } => {
-            let message = format!(
-                "Invalid value '{}'. Expected one of: {}",
-                model,
-                format_known_models(&known)
-            );
-            ServerError::BadRequestJson(json!({
-                "error": "invalid_field",
-                "field": "model",
-                "message": message,
-            }))
-        }
-        ModelResolveError::UnsupportedInput { model, input } => {
-            let message = format!("Model '{}' does not support {} input", model, input);
-            ServerError::BadRequestJson(json!({
-                "error": "invalid_field",
-                "field": "model",
-                "message": message,
-            }))
-        }
-        ModelResolveError::EmptyConfig => {
-            ServerError::Internal("Model configuration is empty".to_string())
-        }
-        ModelResolveError::MissingDefault {
-            default_model,
-            known,
-        } => ServerError::Internal(format!(
-            "Default model '{}' not configured (known models: {})",
-            default_model,
-            format_known_models(&known)
-        )),
-        ModelResolveError::InvalidOutput { model, output } => ServerError::Internal(format!(
-            "Invalid output '{}' configured for model '{}'",
-            output, model
-        )),
-        ModelResolveError::InvalidInputSupport { model } => ServerError::Internal(format!(
-            "Model '{}' must support at least one input mode",
-            model
-        )),
-    }
-}
-
-#[inline(always)]
-async fn read_text_field(
-    field: multer::Field<'_>,
-    name: &'static str,
-) -> Result<String, ServerError> {
-    field
-        .text()
-        .await
-        .map_err(|e| ServerError::BadRequest(format!("Failed to read {}: {}", name, e)))
 }
 
 struct AddTaskMultipartData {
@@ -122,18 +56,7 @@ async fn parse_add_task_multipart(
     req: &mut Request,
     boundary: &str,
 ) -> Result<AddTaskMultipartData, ServerError> {
-    let raw_stream = req
-        .take_body()
-        .into_stream()
-        .map_err(|err| std::io::Error::other(format!("Stream error: {}", err)))
-        .and_then(|frame| async move {
-            frame
-                .into_data()
-                .map_err(|_| std::io::Error::other("Frame data error".to_string()))
-        });
-
-    let stream_reader = StreamReader::new(raw_stream);
-    let byte_stream = FramedRead::new(stream_reader, BytesCodec::new()).map_ok(|b| b.freeze());
+    let byte_stream = multipart_stream(req);
 
     let state = depot.require::<HttpState>()?.clone();
     let image_cfg = state.image_config();
@@ -155,7 +78,7 @@ async fn parse_add_task_multipart(
     let mut image = None;
     let mut model = None;
 
-    while let Some(mut field) = multipart
+    while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|e| ServerError::BadRequest(format!("Field error: {}", e)))?
@@ -172,36 +95,9 @@ async fn parse_add_task_multipart(
                 if image_permit.is_none() {
                     image_permit = Some(upload_limiter.acquire().await?);
                 }
-                let (lower, upper) = field.size_hint();
-                let hinted = upper.or(Some(lower)).filter(|&bytes| bytes > 0);
-                let capacity = hinted.unwrap_or(64 * 1024).min(image_cfg.max_size_bytes);
-
-                let mut content = BytesMut::with_capacity(capacity);
-                let mut total = 0usize;
-                while let Some(chunk) = field.chunk().await.map_err(|e| {
-                    if let multer::Error::FieldSizeExceeded { limit, .. } = e {
-                        ServerError::BadRequest(format!(
-                            "Image exceeds maximum allowed size ({} bytes)",
-                            limit
-                        ))
-                    } else {
-                        ServerError::BadRequest(format!("Failed to read image chunk: {}", e))
-                    }
-                })? {
-                    total = total.checked_add(chunk.len()).ok_or_else(|| {
-                        ServerError::BadRequest("Image size overflowed usize".to_string())
-                    })?;
-
-                    if total > image_cfg.max_size_bytes {
-                        return Err(ServerError::BadRequest(format!(
-                            "Image exceeds maximum allowed size ({} bytes)",
-                            image_cfg.max_size_bytes
-                        )));
-                    }
-
-                    content.extend_from_slice(&chunk);
-                }
-                image = Some(content.freeze());
+                let content =
+                    read_binary_field(field, image_cfg.max_size_bytes as u64, "image").await?;
+                image = Some(Bytes::from(content));
             }
             "model" => {
                 model = Some(read_text_field(field, "model").await?);
@@ -228,21 +124,8 @@ async fn parse_add_task_request(
         .ok_or(ServerError::BadRequest("Missing content-type".into()))?
         .to_owned();
 
-    if content_type
-        .get(..MULTIPART_PREFIX.len())
-        .is_some_and(|s| s.eq_ignore_ascii_case(MULTIPART_PREFIX))
-    {
-        let boundary = content_type
-            .split(';')
-            .map(|s| s.trim())
-            .find(|part| {
-                part.get(..BOUNDARY_PREFIX.len())
-                    .is_some_and(|p| p.eq_ignore_ascii_case(BOUNDARY_PREFIX))
-            })
-            .and_then(|part| part.split('=').nth(1))
-            .ok_or(ServerError::BadRequest(
-                "Missing boundary in content-type".into(),
-            ))?;
+    if is_multipart_form(&content_type) {
+        let boundary = parse_boundary(&content_type)?;
         parse_add_task_multipart(depot, req, boundary).await
     } else {
         let add_task = req
@@ -332,18 +215,7 @@ pub async fn add_task_handler(
     let metrics = state.metrics().clone();
     let http_cfg = state.http_config();
     let rate_ctx = depot.require::<RateLimitContext>()?;
-    let is_company_request = rate_ctx.is_company_key;
-    let user_id = rate_ctx.user_id;
-    let user_email = rate_ctx.user_email.as_deref();
-
-    // Determine and validate origin
-    let origin = extract_origin(req);
-    let record_origin = if http_cfg.allowed_origins.contains(origin) {
-        origin
-    } else {
-        "api"
-    };
-
+    let record_origin = normalize_origin(req, http_cfg);
     metrics.inc_request_origin(record_origin);
 
     if queue.len() >= http_cfg.max_task_queue_len {
@@ -353,11 +225,10 @@ pub async fn add_task_handler(
     let model_store = Arc::clone(state.model_store());
     let model_cfg = model_store.get().await;
     let resolved_model = model_cfg
-        .resolve_model(validated.model.as_deref())
-        .map_err(model_error_to_server_error)?;
-    model_cfg
-        .validate_input_support(&resolved_model.model, has_prompt, has_image)
-        .map_err(model_error_to_server_error)?;
+        .resolve_and_validate_input(validated.model.as_deref(), has_prompt, has_image)
+        .map_err(|err| {
+            model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
+        })?;
 
     let task_id = Uuid::new_v4();
     let task_description = if let Some(prompt) = &validated.prompt {
@@ -375,6 +246,7 @@ pub async fn add_task_handler(
 
     let gateway_state = state.gateway_state().clone();
 
+    let model_name = resolved_model.model.clone();
     let task = Task {
         id: task_id,
         prompt: validated.prompt.map(Arc::new),
@@ -385,7 +257,6 @@ pub async fn add_task_handler(
     queue.push(task.clone());
     metrics.set_queue_len(queue.len());
 
-    let model_name = task.model.as_deref().unwrap_or("unknown");
     info!(
         "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
         task_id, model_name, record_origin, task_description
@@ -393,25 +264,17 @@ pub async fn add_task_handler(
 
     gateway_state.task_manager().add_task(task).await;
 
-    let mut company_id = None;
-    let mut company_name: Option<Arc<str>> = None;
-    if is_company_request && let Some(company) = rate_ctx.company.as_ref() {
-        company_id = Some(company.id);
-        company_name = Some(company.name.clone());
-    }
-
-    if user_id.is_some() || company_id.is_some() {
-        gateway_state.record_activity(
-            user_id,
-            user_email,
-            company_id,
-            company_name.as_deref(),
-            "add_task",
-            record_origin,
-            task_kind.label(),
-            Some(task_id),
-        );
-    }
+    record_task_activity(
+        TaskActivityContext {
+            gateway_state: &gateway_state,
+            rate_ctx,
+            origin: record_origin,
+            task_kind: task_kind.label(),
+            model: Some(model_name.as_str()),
+            task_id: Some(task_id),
+        },
+        "add_task",
+    );
 
     res.render(Json(serde_json::json!({
         "id": task_id
@@ -441,20 +304,13 @@ pub async fn get_tasks_handler(
     let queue = state.task_queue().clone();
     let metrics = state.metrics().clone();
 
-    verify_hotkey(
-        &get_tasks.timestamp,
+    validate_worker_request(
+        http_cfg,
         &get_tasks.worker_hotkey,
+        &get_tasks.timestamp,
         &get_tasks.signature,
-        http_cfg.signature_freshness_threshold,
-    )
-    .map_err(|e| ServerError::Internal(format!("Failed to verify GetTasksRequest: {:?}", e)))?;
-    if !http_cfg.worker_whitelist.is_empty()
-        && !http_cfg.worker_whitelist.contains(&get_tasks.worker_hotkey)
-    {
-        return Err(ServerError::Unauthorized(
-            "Worker hotkey is not whitelisted".to_string(),
-        ));
-    }
+        WorkerAuthContext::GetTasks,
+    )?;
 
     let model_filter = {
         let mut models = get_tasks.model.to_vec();
@@ -469,9 +325,9 @@ pub async fn get_tasks_handler(
         models.retain(|model| seen.insert(model.clone()));
 
         for model in &models {
-            model_cfg
-                .output_for(model)
-                .map_err(model_error_to_server_error)?;
+            model_cfg.output_for(model).map_err(|err| {
+                model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
+            })?;
         }
 
         models

@@ -191,6 +191,17 @@ impl ModelConfig {
         Ok(())
     }
 
+    pub fn resolve_and_validate_input(
+        &self,
+        requested: Option<&str>,
+        has_prompt: bool,
+        has_image: bool,
+    ) -> Result<ResolvedModel, ModelResolveError> {
+        let resolved = self.resolve_model(requested)?;
+        self.validate_input_support(&resolved.model, has_prompt, has_image)?;
+        Ok(resolved)
+    }
+
     pub fn known_models(&self) -> Vec<String> {
         let mut models: Vec<String> = self.models.keys().cloned().collect();
         models.sort();

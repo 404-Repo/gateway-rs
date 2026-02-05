@@ -7,6 +7,7 @@ Optional: include `model` in `/add_task` to select output format. For `404-3dgs`
 `/get_result` returns GLB.
 
 ## Text to 3D (console)
+Note: `model` is only sent to `/add_task`, not `/get_status` or `/get_result`.
 
 ### 1. Add task
 ```console
@@ -50,6 +51,7 @@ curl --http3 "https://{REGION}:4443/get_result?id=123e4567-e89b-12d3-a456-426614
 ```
 
 ## 2D to 3D (console)
+Note: `model` is only sent to `/add_task`, not `/get_result`.
 
 ### 1. Add 2D to 3D task
 Important: send only an image for 2D to 3D tasks. Do not send a prompt.
