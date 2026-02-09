@@ -234,8 +234,10 @@ pub struct RateLimiters {
 
 impl RateLimiters {
     pub fn new(http_config: &HTTPConfig) -> Self {
-        let basic_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
-        let update_limiter = Self::create_ip_rate_limiter(http_config.update_key_rate_limit);
+        let basic_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.basic_rate_limit);
+        let update_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.update_key_rate_limit);
         let unauthorized_only_limiter = UnauthorizedOnlyRateLimiter::new(
             FixedGuard::new(),
             MokaStore::new(),
@@ -245,7 +247,7 @@ impl RateLimiters {
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot
                 .obtain::<RateLimitContext>()
-                .map(|ctx| ctx.has_authorized_key())
+                .map(|ctx| ctx.is_whitelisted_ip || ctx.has_authorized_key())
                 .unwrap_or(false)
         });
         let generic_global_limiter = GlobalGenericKeyRateLimiter::new(
@@ -257,7 +259,7 @@ impl RateLimiters {
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot
                 .obtain::<RateLimitContext>()
-                .map(|ctx| !ctx.is_generic_key)
+                .map(|ctx| ctx.is_whitelisted_ip || !ctx.is_generic_key)
                 .unwrap_or(false)
         });
         let generic_per_ip_limiter = GenericKeyPerIpRateLimiter::new(
@@ -269,16 +271,22 @@ impl RateLimiters {
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot
                 .obtain::<RateLimitContext>()
-                .map(|ctx| !ctx.is_generic_key)
+                .map(|ctx| ctx.is_whitelisted_ip || !ctx.is_generic_key)
                 .unwrap_or(false)
         });
 
-        let result_limiter = Self::create_ip_rate_limiter(http_config.add_result_rate_limit);
-        let read_limiter = Self::create_ip_rate_limiter(http_config.basic_rate_limit);
-        let load_limiter = Self::create_ip_rate_limiter(http_config.load_rate_limit);
-        let leader_limiter = Self::create_ip_rate_limiter(http_config.leader_rate_limit);
-        let metric_limiter = Self::create_ip_rate_limiter(http_config.metric_rate_limit);
-        let status_limiter = Self::create_ip_rate_limiter(http_config.get_status_rate_limit);
+        let result_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.add_result_rate_limit);
+        let read_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.basic_rate_limit);
+        let load_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.load_rate_limit);
+        let leader_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.leader_rate_limit);
+        let metric_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.metric_rate_limit);
+        let status_limiter =
+            Self::create_ip_rate_limiter_with_whitelist_skip(http_config.get_status_rate_limit);
 
         Self {
             basic_limiter,
@@ -295,7 +303,7 @@ impl RateLimiters {
         }
     }
 
-    fn create_ip_rate_limiter(
+    fn create_ip_rate_limiter_with_whitelist_skip(
         quota: usize,
     ) -> RateLimiter<
         FixedGuard,
@@ -309,6 +317,12 @@ impl RateLimiters {
             CachedIpIssuer,
             BasicQuota::per_minute(quota),
         )
+        .with_skipper(|_: &mut Request, depot: &Depot| {
+            depot
+                .obtain::<RateLimitContext>()
+                .map(|ctx| ctx.is_whitelisted_ip)
+                .unwrap_or(false)
+        })
     }
 }
 

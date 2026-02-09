@@ -116,6 +116,36 @@ async fn add_task_missing_multipart_boundary() {
 }
 
 #[tokio::test]
+async fn add_task_wrong_method_honors_accept_json() {
+    let h = build_harness().await;
+    let res = TestClient::get("http://localhost/add_task")
+        .add_header("accept", "application/json", true)
+        .send(&h.service)
+        .await;
+    let (status, headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "content-type: {content_type}, body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    assert_eq!(
+        payload
+            .get("error")
+            .and_then(|v| v.get("code"))
+            .and_then(|v| v.as_u64()),
+        Some(StatusCode::METHOD_NOT_ALLOWED.as_u16() as u64)
+    );
+}
+
+#[tokio::test]
 async fn add_task_rejects_missing_prompt_and_image() {
     let h = build_harness().await;
     let res = TestClient::post("http://localhost/add_task")

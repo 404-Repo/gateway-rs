@@ -281,24 +281,9 @@ pub async fn get_status_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
-    let record_origin = normalize_origin(req, http_cfg);
     let gateway_state = state.gateway_state().clone();
-    let rate_ctx = depot.require::<RateLimitContext>()?;
 
     let status = gateway_state.task_manager().get_status(get_status.id).await;
-
-    record_task_activity(
-        TaskActivityContext {
-            gateway_state: &gateway_state,
-            rate_ctx,
-            origin: record_origin,
-            task_kind: "unknown",
-            model: None,
-            task_id: Some(get_status.id),
-        },
-        "get_status",
-    );
 
     res.render(Json(GetTaskStatusResponse::from(status)));
 

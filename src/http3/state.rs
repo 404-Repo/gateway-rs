@@ -9,7 +9,7 @@ use crate::common::queue::DupQueue;
 use crate::config::{HTTPConfig, ImageConfig, ModelConfigStore, NodeConfig, PromptConfig};
 use crate::http3::rate_limits::RateLimitService;
 use crate::http3::upload_limiter::ImageUploadLimiter;
-use crate::http3::whitelist::AddTaskWhitelist;
+use crate::http3::whitelist::RateLimitWhitelist;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 
@@ -20,7 +20,7 @@ pub struct HttpState {
     gateway_state: GatewayState,
     task_queue: DupQueue<Task>,
     metrics: Metrics,
-    add_task_whitelist: AddTaskWhitelist,
+    rate_limit_whitelist: RateLimitWhitelist,
     cluster_ips: Arc<HashSet<IpAddr>>,
     image_upload_limiter: ImageUploadLimiter,
     prompt_regex: Arc<Regex>,
@@ -33,7 +33,7 @@ pub struct HttpStateInit {
     pub gateway_state: GatewayState,
     pub task_queue: DupQueue<Task>,
     pub metrics: Metrics,
-    pub add_task_whitelist: AddTaskWhitelist,
+    pub rate_limit_whitelist: RateLimitWhitelist,
     pub cluster_ips: HashSet<IpAddr>,
     pub image_upload_limiter: ImageUploadLimiter,
     pub prompt_regex: Regex,
@@ -48,7 +48,7 @@ impl HttpState {
             gateway_state,
             task_queue,
             metrics,
-            add_task_whitelist,
+            rate_limit_whitelist,
             cluster_ips,
             image_upload_limiter,
             prompt_regex,
@@ -60,7 +60,7 @@ impl HttpState {
             gateway_state,
             task_queue,
             metrics,
-            add_task_whitelist,
+            rate_limit_whitelist,
             cluster_ips: Arc::new(cluster_ips),
             image_upload_limiter,
             prompt_regex: Arc::new(prompt_regex),
@@ -100,8 +100,8 @@ impl HttpState {
         &self.metrics
     }
 
-    pub fn add_task_whitelist(&self) -> &AddTaskWhitelist {
-        &self.add_task_whitelist
+    pub fn rate_limit_whitelist(&self) -> &RateLimitWhitelist {
+        &self.rate_limit_whitelist
     }
 
     pub fn cluster_ips(&self) -> &HashSet<IpAddr> {

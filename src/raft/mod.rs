@@ -51,7 +51,7 @@ use crate::common::cert::generate_and_create_keycert;
 use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
 use crate::common::queue::DupQueue;
-use crate::common::resolve::lookup_hosts_ips;
+use crate::common::resolve::lookup_one_ip_per_host;
 use crate::config::{ModelConfigStore, NodeConfig};
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle};
@@ -720,7 +720,7 @@ pub async fn start_gateway(
     let node_ips = if mode == GatewayMode::Single || peer_dns_names.is_empty() {
         Vec::new()
     } else {
-        lookup_hosts_ips(&peer_dns_names).await?
+        lookup_one_ip_per_host(&peer_dns_names).await?
     };
 
     if mode != GatewayMode::Single && !node_ips.is_empty() {

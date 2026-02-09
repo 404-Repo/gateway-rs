@@ -11,6 +11,6 @@ pub use crate::http3::rate_limits::{
 pub use crate::http3::response::custom_response;
 pub use crate::http3::state::{HttpState, HttpStateInit};
 pub use crate::http3::upload_limiter::ImageUploadLimiter;
-pub use crate::http3::whitelist::AddTaskWhitelist;
+pub use crate::http3::whitelist::RateLimitWhitelist;
 pub use crate::raft::gateway_state::{GatewayState, GatewayStateInit};
 pub use crate::raft::network::Network;

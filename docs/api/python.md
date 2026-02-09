@@ -113,7 +113,7 @@ headers = {"x-api-key": api_key}
 with httpx.Client(http2=True) as client:
     with open("input_2d_image.jpg", "rb") as f:
         files = {"image": f}
-        data = {"model": "404-3dgs"}  # Optional model
+        data = {"model": "404-3dgs"}  # Optional model (or "404-mesh")
         response = client.post(url, headers=headers, files=files, data=data)
     print(response.json())
 ```

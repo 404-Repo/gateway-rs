@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::api::Task;
 use crate::common::queue::DupQueue;
-use crate::common::resolve::lookup_hosts_ips;
+use crate::common::resolve::lookup_all_host_ips;
 use crate::config::{ModelConfigStore, NodeConfig};
 use crate::http3::handlers::admin::{
     admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
@@ -29,7 +29,7 @@ use crate::http3::rate_limits::{
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
 use crate::http3::upload_limiter::ImageUploadLimiter;
-use crate::http3::whitelist::AddTaskWhitelist;
+use crate::http3::whitelist::RateLimitWhitelist;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 use std::collections::HashSet;
@@ -67,7 +67,7 @@ pub struct Http3Server {
 }
 
 async fn resolve_domain_ips(domains: &[&str]) -> Result<HashSet<IpAddr>> {
-    let resolved = lookup_hosts_ips(domains).await?;
+    let resolved = lookup_all_host_ips(domains).await?;
     Ok(resolved.into_iter().collect())
 }
 
@@ -88,7 +88,7 @@ impl Http3Server {
 
         let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
         let mut domains: Vec<&str> = Vec::new();
-        for entry in &config.http.add_task_rate_limit_allowlist {
+        for entry in &config.http.rate_limit_whitelist {
             if let Ok(ip) = entry.parse::<IpAddr>() {
                 whitelist_ips.insert(ip);
             } else {
@@ -102,13 +102,13 @@ impl Http3Server {
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to resolve some add_task_rate_limit_allowlist domains: {:?}",
+                        "Failed to resolve some rate_limit_whitelist domains: {:?}",
                         e
                     );
                 }
             }
         }
-        let add_task_whitelist = AddTaskWhitelist {
+        let rate_limit_whitelist = RateLimitWhitelist {
             ips: Arc::new(whitelist_ips),
         };
 
@@ -141,7 +141,7 @@ impl Http3Server {
             gateway_state: gateway_state.clone(),
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
-            add_task_whitelist,
+            rate_limit_whitelist,
             cluster_ips,
             image_upload_limiter,
             prompt_regex,

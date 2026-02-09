@@ -36,14 +36,6 @@ async fn records_client_activity_events() {
     )
     .await;
 
-    let res = TestClient::get(format!("http://localhost/get_status?id={task_id}"))
-        .add_header("x-api-key", h.api_key.to_string(), true)
-        .add_header("x-client-origin", "api", true)
-        .send(&h.service)
-        .await;
-    let (status, _headers, _body) = read_response(res).await;
-    assert_eq!(status, StatusCode::OK);
-
     let res = TestClient::get(format!("http://localhost/get_result?id={task_id}"))
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header("x-client-origin", "api", true)
@@ -65,15 +57,6 @@ async fn records_client_activity_events() {
     assert_eq!(add_task.task_id, Some(task_id));
     assert_eq!(add_task.tool, "api");
     assert_eq!(add_task.model.as_deref(), Some("404-3dgs"));
-
-    let get_status = rows
-        .iter()
-        .find(|r| r.action == "get_status")
-        .expect("get_status");
-    assert_eq!(get_status.task_kind, "unknown");
-    assert_eq!(get_status.task_id, Some(task_id));
-    assert_eq!(get_status.tool, "api");
-    assert!(get_status.model.is_none());
 
     let get_result = rows
         .iter()

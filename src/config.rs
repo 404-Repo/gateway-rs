@@ -113,8 +113,8 @@ pub struct HTTPConfig {
     pub add_task_user_id_global_hourly_rate_limit: usize,
     pub add_task_user_id_per_user_hourly_rate_limit: usize,
     pub add_task_basic_per_ip_rate_limit: usize,
-    #[serde(default, alias = "add_task_whitelist")]
-    pub add_task_rate_limit_allowlist: HashSet<String>,
+    #[serde(alias = "add_task_whitelist", alias = "add_task_rate_limit_allowlist")]
+    pub rate_limit_whitelist: HashSet<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
     pub load_rate_limit: usize,
