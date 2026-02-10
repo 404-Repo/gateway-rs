@@ -92,7 +92,12 @@ async fn parse_add_task_multipart(
                 prompt = Some(read_text_field(field, "prompt").await?);
             }
             "image" => {
-                if image_permit.is_none() {
+                let is_whitelisted = depot
+                    .obtain::<RateLimitContext>()
+                    .map(|ctx| ctx.is_whitelisted_ip)
+                    .unwrap_or(false);
+
+                if image_permit.is_none() && !is_whitelisted {
                     image_permit = Some(upload_limiter.acquire().await?);
                 }
                 let content =

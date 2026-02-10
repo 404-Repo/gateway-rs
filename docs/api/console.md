@@ -17,12 +17,12 @@ curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -d '{"prompt": "mechanic robot"}'
 ```
 
-Optional: add `model` to select output format (example uses `404-mesh`).
+Optional: add `model` to select output format (**Note: `404-mesh` for text-to-3d will be available later**).
 ```console
 curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -H "content-type: application/json" \
      -H "x-api-key: {YOUR-API-KEY}" \
-     -d '{"prompt": "mechanic robot", "model": "404-mesh"}'
+     -d '{"prompt": "mechanic robot", "model": "404-3dgs"}'
 ```
 
 ### 2. Get task status

@@ -1,4 +1,4 @@
-use salvo::http::StatusCode;
+use salvo::http::{StatusCode, header::ACCEPT};
 use salvo::prelude::*;
 use tracing::error;
 
@@ -33,6 +33,20 @@ fn log_error(status: StatusCode, client_ip: String, req: &Request, body: &salvo:
     }
 }
 
+fn accepts_html(req: &Request) -> bool {
+    req.headers()
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|accept| {
+            accept.split(',').any(|value| {
+                let media_type = value.split(';').next().unwrap_or("").trim();
+                media_type.eq_ignore_ascii_case("text/html")
+                    || media_type.eq_ignore_ascii_case("application/xhtml+xml")
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[handler]
 pub async fn custom_response(
     req: &Request,
@@ -51,6 +65,14 @@ pub async fn custom_response(
         }
 
         if let Some(html) = error_page_for(status) {
+            // Keep explicitly-written API payloads intact.
+            let has_written_body = !res.body.is_none() && !res.body.is_error();
+            if has_written_body || res.content_type().is_some() {
+                return;
+            }
+            if !accepts_html(req) {
+                return;
+            }
             res.render(Text::Html(html));
             res.status_code(status);
             ctrl.skip_rest();

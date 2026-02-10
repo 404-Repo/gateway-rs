@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use image::{ImageFormat, Rgba, RgbaImage};
 use openraft::BasicNode;
 use regex::Regex;
+use salvo::catcher::Catcher;
 use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use salvo::test::TestClient;
@@ -32,10 +33,10 @@ use gateway::raft::store::RateLimitDelta;
 use gateway::raft::{LogStore, StateMachineStore};
 use gateway::task::TaskManager;
 use gateway::test_support::{
-    AddTaskWhitelist, GatewayState, GatewayStateInit, HttpState, HttpStateInit, ImageUploadLimiter,
-    Network, RateLimitService, add_task_handler, api_or_generic_key_check, enforce_rate_limit,
-    get_load_handler, get_result_handler, get_status_handler, get_tasks_handler, id_handler,
-    prepare_rate_limit_context, version_handler,
+    GatewayState, GatewayStateInit, HttpState, HttpStateInit, ImageUploadLimiter, Network,
+    RateLimitService, RateLimitWhitelist, add_task_handler, api_or_generic_key_check,
+    custom_response, enforce_rate_limit, get_load_handler, get_result_handler, get_status_handler,
+    get_tasks_handler, id_handler, prepare_rate_limit_context, version_handler,
 };
 
 static CRYPTO_INIT: Once = Once::new();
@@ -348,7 +349,7 @@ async fn build_harness_inner(
     });
 
     let prompt_regex = Regex::new(&config.prompt.allowed_pattern).expect("prompt regex");
-    let add_task_whitelist = AddTaskWhitelist {
+    let rate_limit_whitelist = RateLimitWhitelist {
         ips: Arc::new(StdHashSet::new()),
     };
     let image_upload_limiter = ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
@@ -359,7 +360,7 @@ async fn build_harness_inner(
         gateway_state: gateway_state.clone(),
         task_queue: task_queue.clone(),
         metrics: metrics.clone(),
-        add_task_whitelist,
+        rate_limit_whitelist,
         cluster_ips: StdHashSet::<std::net::IpAddr>::new(),
         image_upload_limiter,
         prompt_regex,
@@ -414,7 +415,7 @@ async fn build_harness_inner(
                 .get(id_handler),
         );
 
-    let service = Service::new(router);
+    let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
     TestHarness {
         service,

@@ -111,7 +111,7 @@ const apiKey = "{YOUR-API-KEY}";
 
 const form = new FormData();
 form.append("image", new Blob([await Bun.file("input_2d_image.jpg").arrayBuffer()]), "input_2d_image.jpg");
-form.append("model", "404-3dgs"); // Optional model
+form.append("model", "404-3dgs"); // Optional model (or "404-mesh")
 // Node.js alternative:
 // import fs from "node:fs";
 // form.append("image", new Blob([fs.readFileSync("input_2d_image.jpg")]), "input_2d_image.jpg");

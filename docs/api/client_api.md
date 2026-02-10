@@ -5,12 +5,11 @@ This page gives the minimal setup and where to find runnable examples.
 ## Quick start
 
 1) Get your API key: https://auth.404.xyz
-2) Pick the closest gateway and replace `{REGION}`:
-```
-EU:      gateway-eu.404.xyz
-US-EAST: gateway-us-east.404.xyz
-US-WEST: gateway-us-west.404.xyz
-```
+2) Pick the closest gateway base URL:
+
+- **EU**: `https://gateway-eu.404.xyz:4443`
+- **US-EAST**: `https://gateway-us-east.404.xyz:4443`
+- **US-WEST**: `https://gateway-us-west.404.xyz:4443`
 3) Send requests with the `x-api-key` header.
 
 ## Two pipelines
@@ -20,6 +19,7 @@ US-WEST: gateway-us-west.404.xyz
 
 You can also pass an optional `model` in `/add_task` to control the output format:
 `404-3dgs` returns SPZ by default (PLY with `compress=0`), while `404-mesh` returns GLB.
+**Note: `404-mesh` currently supports only image-to-3d (no text prompt yet).**
 
 ## Examples
 

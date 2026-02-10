@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::http3::state::HttpState;
 
 #[derive(Clone)]
-pub struct AddTaskWhitelist {
+pub struct RateLimitWhitelist {
     pub ips: Arc<HashSet<IpAddr>>,
 }
 
@@ -18,7 +18,7 @@ pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
     };
 
     if let Some(ip) = remote_ip {
-        return state.add_task_whitelist().ips.contains(&ip);
+        return state.rate_limit_whitelist().ips.contains(&ip);
     }
     false
 }

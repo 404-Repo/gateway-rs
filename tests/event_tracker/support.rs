@@ -34,8 +34,8 @@ use gateway::raft::store::RateLimitDelta;
 use gateway::raft::{LogStore, StateMachineStore};
 use gateway::task::TaskManager;
 use gateway::test_support::{
-    AddTaskWhitelist, GatewayState, GatewayStateInit, HttpState, HttpStateInit, ImageUploadLimiter,
-    Network, RateLimitContext, RateLimitService, add_result_handler, add_task_handler,
+    GatewayState, GatewayStateInit, HttpState, HttpStateInit, ImageUploadLimiter, Network,
+    RateLimitContext, RateLimitService, RateLimitWhitelist, add_result_handler, add_task_handler,
     api_or_generic_key_check, get_result_handler, get_status_handler, get_tasks_handler,
 };
 use gateway::test_support::{id_handler, version_handler};
@@ -428,7 +428,7 @@ pub(crate) async fn build_harness(
     });
 
     let prompt_regex = Regex::new(&config.prompt.allowed_pattern).expect("prompt regex");
-    let add_task_whitelist = AddTaskWhitelist {
+    let rate_limit_whitelist = RateLimitWhitelist {
         ips: Arc::new(StdHashSet::new()),
     };
     let image_upload_limiter = ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
@@ -439,7 +439,7 @@ pub(crate) async fn build_harness(
         gateway_state: gateway_state.clone(),
         task_queue: task_queue.clone(),
         metrics: metrics.clone(),
-        add_task_whitelist,
+        rate_limit_whitelist,
         cluster_ips: StdHashSet::<std::net::IpAddr>::new(),
         image_upload_limiter,
         prompt_regex,
