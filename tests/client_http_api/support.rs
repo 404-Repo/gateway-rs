@@ -476,7 +476,7 @@ pub(crate) async fn add_task_prompt(h: &TestHarness, prompt: &str, model: Option
 }
 
 pub(crate) async fn add_task_image(h: &TestHarness, image: &[u8], model: Option<&str>) -> Uuid {
-    let (boundary, body) = multipart_body(None, Some(image), model);
+    let (boundary, body) = multipart_body(None, Some(image), model, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(

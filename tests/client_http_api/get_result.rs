@@ -260,6 +260,7 @@ async fn get_result_invalid_model_config() {
             prompt: Some(Arc::new("robot".to_string())),
             image: None,
             model: Some("missing-model".to_string()),
+            seed: 0,
         })
         .await;
 

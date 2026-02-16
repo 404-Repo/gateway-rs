@@ -120,7 +120,7 @@ async fn add_task_invalid_seed_returns_bad_request() {
 #[tokio::test]
 async fn add_task_rejects_invalid_image_data() {
     let h = build_harness().await;
-    let (boundary, body) = multipart_body(None, Some(b"not-an-image"), None);
+    let (boundary, body) = multipart_body(None, Some(b"not-an-image"), None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -206,7 +206,7 @@ async fn add_task_rejects_missing_prompt_and_image() {
 async fn add_task_rejects_prompt_and_image() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None);
+    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
