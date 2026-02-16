@@ -80,6 +80,7 @@ async fn get_tasks_requested_count_zero_returns_empty() {
         prompt: Some(Arc::new("robot".to_string())),
         image: None,
         model: None,
+        seed: 1,
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);
@@ -115,6 +116,7 @@ async fn get_tasks_requested_count_large_returns_available() {
         prompt: Some(Arc::new("robot".to_string())),
         image: None,
         model: None,
+        seed: 1
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);

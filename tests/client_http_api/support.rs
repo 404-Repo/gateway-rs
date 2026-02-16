@@ -136,6 +136,7 @@ pub(crate) fn multipart_body(
     prompt: Option<&str>,
     image: Option<&[u8]>,
     model: Option<&str>,
+    seed: Option<&str>,
 ) -> (String, Vec<u8>) {
     let boundary = "XBOUNDARY123";
     let mut body = Vec::new();
@@ -178,6 +179,9 @@ pub(crate) fn multipart_body(
     }
     if let Some(img) = image {
         push_file(&mut body, boundary, "image", "image.png", "image/png", img);
+    }
+    if let Some(s) = seed {
+        push_text(&mut body, boundary, "seed", &s.to_string());
     }
 
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());

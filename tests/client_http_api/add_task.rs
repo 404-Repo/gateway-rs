@@ -52,7 +52,7 @@ async fn add_task_origin_header_success() {
 async fn add_task_image_multipart_success() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None);
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("1"));
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -71,6 +71,51 @@ async fn add_task_image_multipart_success() {
         String::from_utf8_lossy(&body)
     );
 }
+
+#[tokio::test]
+async fn add_task_without_seed_is_ok() {
+    let h = build_harness().await;
+    let image = tiny_png_bytes();
+    let (boundary, body) = multipart_body(None, Some(&image), None, None);
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "add_task body: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn add_task_invalid_seed_returns_bad_request() {
+    let h = build_harness().await;
+    let image = tiny_png_bytes();
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("not-a-number"));
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+
 
 #[tokio::test]
 async fn add_task_rejects_invalid_image_data() {
@@ -274,6 +319,7 @@ async fn add_task_rejects_when_queue_full() {
             prompt: Some(Arc::new("robot".to_string())),
             image: None,
             model: None,
+            seed: 0,
         });
     }
     let res = TestClient::post("http://localhost/add_task")

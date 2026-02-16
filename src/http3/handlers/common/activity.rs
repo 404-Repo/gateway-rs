@@ -12,6 +12,7 @@ pub struct TaskActivityContext<'a> {
     pub task_kind: &'a str,
     pub model: Option<&'a str>,
     pub task_id: Option<Uuid>,
+    pub seed: u32,
 }
 
 pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
@@ -34,6 +35,7 @@ pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
             ctx.task_kind,
             ctx.model,
             ctx.task_id,
+            ctx.seed
         );
     }
 }

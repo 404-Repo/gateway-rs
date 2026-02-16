@@ -362,6 +362,7 @@ impl GatewayState {
         task_kind: &str,
         model: Option<&str>,
         task_id: Option<Uuid>,
+        seed: u32,
     ) {
         self.internal.event_recorder.record_activity(
             user_id,
@@ -373,6 +374,7 @@ impl GatewayState {
             task_kind,
             model,
             task_id,
+            seed
         );
     }
 

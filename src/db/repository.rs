@@ -114,7 +114,8 @@ task_kind, \
 model, \
 gateway_name, \
 task_id, \
-created_at\
+created_at, \
+seed\
 ) FROM STDIN WITH (FORMAT text)";
 
     pub(super) const COPY_WORKER_EVENTS: &'static str = "\
@@ -309,6 +310,8 @@ created_at\
                         .format("%Y-%m-%d %H:%M:%S%.f")
                         .to_string();
                     append_copy_field(&mut buf, Some(created_at.as_str()));
+                    buf.push(b'\t');
+                    append_copy_field(&mut buf, Some(row.seed.to_string().as_str()));
                     buf.push(b'\n');
                 }
                 let sink = client.copy_in(Self::COPY_ACTIVITY_EVENTS).await?;

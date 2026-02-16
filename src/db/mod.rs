@@ -41,6 +41,7 @@ pub struct ActivityEventRow {
     pub gateway_name: String,
     pub task_id: Option<uuid::Uuid>,
     pub created_at: DateTime<Utc>,
+    pub seed: u32,
 }
 
 #[derive(Clone)]

@@ -9,6 +9,7 @@ use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
+    pub seed: Option<u32>,
     pub prompt: Option<String>,
     pub model: Option<String>,
 }
