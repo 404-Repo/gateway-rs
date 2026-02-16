@@ -18,7 +18,7 @@ api_key = "{YOUR-API-KEY}"
 
 url = f"https://{region}:4443/add_task"
 headers = {"content-type": "application/json", "x-api-key": api_key}
-data = {"prompt": "mechanic robot", "model": "404-3dgs"}  # Optional model
+data = {"prompt": "mechanic robot", "model": "404-3dgs", "seed": 12345}  # Optional model, optional seed
 
 with httpx.Client(http2=True) as client:
     response = client.post(url, headers=headers, json=data)
@@ -77,7 +77,7 @@ OUTPUT_FORMAT = "spz"  # or "ply"
 with httpx.Client(base_url=BASE_URL, headers={"x-api-key": API_KEY}) as client:
     task_id = client.post(
         "/add_task",
-        json={"prompt": "human with happy face", "model": "404-3dgs"},
+        json={"prompt": "human with happy face", "model": "404-3dgs", "seed": 12345},  # optional seed
     ).json()["id"]
     while True:
         try:
@@ -113,7 +113,7 @@ headers = {"x-api-key": api_key}
 with httpx.Client(http2=True) as client:
     with open("input_2d_image.jpg", "rb") as f:
         files = {"image": f}
-        data = {"model": "404-3dgs"}  # Optional model (or "404-mesh")
+        data = {"model": "404-3dgs", "seed": 12345}  # Optional model (or "404-mesh"), optional seed
         response = client.post(url, headers=headers, files=files, data=data)
     print(response.json())
 ```

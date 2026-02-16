@@ -21,6 +21,8 @@ You can also pass an optional `model` in `/add_task` to control the output forma
 `404-3dgs` returns SPZ by default (PLY with `compress=0`), while `404-mesh` returns GLB.
 **Note: `404-mesh` currently supports only image-to-3d (no text prompt yet).**
 
+Optional `seed` (integer) in `/add_task` sets the random seed for reproducible outputs; if omitted, a random seed is generated. The task’s seed is included in `/get_tasks` responses.
+
 ## Examples
 
 - Console (curl): [console.md](console.md)
