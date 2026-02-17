@@ -39,14 +39,14 @@ fn task_kind_label(task: &Task) -> &'static str {
 }
 
 struct AddTaskMultipartData {
-    seed: Option<u32>,
+    seed: Option<i32>,
     prompt: Option<String>,
     image: Option<Bytes>,
     model: Option<String>,
 }
 
 struct ValidatedAddTask {
-    seed: Option<u32>,
+    seed: Option<i32>,
     prompt: Option<String>,
     image: Option<crate::common::image::ImageValidationResult>,
     model: Option<String>,
@@ -73,7 +73,7 @@ async fn parse_add_task_multipart(
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
                 .for_field("model", 64)
-                .for_field("seed", 4),
+                .for_field("seed", 11),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
@@ -112,14 +112,7 @@ async fn parse_add_task_multipart(
                 model = Some(read_text_field(field, "model").await?);
             }
             "seed" => {
-                seed = Some(
-                    read_text_field(field, "seed")
-                        .await?
-                        .parse::<u32>()
-                        .map_err(|e| {
-                            ServerError::BadRequest(format!("Invalid seed value: {}", e))
-                        })?,
-                );
+                seed = Some(parse_seed_text(&read_text_field(field, "seed").await?)?);
             }
             _ => continue,
         }
@@ -156,9 +149,20 @@ async fn parse_add_task_request(
             prompt: add_task.prompt,
             image: None,
             model: add_task.model,
-            seed: add_task.seed,
+            seed: add_task.seed.map(|seed| seed.into_i32()),
         })
     }
+}
+
+fn parse_seed_text(seed: &str) -> Result<i32, ServerError> {
+    let seed = seed.trim();
+    if let Ok(value) = seed.parse::<i32>() {
+        return Ok(value);
+    }
+
+    seed.parse::<u32>()
+        .map(|value| value as i32)
+        .map_err(|e| ServerError::BadRequest(format!("Invalid seed value: {}", e)))
 }
 
 fn validate_add_task_input(
@@ -231,7 +235,8 @@ pub async fn add_task_handler(
     let has_prompt = validated.prompt.is_some();
     let has_image = validated.image.is_some();
     let task_kind = validated.task_kind;
-    let seed = validated.seed.unwrap_or_else(rand::random::<u32>);
+    let user_seed = validated.seed;
+    let seed = user_seed.unwrap_or_else(rand::random::<i32>);
 
     let state = depot.require::<HttpState>()?.clone();
     let queue = state.task_queue().clone();
@@ -281,10 +286,17 @@ pub async fn add_task_handler(
     queue.push(task.clone());
     metrics.set_queue_len(queue.len());
 
-    info!(
-        "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
-        task_id, model_name, record_origin, task_description
-    );
+    if let Some(user_seed) = user_seed {
+        info!(
+            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}, seed: {}",
+            task_id, model_name, record_origin, task_description, user_seed
+        );
+    } else {
+        info!(
+            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
+            task_id, model_name, record_origin, task_description
+        );
+    }
 
     gateway_state.task_manager().add_task(task).await;
 
@@ -296,7 +308,6 @@ pub async fn add_task_handler(
             task_kind: task_kind.label(),
             model: Some(model_name.as_str()),
             task_id: Some(task_id),
-            seed,
         },
         "add_task",
     );

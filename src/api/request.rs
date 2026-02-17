@@ -9,9 +9,25 @@ use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
-    pub seed: Option<u32>,
+    pub seed: Option<SeedValue>,
     pub prompt: Option<String>,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SeedValue {
+    Signed(i32),
+    Unsigned(u32),
+}
+
+impl SeedValue {
+    pub fn into_i32(self) -> i32 {
+        match self {
+            SeedValue::Signed(value) => value,
+            SeedValue::Unsigned(value) => value as i32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

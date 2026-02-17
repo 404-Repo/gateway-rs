@@ -17,7 +17,7 @@ curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -d '{"prompt": "mechanic robot"}'
 ```
 
-Optional: add `model` to select output format (**Note: `404-mesh` for text-to-3d will be available later**). Optional: add `seed` (integer) for reproducible outputs.
+Optional: add `model` to select output format (**Note: `404-mesh` for text-to-3d will be available later**). Optional: add `seed` for reproducible outputs.
 ```console
 curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -H "content-type: application/json" \
@@ -61,7 +61,7 @@ curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -H "x-api-key: {YOUR-API-KEY}"
 ```
 
-Optional: add `model` to select output format (example uses `404-mesh`). Optional: add `seed` (integer) for reproducible outputs.
+Optional: add `model` to select output format (example uses `404-mesh`). Optional: add `seed` for reproducible outputs.
 ```console
 curl --http3 -X POST "https://{REGION}:4443/add_task" \
      -F "image=@image.jpg" \

@@ -56,7 +56,6 @@ impl<S: EventSink + 'static> EventRecorder<S> {
         task_kind: &str,
         model: Option<&str>,
         task_id: Option<Uuid>,
-        seed: u32,
     ) {
         let row = ActivityEventRow {
             user_id,
@@ -70,7 +69,6 @@ impl<S: EventSink + 'static> EventRecorder<S> {
             gateway_name: self.gateway_name.to_string(),
             task_id,
             created_at: Utc::now(),
-            seed,
         };
         self.enqueue(EventRow::Activity(row));
     }

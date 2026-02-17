@@ -42,7 +42,7 @@ struct TaskState {
     assigned_workers: HashSet<Hotkey>,
     assigned_worker_ids: FoldHashMap<Hotkey, Arc<str>>,
     in_progress: FoldHashMap<Hotkey, TaskInProgressGuard>,
-    seed: Option<u32>,
+    seed: Option<i32>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -513,7 +513,9 @@ impl TaskManager {
             .and_then(|entry| entry.image.clone())
     }
 
-    pub async fn get_seed(&self, task_id: Uuid) -> Option<u32> {
+    #[cfg(feature = "test-support")]
+    #[allow(dead_code)]
+    pub async fn get_seed(&self, task_id: Uuid) -> Option<i32> {
         self.inner
             .tasks
             .get_async(&task_id)

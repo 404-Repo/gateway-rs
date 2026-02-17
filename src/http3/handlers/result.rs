@@ -4,7 +4,6 @@ use std::time::Instant;
 use anyhow::Result;
 use bytes::Bytes;
 use multer::{Constraints, Multipart};
-use rand::random;
 use salvo::prelude::*;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -81,10 +80,6 @@ pub async fn get_result_handler(
     let task_manager = gateway_state.task_manager();
     let rate_ctx = depot.require::<RateLimitContext>()?;
     let task_kind = "unknown";
-    let seed = task_manager
-        .get_seed(get_task.id)
-        .await
-        .unwrap_or_else(random::<u32>);
     record_task_activity(
         TaskActivityContext {
             gateway_state: &gateway_state,
@@ -93,7 +88,6 @@ pub async fn get_result_handler(
             task_kind,
             model: None,
             task_id: Some(get_task.id),
-            seed,
         },
         "get_result",
     );
