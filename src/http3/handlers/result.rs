@@ -84,7 +84,7 @@ pub async fn get_result_handler(
     let seed = task_manager
         .get_seed(get_task.id)
         .await
-        .unwrap_or_else(|| random::<u32>());
+        .unwrap_or_else(random::<u32>);
     record_task_activity(
         TaskActivityContext {
             gateway_state: &gateway_state,

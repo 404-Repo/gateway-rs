@@ -231,7 +231,7 @@ pub async fn add_task_handler(
     let has_prompt = validated.prompt.is_some();
     let has_image = validated.image.is_some();
     let task_kind = validated.task_kind;
-    let seed = validated.seed.unwrap_or_else(|| rand::random::<u32>());
+    let seed = validated.seed.unwrap_or_else(rand::random::<u32>);
 
     let state = depot.require::<HttpState>()?.clone();
     let queue = state.task_queue().clone();
