@@ -115,8 +115,6 @@ async fn add_task_invalid_seed_returns_bad_request() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-
-
 #[tokio::test]
 async fn add_task_rejects_invalid_image_data() {
     let h = build_harness().await;

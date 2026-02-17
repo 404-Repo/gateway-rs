@@ -73,7 +73,7 @@ async fn parse_add_task_multipart(
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
                 .for_field("model", 64)
-                .for_field("seed", 4)
+                .for_field("seed", 4),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
@@ -112,7 +112,14 @@ async fn parse_add_task_multipart(
                 model = Some(read_text_field(field, "model").await?);
             }
             "seed" => {
-                seed = Some(read_text_field(field, "seed").await?.parse::<u32>().map_err(|e| ServerError::BadRequest(format!("Invalid seed value: {}", e)))?);
+                seed = Some(
+                    read_text_field(field, "seed")
+                        .await?
+                        .parse::<u32>()
+                        .map_err(|e| {
+                            ServerError::BadRequest(format!("Invalid seed value: {}", e))
+                        })?,
+                );
             }
             _ => continue,
         }
@@ -289,7 +296,7 @@ pub async fn add_task_handler(
             task_kind: task_kind.label(),
             model: Some(model_name.as_str()),
             task_id: Some(task_id),
-            seed
+            seed,
         },
         "add_task",
     );

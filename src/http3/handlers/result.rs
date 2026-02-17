@@ -4,10 +4,10 @@ use std::time::Instant;
 use anyhow::Result;
 use bytes::Bytes;
 use multer::{Constraints, Multipart};
+use rand::random;
 use salvo::prelude::*;
 use tracing::{info, warn};
 use uuid::Uuid;
-use rand::random;
 
 use crate::api::request::{AddTaskResultRequest, GetTaskResultRequest, GetTaskStatus};
 use crate::api::response::GetTaskStatusResponse;
@@ -81,7 +81,10 @@ pub async fn get_result_handler(
     let task_manager = gateway_state.task_manager();
     let rate_ctx = depot.require::<RateLimitContext>()?;
     let task_kind = "unknown";
-    let seed = task_manager.get_seed(get_task.id).await.unwrap_or_else(|| random::<u32>());
+    let seed = task_manager
+        .get_seed(get_task.id)
+        .await
+        .unwrap_or_else(|| random::<u32>());
     record_task_activity(
         TaskActivityContext {
             gateway_state: &gateway_state,

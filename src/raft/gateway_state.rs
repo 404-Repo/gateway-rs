@@ -374,7 +374,7 @@ impl GatewayState {
             task_kind,
             model,
             task_id,
-            seed
+            seed,
         );
     }
 

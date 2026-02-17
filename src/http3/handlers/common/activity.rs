@@ -35,7 +35,7 @@ pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
             ctx.task_kind,
             ctx.model,
             ctx.task_id,
-            ctx.seed
+            ctx.seed,
         );
     }
 }
