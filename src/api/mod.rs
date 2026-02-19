@@ -26,6 +26,7 @@ pub struct Task {
     // The model selector
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    pub seed: i32,
 }
 
 pub trait HasUuid {

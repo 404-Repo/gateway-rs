@@ -39,12 +39,14 @@ fn task_kind_label(task: &Task) -> &'static str {
 }
 
 struct AddTaskMultipartData {
+    seed: Option<i32>,
     prompt: Option<String>,
     image: Option<Bytes>,
     model: Option<String>,
 }
 
 struct ValidatedAddTask {
+    seed: Option<i32>,
     prompt: Option<String>,
     image: Option<crate::common::image::ImageValidationResult>,
     model: Option<String>,
@@ -65,16 +67,18 @@ async fn parse_add_task_multipart(
     let mut image_permit: Option<OwnedSemaphorePermit> = None;
 
     let constraints = Constraints::new()
-        .allowed_fields(vec!["prompt", "image", "model"])
+        .allowed_fields(vec!["seed", "prompt", "image", "model"])
         .size_limit(
             SizeLimit::new()
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
-                .for_field("model", 64),
+                .for_field("model", 64)
+                .for_field("seed", 11),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
     let mut prompt = None;
+    let mut seed = None;
     let mut image = None;
     let mut model = None;
 
@@ -107,6 +111,9 @@ async fn parse_add_task_multipart(
             "model" => {
                 model = Some(read_text_field(field, "model").await?);
             }
+            "seed" => {
+                seed = Some(parse_seed_text(&read_text_field(field, "seed").await?)?);
+            }
             _ => continue,
         }
     }
@@ -115,6 +122,7 @@ async fn parse_add_task_multipart(
         prompt,
         image,
         model,
+        seed,
     })
 }
 
@@ -133,7 +141,7 @@ async fn parse_add_task_request(
         let boundary = parse_boundary(&content_type)?;
         parse_add_task_multipart(depot, req, boundary).await
     } else {
-        let add_task = req
+        let add_task: AddTaskRequest = req
             .parse_json::<AddTaskRequest>()
             .await
             .map_err(|e| ServerError::BadRequest(e.to_string()))?;
@@ -141,8 +149,20 @@ async fn parse_add_task_request(
             prompt: add_task.prompt,
             image: None,
             model: add_task.model,
+            seed: add_task.seed.map(|seed| seed.into_i32()),
         })
     }
+}
+
+fn parse_seed_text(seed: &str) -> Result<i32, ServerError> {
+    let seed = seed.trim();
+    if let Ok(value) = seed.parse::<i32>() {
+        return Ok(value);
+    }
+
+    seed.parse::<u32>()
+        .map(|value| value as i32)
+        .map_err(|e| ServerError::BadRequest(format!("Invalid seed value: {}", e)))
 }
 
 fn validate_add_task_input(
@@ -193,6 +213,7 @@ fn validate_add_task_input(
     };
 
     Ok(ValidatedAddTask {
+        seed: add_task.seed,
         prompt: add_task.prompt,
         image: validated_image,
         model: add_task.model,
@@ -200,9 +221,9 @@ fn validate_add_task_input(
     })
 }
 
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot"}'
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "prompt=a robot" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "image=@image.jpg" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot", "seed": 12345}'
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "prompt=a robot" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
+// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "image=@image.jpg" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
 #[handler]
 pub async fn add_task_handler(
     depot: &mut Depot,
@@ -214,6 +235,8 @@ pub async fn add_task_handler(
     let has_prompt = validated.prompt.is_some();
     let has_image = validated.image.is_some();
     let task_kind = validated.task_kind;
+    let user_seed = validated.seed;
+    let seed = user_seed.unwrap_or_else(rand::random::<i32>);
 
     let state = depot.require::<HttpState>()?.clone();
     let queue = state.task_queue().clone();
@@ -257,15 +280,23 @@ pub async fn add_task_handler(
         prompt: validated.prompt.map(Arc::new),
         image: validated.image.as_ref().map(|img| img.data.clone()),
         model: Some(resolved_model.model),
+        seed,
     };
 
     queue.push(task.clone());
     metrics.set_queue_len(queue.len());
 
-    info!(
-        "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
-        task_id, model_name, record_origin, task_description
-    );
+    if let Some(user_seed) = user_seed {
+        info!(
+            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}, seed: {}",
+            task_id, model_name, record_origin, task_description, user_seed
+        );
+    } else {
+        info!(
+            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
+            task_id, model_name, record_origin, task_description
+        );
+    }
 
     gateway_state.task_manager().add_task(task).await;
 

@@ -21,6 +21,8 @@ You can also pass an optional `model` in `/add_task` to control the output forma
 `404-3dgs` returns SPZ by default (PLY with `compress=0`), while `404-mesh` returns GLB.
 **Note: `404-mesh` currently supports only image-to-3d (no text prompt yet).**
 
+Optional `seed` in `/add_task` sets the random seed for reproducible outputs; if omitted, a random seed is generated. Seed is a signed 32-bit integer (`-2147483648..2147483647`), if you send an unsigned 32-bit integer (`0..4294967295`), it is converted to signed using two's-complement cast semantics (for example, `4294967295` becomes `-1`). The task's seed is included in `/get_tasks` responses.
+
 ## Examples
 
 - Console (curl): [console.md](console.md)

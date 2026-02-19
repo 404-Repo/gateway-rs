@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rand::Rng;
+use rand::RngExt;
 use uuid::Uuid;
 
 use super::{TaskManager, TaskStatus};
@@ -182,6 +182,7 @@ async fn image_task_persists_until_all_assignments_complete() {
         prompt: None,
         image: Some(image.clone()),
         model: Some("404-mesh".to_string()),
+        seed: 0,
     };
     task_manager.add_task(task).await;
 
@@ -263,6 +264,7 @@ async fn model_persists_until_result_retrieval() {
         prompt: Some(Arc::new("model check".to_string())),
         image: None,
         model: Some("404-3dgs".to_string()),
+        seed: 0,
     };
     task_manager.add_task(task).await;
 
@@ -324,6 +326,7 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
         prompt: Some(Arc::new("hello".to_string())),
         image: None,
         model: None,
+        seed: 0,
     };
     task_manager.add_task(task).await;
     task_manager
@@ -411,6 +414,7 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
         prompt: Some(Arc::new("batch".to_string())),
         image: None,
         model: None,
+        seed: 0,
     };
     task_manager.add_task(task).await;
 
@@ -481,6 +485,7 @@ async fn test_timeout_increments_metric() {
         prompt: None,
         image: Some(Bytes::from_static(b"")),
         model: None,
+        seed: 0,
     };
     task_manager.add_task(task).await;
 

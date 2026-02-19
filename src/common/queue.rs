@@ -225,6 +225,7 @@ mod tests {
             prompt: Some(Arc::new(prompt.to_string())),
             image: None,
             model: None,
+            seed: 0,
         }
     }
 
@@ -283,12 +284,14 @@ mod tests {
             prompt: Some(Arc::new("Task A".to_string())),
             image: None,
             model: Some("404-3dgs".to_string()),
+            seed: 0,
         };
         let task_b = Task {
             id: Uuid::new_v4(),
             prompt: Some(Arc::new("Task B".to_string())),
             image: None,
             model: Some("404-mesh".to_string()),
+            seed: 0,
         };
 
         queue.push(task_a.clone());

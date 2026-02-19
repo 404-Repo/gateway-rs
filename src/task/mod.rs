@@ -42,6 +42,7 @@ struct TaskState {
     assigned_workers: HashSet<Hotkey>,
     assigned_worker_ids: FoldHashMap<Hotkey, Arc<str>>,
     in_progress: FoldHashMap<Hotkey, TaskInProgressGuard>,
+    seed: Option<i32>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -109,6 +110,7 @@ impl TaskState {
             assigned_workers: HashSet::default(),
             assigned_worker_ids: FoldHashMap::default(),
             in_progress: FoldHashMap::default(),
+            seed: Some(task.seed),
         }
     }
 
@@ -128,6 +130,7 @@ impl TaskState {
             assigned_workers: HashSet::default(),
             assigned_worker_ids: FoldHashMap::default(),
             in_progress: FoldHashMap::default(),
+            seed: None,
         }
     }
 }
@@ -444,6 +447,7 @@ impl TaskManager {
                 state.model = task.model.clone();
                 state.execution_start = Some(now);
                 state.task_expires_at = Some(now + self.inner.result_lifetime);
+                state.seed = Some(task.seed);
             }
             Entry::Vacant(entry) => {
                 entry.insert_entry(TaskState::new(&task, now, self.inner.result_lifetime));
@@ -507,6 +511,16 @@ impl TaskManager {
             .get_async(&task_id)
             .await
             .and_then(|entry| entry.image.clone())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[allow(dead_code)]
+    pub async fn get_seed(&self, task_id: Uuid) -> Option<i32> {
+        self.inner
+            .tasks
+            .get_async(&task_id)
+            .await
+            .and_then(|entry| entry.seed)
     }
 
     pub async fn get_time(&self, task_id: Uuid) -> Option<f64> {

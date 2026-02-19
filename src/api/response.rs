@@ -148,6 +148,7 @@ mod tests {
             prompt: Some(Arc::new("mechanic robot".to_string())),
             image: None,
             model: Some("404-3dgs".to_string()),
+            seed: 0,
         };
 
         let resp = GetTasksResponse {
@@ -158,7 +159,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"prompt\":\"mechanic robot\",\"model\":\"404-3dgs\"}],\"gateways\":[]}"
+            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"prompt\":\"mechanic robot\",\"model\":\"404-3dgs\",\"seed\":0}],\"gateways\":[]}"
         );
     }
 
@@ -173,6 +174,7 @@ mod tests {
             prompt: None,
             image: Some(Bytes::from(vec![1u8, 2u8, 3u8])),
             model: Some("404-mesh".to_string()),
+            seed: 0,
         };
 
         let resp = GetTasksResponse {
@@ -183,7 +185,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174001\",\"image\":\"AQID\",\"model\":\"404-mesh\"}],\"gateways\":[]}"
+            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174001\",\"image\":\"AQID\",\"model\":\"404-mesh\",\"seed\":0}],\"gateways\":[]}"
         );
     }
 }

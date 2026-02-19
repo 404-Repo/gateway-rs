@@ -20,7 +20,7 @@ const res = await fetch(`https://${region}:4443/add_task`, {
     "content-type": "application/json",
     "x-api-key": apiKey,
   },
-  body: JSON.stringify({ prompt: "mechanic robot", model: "404-3dgs" }), // Optional model
+  body: JSON.stringify({ prompt: "mechanic robot", model: "404-3dgs", seed: 12345 }), // Optional model, optional seed
 });
 
 const json = await res.json();
@@ -74,7 +74,7 @@ const addRes = await fetch(`${BASE_URL}/add_task`, {
     "content-type": "application/json",
     "x-api-key": API_KEY,
   },
-  body: JSON.stringify({ prompt: "human with happy face", model: "404-3dgs" }),
+  body: JSON.stringify({ prompt: "human with happy face", model: "404-3dgs", seed: 12345 }), // optional seed
 });
 const { id: taskId } = await addRes.json();
 
@@ -112,6 +112,7 @@ const apiKey = "{YOUR-API-KEY}";
 const form = new FormData();
 form.append("image", new Blob([await Bun.file("input_2d_image.jpg").arrayBuffer()]), "input_2d_image.jpg");
 form.append("model", "404-3dgs"); // Optional model (or "404-mesh")
+form.append("seed", "12345"); // Optional seed for reproducibility
 // Node.js alternative:
 // import fs from "node:fs";
 // form.append("image", new Blob([fs.readFileSync("input_2d_image.jpg")]), "input_2d_image.jpg");

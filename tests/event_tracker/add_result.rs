@@ -217,6 +217,7 @@ async fn add_result_not_assigned_returns_unauthorized() {
             prompt: Some(std::sync::Arc::new("robot".to_string())),
             image: None,
             model: None,
+            seed: 0,
         })
         .await;
 
