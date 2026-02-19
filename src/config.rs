@@ -108,12 +108,18 @@ pub struct HTTPConfig {
     // Rate limits
     pub basic_rate_limit: usize,
     pub update_key_rate_limit: usize,
-    pub add_task_generic_global_hourly_rate_limit: usize,
-    pub add_task_generic_per_ip_hourly_rate_limit: usize,
-    pub add_task_user_id_global_hourly_rate_limit: usize,
-    pub add_task_user_id_per_user_hourly_rate_limit: usize,
-    pub add_task_basic_per_ip_rate_limit: usize,
-    #[serde(alias = "add_task_whitelist", alias = "add_task_rate_limit_allowlist")]
+    // /add_task: valid generic key (http.generic_key) global hourly cap,
+    // aggregated across all source IP addresses.
+    pub add_task_generic_key_global_hourly_rate_limit: usize,
+    // /add_task: valid generic key (http.generic_key) per-source-IP hourly cap.
+    pub add_task_generic_key_per_ip_hourly_rate_limit: usize,
+    // /add_task: valid non-company user key per-user hourly cap (distributed).
+    pub add_task_authenticated_per_user_hourly_rate_limit: usize,
+    // /add_task: unauthorized attempts per-source-IP hourly cap.
+    // Unauthorized means missing/invalid/unknown API key.
+    // There is no separate global cap for unauthorized traffic.
+    pub add_task_unauthorized_per_ip_hourly_rate_limit: usize,
+    // IP allowlist for rate limiting only; authentication still applies.
     pub rate_limit_whitelist: HashSet<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,

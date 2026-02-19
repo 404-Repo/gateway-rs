@@ -25,6 +25,7 @@ use crate::http3::handlers::common::origin::normalize_origin;
 use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_worker_request};
 use crate::http3::rate_limits::RateLimitContext;
 use crate::http3::state::HttpState;
+use crate::raft::gateway_state::WorkerEventRef;
 use crate::task::AddResultError;
 use async_zip::ZipEntryBuilder;
 use async_zip::base::write::ZipFileWriter;
@@ -522,17 +523,17 @@ pub async fn add_result_handler(
     };
     let reason = outcome.reason.as_deref();
 
-    gateway_state.record_worker_event(
-        Some(task_id),
-        Some(outcome.worker_id.as_ref()),
-        if outcome.is_success {
+    gateway_state.record_worker_event(WorkerEventRef {
+        task_id: Some(task_id),
+        worker_id: Some(outcome.worker_id.as_ref()),
+        action: if outcome.is_success {
             "result_success"
         } else {
             "result_failure"
         },
-        task_kind.label(),
+        task_kind: task_kind.label(),
         reason,
-    );
+    });
 
     if outcome.is_success {
         info!(

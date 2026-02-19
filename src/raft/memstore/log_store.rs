@@ -17,6 +17,7 @@ use openraft::StorageIOError;
 use openraft::Vote;
 
 use super::persistence::{PersistedLogState, TypeConfigLogPersistence};
+use crate::raft::NodeId;
 use crate::raft::TypeConfig;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
@@ -36,10 +37,6 @@ pub enum PersistOp<C: RaftTypeConfig> {
     Append(Vec<C::Entry>),
 }
 
-type PersistFn<C> = dyn Fn(PersistOp<C>) -> Result<(), Box<StorageError<<C as RaftTypeConfig>::NodeId>>>
-    + Send
-    + Sync;
-
 enum PersistMsg<C: RaftTypeConfig> {
     Op(
         PersistOp<C>,
@@ -47,6 +44,10 @@ enum PersistMsg<C: RaftTypeConfig> {
     ),
     Shutdown,
 }
+
+type PersistOpResult = Result<(), Box<StorageError<NodeId>>>;
+type PersistResultTx = oneshot::Sender<PersistOpResult>;
+type PersistBatchItem = (PersistOp<TypeConfig>, PersistResultTx);
 
 struct PersistenceWorker<C: RaftTypeConfig> {
     tx: std::sync::mpsc::Sender<PersistMsg<C>>,
@@ -286,6 +287,43 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         Ok(self.vote.clone())
     }
 
+    fn validate_append_batch(
+        &self,
+        entries: &[C::Entry],
+    ) -> Result<(), Box<StorageError<C::NodeId>>> {
+        let mut base = self.base_index;
+        let mut len = self.log.len() as u64;
+        let mut has_data = !self.log.is_empty();
+
+        for entry in entries {
+            let idx = entry.get_log_id().index;
+            if !has_data {
+                base = idx;
+                len = 1;
+                has_data = true;
+                continue;
+            }
+
+            let next_index = base + len;
+            let is_prepend = idx.checked_add(1) == Some(base);
+            if idx == next_index || is_prepend {
+                if is_prepend {
+                    base = idx;
+                }
+                len += 1;
+            } else if idx >= base && idx < next_index {
+                // Overwrite in-place is allowed.
+            } else {
+                let io_err = IoError::other(format!(
+                    "log gap detected while appending index {idx} (window [{base}, {next_index}))"
+                ));
+                return Err(Box::new(StorageIOError::write_logs(&io_err).into()));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn append<I>(&mut self, entries: I) -> Result<(), StorageError<C::NodeId>>
     where
         I: IntoIterator<Item = C::Entry>,
@@ -302,7 +340,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
             let next_index = base + self.log.len() as u64;
             if idx == next_index {
                 self.log.push_back(entry);
-            } else if idx + 1 == base {
+            } else if idx.checked_add(1) == Some(base) {
                 self.base_index = idx;
                 self.log.push_front(entry);
             } else if idx >= base && idx < next_index {
@@ -428,59 +466,138 @@ impl<C: RaftTypeConfig> LogStore<C> {
             Err(StorageIOError::write_logs(&io_err).into())
         }
     }
+
+    async fn append_batch(&self, batch: Vec<C::Entry>) -> Result<(), StorageError<C::NodeId>>
+    where
+        C::Entry: Clone,
+    {
+        {
+            let inner = self.inner.lock().await;
+            inner.validate_append_batch(&batch).map_err(|e| *e)?;
+        }
+
+        let op = self.persist_op_if_needed(Some(PersistOp::Append(batch.clone())));
+        self.persist_if_needed(op).await?;
+
+        let mut inner = self.inner.lock().await;
+        inner.append(batch).await
+    }
 }
 
 impl PersistedLogState {
-    fn into_inner(self) -> LogStoreInner<TypeConfig> {
+    fn try_into_inner(self) -> anyhow::Result<LogStoreInner<TypeConfig>> {
         let mut log = VecDeque::with_capacity(self.log.len());
         let mut base_index = 0;
+        let mut prev_index: Option<u64> = None;
         for entry in self.log {
             let idx = entry.get_log_id().index;
             if log.is_empty() {
                 base_index = idx;
             } else {
-                let expected = base_index + log.len() as u64;
-                debug_assert!(
-                    idx == expected,
-                    "persisted log is not contiguous (expected {expected}, got {idx})"
-                );
+                let Some(prev) = prev_index else {
+                    return Err(anyhow::anyhow!("persisted log contiguity check failed"));
+                };
+                let Some(expected) = prev.checked_add(1) else {
+                    return Err(anyhow::anyhow!(
+                        "persisted log contains index overflow after {prev}"
+                    ));
+                };
+                if idx != expected {
+                    return Err(anyhow::anyhow!(
+                        "persisted log is not contiguous (expected {expected}, got {idx})"
+                    ));
+                }
             }
+            prev_index = Some(idx);
             log.push_back(entry);
         }
-        LogStoreInner {
+        Ok(LogStoreInner {
             last_purged_log_id: self.last_purged_log_id,
             log,
             base_index,
             committed: self.committed,
             vote: self.vote,
-        }
+        })
     }
 }
 
 impl LogStore<TypeConfig> {
+    const MAX_PERSIST_BATCH: usize = 128;
+
+    fn persist_single_op(
+        persistence: &TypeConfigLogPersistence,
+        op: PersistOp<TypeConfig>,
+    ) -> PersistOpResult {
+        use PersistOp::*;
+
+        let io_res = match op {
+            VoteSet(v) => persistence.append_vote(&v),
+            CommittedSet(c) => persistence.append_committed(&c),
+            PurgeTo(id) => persistence.append_purge_to(&id),
+            TruncateFrom(start) => persistence.append_truncate_from(start),
+            Append(entries) => persistence.append_append(&entries),
+        };
+        io_res.map_err(|e| Box::new(StorageIOError::write_logs(&e).into()))
+    }
+
+    fn send_op_result(tx: PersistResultTx, result: PersistOpResult) {
+        let _ = tx.send(result);
+    }
+
+    fn send_op_error(tx: PersistResultTx, message: &str) {
+        let io_err = IoError::other(message.to_string());
+        let _ = tx.send(Err(Box::new(StorageIOError::write_logs(&io_err).into())));
+    }
+
+    fn process_persist_batch(persistence: &TypeConfigLogPersistence, batch: Vec<PersistBatchItem>) {
+        let mut iter = batch.into_iter().peekable();
+
+        while let Some((op, tx)) = iter.next() {
+            match op {
+                PersistOp::Append(mut merged_entries) => {
+                    let mut responders = vec![tx];
+
+                    while let Some((PersistOp::Append(_), _)) = iter.peek() {
+                        if let Some((PersistOp::Append(next_entries), next_tx)) = iter.next() {
+                            merged_entries.extend(next_entries);
+                            responders.push(next_tx);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let persist_result =
+                        Self::persist_single_op(persistence, PersistOp::Append(merged_entries));
+                    match persist_result {
+                        Ok(()) => {
+                            for responder in responders {
+                                Self::send_op_result(responder, Ok(()));
+                            }
+                        }
+                        Err(err) => {
+                            let err_msg = err.to_string();
+                            for responder in responders {
+                                Self::send_op_error(responder, &err_msg);
+                            }
+                        }
+                    }
+                }
+                other => {
+                    let res = Self::persist_single_op(persistence, other);
+                    Self::send_op_result(tx, res);
+                }
+            }
+        }
+    }
+
     fn from_persistence_instance(
         persistence: Arc<TypeConfigLogPersistence>,
         flush_interval: Duration,
     ) -> anyhow::Result<Self> {
         let initial_inner = if let Some(persisted) = persistence.load()? {
-            persisted.into_inner()
+            persisted.try_into_inner()?
         } else {
             LogStoreInner::default()
-        };
-
-        let persistence_fn: Arc<PersistFn<TypeConfig>> = {
-            let persistence = Arc::clone(&persistence);
-            Arc::new(move |op: PersistOp<TypeConfig>| {
-                use PersistOp::*;
-                let io_res = match op {
-                    VoteSet(v) => persistence.append_vote(&v),
-                    CommittedSet(c) => persistence.append_committed(&c),
-                    PurgeTo(id) => persistence.append_purge_to(&id),
-                    TruncateFrom(start) => persistence.append_truncate_from(start),
-                    Append(entries) => persistence.append_append(&entries),
-                };
-                io_res.map_err(|e| Box::new(StorageIOError::write_logs(&e).into()))
-            })
         };
 
         // Create a single background worker thread to handle all persistence ops
@@ -489,22 +606,61 @@ impl LogStore<TypeConfig> {
             std::sync::mpsc::Receiver<PersistMsg<TypeConfig>>,
         ) = std::sync::mpsc::channel();
 
-        let worker_fn = Arc::clone(&persistence_fn);
         let persistence_flush = Arc::clone(&persistence);
+        let persistence_for_ops = Arc::clone(&persistence);
         let handle = thread::spawn(move || {
             loop {
                 match op_rx.recv_timeout(flush_interval) {
                     Ok(PersistMsg::Op(op, resp_tx)) => {
-                        let res = (worker_fn)(op);
-                        let _ = resp_tx.send(res);
+                        let mut batch = vec![(op, resp_tx)];
+                        let mut should_shutdown = false;
+
+                        while batch.len() < Self::MAX_PERSIST_BATCH {
+                            match op_rx.try_recv() {
+                                Ok(PersistMsg::Op(next_op, next_tx)) => {
+                                    batch.push((next_op, next_tx));
+                                }
+                                Ok(PersistMsg::Shutdown) => {
+                                    should_shutdown = true;
+                                    break;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    should_shutdown = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        Self::process_persist_batch(&persistence_for_ops, batch);
+
+                        if should_shutdown {
+                            if let Err(err) = persistence_flush.flush_if_dirty() {
+                                warn!("log persistence flush failed during shutdown: {}", err);
+                            }
+                            break;
+                        }
                     }
-                    Ok(PersistMsg::Shutdown) => break,
+                    Ok(PersistMsg::Shutdown) => {
+                        if let Err(err) = persistence_flush.flush_if_dirty() {
+                            warn!("log persistence flush failed during shutdown: {}", err);
+                        }
+                        break;
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if let Err(err) = persistence_flush.flush_if_dirty() {
                             warn!("log persistence flush failed: {}", err);
                         }
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if let Err(err) = persistence_flush.flush_if_dirty() {
+                            warn!(
+                                "log persistence flush failed after worker channel disconnect: {}",
+                                err
+                            );
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -625,13 +781,9 @@ mod impl_log_store {
         where
             I: IntoIterator<Item = C::Entry>,
         {
-            // Collect entries once. Persist first, then update memory.
             let batch: Vec<C::Entry> = entries.into_iter().collect();
-            let op = self.persist_op_if_needed(Some(super::PersistOp::Append(batch.clone())));
-            match self.persist_if_needed(op).await {
+            match self.append_batch(batch).await {
                 Ok(()) => {
-                    let mut inner = self.inner.lock().await;
-                    inner.append(batch).await?;
                     callback.log_io_completed(Ok(()));
                     Ok(())
                 }
@@ -667,219 +819,5 @@ mod impl_log_store {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::raft::TypeConfig;
-    use crate::raft::test_utils::unique_path;
-    use openraft::Entry;
-    use openraft::EntryPayload;
-    use openraft::LeaderId;
-    use std::fs;
-    use std::time::{Duration, Instant};
-    use tempfile::tempdir;
-    use tokio::time::sleep;
-
-    fn blank_entry(leader: LeaderId<u64>, idx: u64) -> Entry<TypeConfig> {
-        Entry {
-            log_id: LogId::new(leader, idx),
-            payload: EntryPayload::Blank,
-        }
-    }
-
-    fn log_has_index(inner: &LogStoreInner<TypeConfig>, index: u64) -> bool {
-        if inner.log.is_empty() {
-            return false;
-        }
-        let base = inner.base_index;
-        let last_exclusive = base + inner.log.len() as u64;
-        index >= base && index < last_exclusive
-    }
-
-    #[tokio::test]
-    async fn persists_and_recovers_log_store() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let log_path = unique_path(tmp_dir.path(), "log_store_persist_recover_", ".bin");
-
-        let log_store = LogStore::with_persistence(&log_path)?;
-
-        // Mutate in-memory and persist per-op without cloning the entire store
-        let log_id = LogId::new(LeaderId::new(1, 1), 1);
-        let entry = blank_entry(LeaderId::new(1, 1), 1);
-        {
-            let mut guard = log_store.inner.lock().await;
-            guard
-                .append(vec![entry.clone()])
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            guard.committed = Some(log_id);
-            guard.last_purged_log_id = Some(LogId::new(LeaderId::new(1, 1), 0));
-            guard.vote = Some(Vote::new(1, 1));
-        }
-        // Persist each change as diff ops
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![entry]))),
-            )
-            .await?;
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::CommittedSet(Some(log_id)))),
-            )
-            .await?;
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::PurgeTo(LogId::new(
-                    LeaderId::new(1, 1),
-                    0,
-                )))),
-            )
-            .await?;
-        log_store
-            .persist_if_needed(
-                log_store
-                    .persist_op_if_needed(Some(super::PersistOp::VoteSet(Some(Vote::new(1, 1))))),
-            )
-            .await?;
-
-        drop(log_store);
-
-        let restored = LogStore::with_persistence(&log_path)?;
-        let guard = restored.inner.lock().await;
-        assert_eq!(guard.log.len(), 1);
-        assert!(log_has_index(&guard, 1));
-        assert_eq!(guard.committed.unwrap().index, 1);
-        assert_eq!(guard.last_purged_log_id.unwrap().index, 0);
-        assert_eq!(guard.vote.unwrap().leader_id().node_id, 1);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn recovers_from_archive_when_primary_corrupted() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let log_path = unique_path(tmp_dir.path(), "log_store_recover_archive_", ".bin");
-        let persistence = TypeConfigLogPersistence::new(&log_path)?;
-
-        let log_id = LogId::new(LeaderId::new(1, 1), 7);
-        let entry = blank_entry(LeaderId::new(1, 1), 7);
-        // Write using diff-only append methods
-        persistence.append_append(&[entry])?;
-        persistence.append_committed(&Some(log_id))?;
-
-        let archive_path = unique_path(tmp_dir.path(), "log_store_backup_test_", ".bin.zst");
-        let archive_bytes = fs::read(&log_path)?;
-        fs::write(&archive_path, &archive_bytes)?;
-
-        fs::write(&log_path, b"corrupted-log-store-bytes")?;
-
-        let restored = LogStore::with_persistence(&log_path)?;
-        let guard = restored.inner.lock().await;
-        assert_eq!(guard.log.len(), 1);
-        assert!(log_has_index(&guard, log_id.index));
-        assert_eq!(guard.committed.unwrap(), log_id);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn truncate_removes_boundary_entry() -> anyhow::Result<()> {
-        let mut inner = LogStoreInner::<TypeConfig>::default();
-        let leader = LeaderId::new(1, 1);
-        let entry1 = blank_entry(leader, 5);
-        let entry2 = blank_entry(leader, 6);
-        inner.append(vec![entry1.clone(), entry2]).await?;
-
-        inner.truncate(entry1.log_id).await?;
-
-        assert!(!log_has_index(&inner, entry1.log_id.index));
-        assert!(!log_has_index(&inner, entry1.log_id.index + 1));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn purge_rewrites_persistent_log_store() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let log_path = unique_path(tmp_dir.path(), "log_store_purge_rewrites_", ".bin");
-
-        let log_store = LogStore::with_persistence(&log_path)?;
-        let leader = LeaderId::new(1, 1);
-
-        let entry1 = blank_entry(leader, 1);
-        let entry2 = blank_entry(leader, 2);
-
-        {
-            let mut guard = log_store.inner.lock().await;
-            guard
-                .append(vec![entry1.clone(), entry2.clone()])
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
-
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![
-                    entry1.clone(),
-                    entry2.clone(),
-                ]))),
-            )
-            .await?;
-
-        let size_after_append = fs::metadata(&log_path)?.len();
-
-        let purge_id = entry1.log_id;
-        {
-            let mut guard = log_store.inner.lock().await;
-            guard.purge(purge_id).await?;
-        }
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::PurgeTo(purge_id))),
-            )
-            .await?;
-
-        let size_after_purge = fs::metadata(&log_path)?.len();
-        assert!(
-            size_after_purge < size_after_append,
-            "expected purge to rewrite log store file ({} !< {})",
-            size_after_purge,
-            size_after_append
-        );
-
-        drop(log_store);
-
-        let restored = LogStore::with_persistence(&log_path)?;
-        let guard = restored.inner.lock().await;
-        assert_eq!(guard.last_purged_log_id, Some(purge_id));
-        assert!(!log_has_index(&guard, purge_id.index));
-        assert!(log_has_index(&guard, purge_id.index + 1));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn periodic_flush_persists_append() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let log_path = unique_path(tmp_dir.path(), "log_store_periodic_flush_", ".bin");
-
-        let log_store = LogStore::with_persistence(&log_path)?;
-        let start_flushes = TypeConfigLogPersistence::flush_count();
-
-        let entry = blank_entry(LeaderId::new(1, 1), 1);
-        log_store
-            .persist_if_needed(
-                log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![entry]))),
-            )
-            .await?;
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while TypeConfigLogPersistence::flush_count() == start_flushes {
-            if Instant::now() >= deadline {
-                anyhow::bail!("periodic flush did not trigger within timeout");
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-
-        Ok(())
-    }
-}
+#[path = "../tests/memstore_log_store.rs"]
+mod tests;

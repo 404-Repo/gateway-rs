@@ -25,8 +25,6 @@ pub(crate) const LOG_STORE_ARCHIVE_SUFFIX: &str = ".bin.zst";
 const LOG_STORE_MAGIC: [u8; 8] = *b"LOGDIF01";
 const LOG_STORE_VERSION: u32 = 1;
 const LOG_STORE_HEADER_LEN: usize = LOG_STORE_MAGIC.len() + std::mem::size_of::<u32>();
-#[cfg(test)]
-static FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 // Defaults are defined in config::PersistenceConfig. These are only used to seed the
 // internal config when callers use `new()` instead of `with_config()` (e.g., tests).
 const DEFAULT_LOG_STORE_COMPACTION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
@@ -356,7 +354,13 @@ impl TypeConfigLogPersistence {
         if entries.is_empty() {
             return Ok(());
         }
-        self.persist_record(DiffRecord::Append(entries.to_vec()), false)
+        // Raft append callback may treat this as durable once append returns, thus append records
+        // must be synced before reporting completion.
+        //
+        // NOTE: force_sync = true means each append batch issues a sync_data/fsync-style
+        // syscall before returning. This is required for Raft durability semantics, but can
+        // reduce throughput and increase tail latency under sustained write load.
+        self.persist_record(DiffRecord::Append(entries.to_vec()), true)
     }
 
     fn persist_record(&self, record: DiffRecord, force_sync: bool) -> std::io::Result<()> {
@@ -491,16 +495,7 @@ impl TypeConfigLogPersistence {
             self.dirty.store(true, Ordering::Release);
             return Err(err);
         }
-        #[cfg(test)]
-        {
-            FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn flush_count() -> u64 {
-        FLUSH_COUNT.load(Ordering::Relaxed)
     }
 
     fn is_diff_format(bytes: &[u8]) -> bool {
@@ -595,116 +590,5 @@ enum DiffRecord {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::raft::TypeConfig;
-    use crate::raft::test_utils::unique_path;
-    use openraft::EntryPayload;
-    use openraft::LeaderId;
-    use openraft::LogId;
-    use openraft::Vote;
-    use tempfile::tempdir;
-
-    fn blank_entry(leader: LeaderId<u64>, idx: u64) -> Entry<TypeConfig> {
-        Entry {
-            log_id: LogId::new(leader, idx),
-            payload: EntryPayload::Blank,
-        }
-    }
-
-    #[test]
-    fn purge_rewrites_log_store_to_trimmed_state() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let path = unique_path(tmp_dir.path(), "persist_log_store_", ".bin");
-
-        let persistence = TypeConfigLogPersistence::new(&path)?;
-        let leader = LeaderId::new(1, 1);
-
-        for idx in 1..=2_000u64 {
-            let entry = blank_entry(leader, idx);
-            persistence.append_append(&[entry])?;
-        }
-
-        let size_after_append = std::fs::metadata(&path)?.len();
-
-        let purge_id = LogId::new(leader, 1_000);
-        persistence.append_purge_to(&purge_id)?;
-
-        let size_after_purge = std::fs::metadata(&path)?.len();
-        assert!(
-            size_after_purge < size_after_append,
-            "expected purge to shrink log store file ({} !< {})",
-            size_after_purge,
-            size_after_append
-        );
-
-        let reloaded = TypeConfigLogPersistence::new(&path)?;
-        let persisted = reloaded
-            .load()?
-            .expect("log store should deserialize after purge");
-
-        assert_eq!(persisted.last_purged_log_id, Some(purge_id));
-        assert!(
-            persisted
-                .log
-                .iter()
-                .all(|entry| entry.get_log_id().index > purge_id.index)
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn recover_from_truncated_tail_record() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let path = unique_path(tmp_dir.path(), "persist_log_store_truncated_", ".bin");
-
-        let mut buf = Vec::new();
-        TypeConfigLogPersistence::write_diff_header(&mut buf);
-        TypeConfigLogPersistence::append_record(
-            &mut buf,
-            &DiffRecord::VoteSet(Some(Vote::new(1, 1))),
-        )?;
-
-        let mut truncated = Vec::new();
-        let committed = LogId::new(LeaderId::new(1, 1), 42);
-        TypeConfigLogPersistence::append_record(
-            &mut truncated,
-            &DiffRecord::CommittedSet(Some(committed)),
-        )?;
-        truncated.truncate(truncated.len().saturating_sub(1));
-        buf.extend_from_slice(&truncated);
-
-        std::fs::write(&path, &buf)?;
-
-        let persistence = TypeConfigLogPersistence::new(&path)?;
-        let persisted = persistence
-            .load()?
-            .expect("log store should recover after truncated tail");
-
-        assert!(persisted.vote.is_some());
-        assert!(persisted.committed.is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn corrupted_file_is_reinitialized_on_append() -> anyhow::Result<()> {
-        let tmp_dir = tempdir()?;
-        let path = unique_path(tmp_dir.path(), "persist_log_store_corrupt_", ".bin");
-
-        std::fs::write(&path, b"not-a-log-store")?;
-
-        let persistence = TypeConfigLogPersistence::new(&path)?;
-        persistence.append_vote(&Some(Vote::new(2, 2)))?;
-
-        let reloaded = TypeConfigLogPersistence::new(&path)?;
-        let persisted = reloaded
-            .load()?
-            .expect("log store should deserialize after corruption recovery");
-
-        assert!(persisted.vote.is_some());
-
-        Ok(())
-    }
-}
+#[path = "../tests/memstore_persistence.rs"]
+mod tests;

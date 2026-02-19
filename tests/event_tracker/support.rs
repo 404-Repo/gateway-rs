@@ -1,18 +1,9 @@
-use std::collections::BTreeMap;
-use std::collections::HashSet as StdHashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64_simd::STANDARD;
 use foldhash::HashSet;
-use foldhash::fast::RandomState;
-use http::{HeaderMap, StatusCode};
-use http_body_util::BodyExt;
-use image::{ImageFormat, Rgba, RgbaImage};
-use openraft::BasicNode;
-use regex::Regex;
 use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use schnorrkel::{ExpansionMode, MiniSecretKey, context::signing_context};
@@ -21,51 +12,32 @@ use uuid::Uuid;
 
 use gateway::api::Task;
 use gateway::api::request::AddTaskResultRequest;
-use gateway::api::response::GatewayInfo;
 use gateway::common::queue::DupQueue;
-use gateway::config::{ModelConfigStore, NodeConfig};
-use gateway::crypto::crypto_provider::init_crypto_provider;
+use gateway::config::NodeConfig;
 use gateway::crypto::hotkey::Hotkey;
 use gateway::db::{
     ActivityEventRow, EventRecorder, EventSinkHandle, InMemoryEventSink, WorkerEventRow,
 };
-use gateway::metrics::Metrics;
-use gateway::raft::store::RateLimitDelta;
-use gateway::raft::{LogStore, StateMachineStore};
 use gateway::task::TaskManager;
 use gateway::test_support::{
-    GatewayState, GatewayStateInit, HttpState, HttpStateInit, ImageUploadLimiter, Network,
-    RateLimitContext, RateLimitService, RateLimitWhitelist, add_result_handler, add_task_handler,
-    api_or_generic_key_check, get_result_handler, get_status_handler, get_tasks_handler,
+    MultipartFilePart, RateLimitContext, add_result_handler, add_task_handler,
+    api_or_generic_key_check, build_multipart_form, build_shared_harness_core,
+    current_timestamp_secs, ensure_test_crypto_provider, get_result_handler, get_status_handler,
+    get_tasks_handler, load_test_single_node_config,
 };
 use gateway::test_support::{id_handler, version_handler};
 
-static CRYPTO_INIT: Once = Once::new();
+pub(crate) use crate::common::{read_response, tiny_png_bytes};
 
 const SIGNING_CTX: &[u8] = b"substrate";
 const GATEWAY_PREFIX: &str = "404_GATEWAY_";
 
 fn ensure_crypto_provider() {
-    CRYPTO_INIT.call_once(|| {
-        init_crypto_provider().expect("crypto provider init must succeed");
-    });
+    ensure_test_crypto_provider();
 }
 
 fn load_config() -> (NodeConfig, PathBuf) {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("dev-env/config/config-single.toml");
-    let contents = std::fs::read_to_string(&path).expect("read config-single.toml");
-    let config: NodeConfig = toml::from_str(&contents).expect("parse config-single.toml");
-    (config, path)
-}
-
-pub(crate) fn tiny_png_bytes() -> Vec<u8> {
-    let img = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut cursor, ImageFormat::Png)
-        .expect("encode png");
-    cursor.into_inner()
+    load_test_single_node_config()
 }
 
 pub(crate) fn sign_worker(seed: [u8; 32]) -> (Hotkey, String, String) {
@@ -90,11 +62,7 @@ pub(crate) fn sign_worker_with_timestamp(seed: [u8; 32], timestamp: &str) -> (Ho
 }
 
 pub(crate) fn current_timestamp() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_secs()
+    current_timestamp_secs()
 }
 
 pub(crate) fn multipart_add_result(
@@ -107,168 +75,70 @@ pub(crate) fn multipart_add_result(
     asset: Option<&[u8]>,
     reason: Option<&str>,
 ) -> (String, Vec<u8>) {
-    let boundary = "XBOUNDARY123";
-    let mut body = Vec::new();
-
-    fn push_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-
-    fn push_file(
-        body: &mut Vec<u8>,
-        boundary: &str,
-        name: &str,
-        filename: &str,
-        content_type: &str,
-        bytes: &[u8],
-    ) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                name, filename
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-
-    push_text(&mut body, boundary, "id", task_id.to_string().as_str());
-    push_text(&mut body, boundary, "signature", signature);
-    push_text(&mut body, boundary, "timestamp", timestamp);
-    push_text(&mut body, boundary, "worker_hotkey", worker_hotkey.as_ref());
-    push_text(&mut body, boundary, "worker_id", worker_id);
-    push_text(&mut body, boundary, "status", status);
+    let task_id_str = task_id.to_string();
+    let mut fields = vec![
+        ("id", task_id_str.as_str()),
+        ("signature", signature),
+        ("timestamp", timestamp),
+        ("worker_hotkey", worker_hotkey.as_ref()),
+        ("worker_id", worker_id),
+        ("status", status),
+    ];
     if let Some(reason) = reason {
-        push_text(&mut body, boundary, "reason", reason);
-    }
-    if let Some(asset) = asset {
-        push_file(
-            &mut body,
-            boundary,
-            "asset",
-            "result.spz",
-            "application/octet-stream",
-            asset,
-        );
+        fields.push(("reason", reason));
     }
 
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (boundary.to_string(), body)
+    let mut files = Vec::new();
+    if let Some(asset) = asset {
+        files.push(MultipartFilePart {
+            name: "asset",
+            filename: "result.spz",
+            content_type: "application/octet-stream",
+            bytes: asset,
+        });
+    }
+
+    build_multipart_form(&fields, &files)
 }
 
 pub(crate) fn multipart_add_task(prompt: Option<&str>, image: Option<&[u8]>) -> (String, Vec<u8>) {
-    let boundary = "XBOUNDARY123";
-    let mut body = Vec::new();
-
-    fn push_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-
-    fn push_file(
-        body: &mut Vec<u8>,
-        boundary: &str,
-        name: &str,
-        filename: &str,
-        content_type: &str,
-        bytes: &[u8],
-    ) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                name, filename
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-
+    let mut fields = Vec::<(&str, &str)>::new();
     if let Some(prompt) = prompt {
-        push_text(&mut body, boundary, "prompt", prompt);
+        fields.push(("prompt", prompt));
     }
+    let mut files = Vec::new();
     if let Some(image) = image {
-        push_file(
-            &mut body,
-            boundary,
-            "image",
-            "image.png",
-            "image/png",
-            image,
-        );
+        files.push(MultipartFilePart {
+            name: "image",
+            filename: "image.png",
+            content_type: "image/png",
+            bytes: image,
+        });
     }
 
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (boundary.to_string(), body)
+    build_multipart_form(&fields, &files)
 }
 
 pub(crate) fn multipart_custom(
     fields: Vec<(String, String)>,
     file: Option<(&str, &[u8])>,
 ) -> (String, Vec<u8>) {
-    let boundary = "XBOUNDARY123";
-    let mut body = Vec::new();
+    let fields_ref: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
 
-    fn push_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
-        );
-        body.extend_from_slice(value.as_bytes());
-        body.extend_from_slice(b"\r\n");
-    }
-
-    fn push_file(
-        body: &mut Vec<u8>,
-        boundary: &str,
-        name: &str,
-        filename: &str,
-        content_type: &str,
-        bytes: &[u8],
-    ) {
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                name, filename
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(b"\r\n");
-    }
-
-    for (name, value) in fields {
-        push_text(&mut body, boundary, &name, &value);
-    }
+    let mut files = Vec::new();
     if let Some((name, bytes)) = file {
-        push_file(
-            &mut body,
-            boundary,
+        files.push(MultipartFilePart {
             name,
-            "result.spz",
-            "application/octet-stream",
+            filename: "result.spz",
+            content_type: "application/octet-stream",
             bytes,
-        );
+        });
     }
 
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (boundary.to_string(), body)
+    build_multipart_form(&fields_ref, &files)
 }
 
 pub(crate) struct EventHarness {
@@ -301,23 +171,6 @@ pub(crate) async fn build_harness(
     }
     let config = Arc::new(config);
 
-    let generic_key = config.http.generic_key.unwrap_or_else(Uuid::new_v4);
-
-    let model_store = Arc::new(
-        ModelConfigStore::new(config_path, config.model_config.clone())
-            .await
-            .expect("model store"),
-    );
-
-    let metrics = Metrics::new(0.05).expect("metrics");
-
-    let task_queue: DupQueue<Task> = DupQueue::<Task>::builder()
-        .dup(config.basic.unique_workers_per_task)
-        .ttl(config.basic.taskqueue_task_ttl)
-        .cleanup_interval(config.basic.taskqueue_cleanup_interval)
-        .build();
-
-    let db = Arc::new(gateway::db::Database::new_mock());
     let shutdown = CancellationToken::new();
 
     let event_sink = InMemoryEventSink::default();
@@ -331,120 +184,15 @@ pub(crate) async fn build_harness(
         shutdown.clone(),
     );
 
-    let key_validator = Arc::new(
-        gateway::db::ApiKeyValidator::new(
-            Arc::clone(&db),
-            Duration::from_secs(config.db.api_keys_update_interval),
-            config.db.keys_cache_ttl_sec,
-            config.db.keys_cache_initial_capacity,
-            config.db.keys_cache_max_capacity,
-            &config.http.api_key_secret,
-            config.db.deleted_keys_ttl_minutes,
-        )
-        .expect("api key validator"),
-    );
-
-    let state_machine_store = Arc::new(StateMachineStore::default());
-    {
-        let mut sm = state_machine_store.state_machine.write().await;
-        let serialized_key = rmp_serde::to_vec(&generic_key).expect("serialize key");
-        sm.data.insert("generic_key".to_string(), serialized_key);
-    }
-
-    let node_clients = scc::HashMap::with_capacity_and_hasher(1, RandomState::default());
-    let network = Network::new(Arc::new(node_clients));
-    let log_store = LogStore::default();
-    let raft_config = Arc::new(
-        openraft::Config {
-            cluster_name: config.raft.cluster_name.clone(),
-            heartbeat_interval: 100,
-            election_timeout_min: 300,
-            election_timeout_max: 600,
-            ..Default::default()
-        }
-        .validate()
-        .expect("raft config"),
-    );
-    let raft = gateway::raft::Raft::new(
-        config.network.node_id,
-        Arc::clone(&raft_config),
-        network,
-        log_store,
-        Arc::clone(&state_machine_store),
-    )
-    .await
-    .expect("raft");
-
-    let mut members = BTreeMap::new();
-    members.insert(
-        config.network.node_id,
-        BasicNode {
-            addr: format!(
-                "{}:{}",
-                config.network.external_ip, config.network.server_port
-            ),
-        },
-    );
-    let _ = raft.initialize(members).await;
-
-    let gateway_info = GatewayInfo {
-        node_id: config.network.node_id,
-        domain: config.network.domain.clone(),
-        ip: config.network.external_ip.clone(),
-        name: config.network.name.clone(),
-        http_port: config.http.port,
-        available_tasks: 0,
-        last_task_acquisition: 0,
-        last_update: 0,
-    };
-    let gateway_bytes = rmp_serde::to_vec(&gateway_info).expect("serialize gateway info");
-    {
-        let mut sm = state_machine_store.state_machine.write().await;
-        sm.data
-            .insert(config.network.node_id.to_string(), gateway_bytes);
-    }
-
-    let task_manager = TaskManager::new(
-        config.basic.taskmanager_initial_capacity,
-        config.basic.unique_workers_per_task,
-        Duration::from_secs(config.basic.taskmanager_cleanup_interval),
-        Duration::from_secs(config.basic.taskmanager_result_lifetime),
-        metrics.clone(),
-        Some(event_recorder.clone()),
+    let core = build_shared_harness_core(
+        Arc::clone(&config),
+        config_path,
+        event_recorder.clone(),
+        true,
     )
     .await;
 
-    let rate_limit_queue = Arc::new(scc::Queue::<RateLimitDelta>::default());
-
-    let gateway_state = GatewayState::new(GatewayStateInit {
-        state: Arc::clone(&state_machine_store),
-        raft,
-        last_task_acquisition: Arc::new(AtomicU64::new(0)),
-        key_validator_updater: key_validator.clone(),
-        task_manager: task_manager.clone(),
-        config: Arc::clone(&config),
-        rate_limit_queue,
-        event_recorder: event_recorder.clone(),
-    });
-
-    let prompt_regex = Regex::new(&config.prompt.allowed_pattern).expect("prompt regex");
-    let rate_limit_whitelist = RateLimitWhitelist {
-        ips: Arc::new(StdHashSet::new()),
-    };
-    let image_upload_limiter = ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
-    let (rate_limit_service, _rate_limiters) = RateLimitService::new(&config.http);
-    let state = HttpState::new(HttpStateInit {
-        config: Arc::clone(&config),
-        model_store,
-        gateway_state: gateway_state.clone(),
-        task_queue: task_queue.clone(),
-        metrics: metrics.clone(),
-        rate_limit_whitelist,
-        cluster_ips: StdHashSet::<std::net::IpAddr>::new(),
-        image_upload_limiter,
-        prompt_regex,
-        rate_limits: rate_limit_service,
-    });
+    let state = core.state;
 
     let request_size_limit = config.http.request_size_limit as usize;
     let size_limit_handler = || SecureMaxSize(request_size_limit);
@@ -497,27 +245,14 @@ pub(crate) async fn build_harness(
 
     EventHarness {
         service,
-        task_queue,
-        task_manager,
+        task_queue: core.task_queue,
+        task_manager: core.task_manager,
         event_sink,
-        key_validator,
+        key_validator: core.key_validator,
         event_recorder,
         shutdown,
-        api_key: generic_key,
+        api_key: core.generic_key,
     }
-}
-
-pub(crate) async fn read_response(res: Response) -> (StatusCode, HeaderMap, Vec<u8>) {
-    let hyper_res = res.into_hyper();
-    let status = hyper_res.status();
-    let headers = hyper_res.headers().clone();
-    let body = hyper_res
-        .into_body()
-        .collect()
-        .await
-        .expect("read body")
-        .to_bytes();
-    (status, headers, body.to_vec())
 }
 
 pub(crate) fn default_rate_ctx() -> RateLimitContext {

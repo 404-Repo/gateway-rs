@@ -1,6 +1,7 @@
 use super::store::Request;
 use super::store::{RateLimitDelta, Subject, rate_limit_key};
 use super::{NodeId, Raft, StateMachineStore};
+use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
 use crate::config::NodeConfig;
@@ -23,6 +24,26 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 type RateLimitDeltaBatch = Arc<Vec<RateLimitDelta>>;
+
+pub struct ActivityEventRef<'a> {
+    pub user_id: Option<Uuid>,
+    pub user_email: Option<&'a str>,
+    pub company_id: Option<Uuid>,
+    pub company_name: Option<&'a str>,
+    pub action: &'a str,
+    pub tool: &'a str,
+    pub task_kind: &'a str,
+    pub model: Option<&'a str>,
+    pub task_id: Option<Uuid>,
+}
+
+pub struct WorkerEventRef<'a> {
+    pub task_id: Option<Uuid>,
+    pub worker_id: Option<&'a str>,
+    pub action: &'a str,
+    pub task_kind: &'a str,
+    pub reason: Option<&'a str>,
+}
 
 #[derive(Serialize)]
 enum RateLimitRequestRef<'a> {
@@ -100,8 +121,11 @@ impl GatewayState {
         format!("{}:{}", info.ip, info.http_port)
     }
 
-    pub(crate) fn leader_write_url(&self, info: &GatewayInfo) -> String {
-        format!("https://{}:{}/write", info.domain, info.http_port)
+    fn leader_endpoint_url(&self, info: &GatewayInfo, endpoint_path: &str) -> String {
+        format!(
+            "https://{}:{}{}",
+            info.domain, info.http_port, endpoint_path
+        )
     }
 
     pub(crate) async fn build_leader_client(
@@ -131,6 +155,56 @@ impl GatewayState {
                 e
             )
         })
+    }
+
+    async fn forward_to_leader_endpoint(
+        &self,
+        current_node_id: u64,
+        endpoint_path: &str,
+        payload: Bytes,
+        admin_key: Option<&str>,
+        client: Option<&Http3Client>,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let Some(leader_id) = self.leader().await else {
+            return Err(anyhow::anyhow!("No leader elected"));
+        };
+        if leader_id == current_node_id {
+            return Ok(false);
+        }
+
+        let leader_info = self
+            .gateway(leader_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
+
+        let client_storage;
+        let client = match client {
+            Some(client) => client,
+            None => {
+                client_storage = self.build_leader_client(&leader_info).await?;
+                &client_storage
+            }
+        };
+
+        let url = self.leader_endpoint_url(&leader_info, endpoint_path);
+        let headers_vec: Vec<(&str, &str)> = admin_key
+            .map(|key| vec![("x-admin-key", key)])
+            .unwrap_or_default();
+        let extra_headers = (!headers_vec.is_empty()).then_some(headers_vec.as_slice());
+
+        match client
+            .post(&url, payload, extra_headers, Some(timeout))
+            .await
+        {
+            Ok((status, _body)) if status.is_success() => Ok(true),
+            Ok((status, body)) => Err(anyhow::anyhow!(
+                "Failed to forward to leader: {} {:?}",
+                status,
+                String::from_utf8_lossy(&body)
+            )),
+            Err(e) => Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
+        }
     }
 
     pub fn new(args: GatewayStateInit) -> Self {
@@ -221,6 +295,41 @@ impl GatewayState {
         Ok(())
     }
 
+    pub async fn submit_gateway_info_ext(
+        &self,
+        info: GatewayInfoExtRef<'_>,
+        client: Option<&Http3Client>,
+    ) -> Result<bool> {
+        let current_node_id = self.internal.config.network.node_id;
+        if self.leader().await == Some(current_node_id) {
+            self.set_gateway_info(GatewayInfoRef {
+                node_id: info.node_id,
+                domain: info.domain,
+                ip: info.ip,
+                name: info.name,
+                http_port: info.http_port,
+                available_tasks: info.available_tasks,
+                last_task_acquisition: info.last_task_acquisition,
+                last_update: info.last_update,
+            })
+            .await?;
+            return Ok(false);
+        }
+
+        let payload = rmp_serde::to_vec(&info)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize gateway info: {}", e))?;
+        let admin_key = self.admin_key();
+        self.forward_to_leader_endpoint(
+            current_node_id,
+            "/write",
+            Bytes::from(payload),
+            Some(admin_key.as_str()),
+            client,
+            Duration::from_secs(self.internal.config.http.post_timeout_sec),
+        )
+        .await
+    }
+
     pub async fn update_gateway_generic_key(
         &self,
         current_node_id: u64,
@@ -238,63 +347,24 @@ impl GatewayState {
         let serialized_key = rmp_serde::to_vec(&key_to_set)
             .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to rmp: {}", e))?;
 
-        let leader_id = self.leader().await;
-
-        if leader_id != Some(current_node_id) {
-            let leader_id = leader_id.ok_or_else(|| anyhow::anyhow!("No leader elected"))?;
-            let leader_info = self
-                .gateway(leader_id)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
-
-            let server_ip = format!("{}:{}", leader_info.ip, leader_info.http_port);
-            let url = format!(
-                "https://{}:{}/update_key",
-                leader_info.domain, leader_info.http_port
+        let payload = serde_json::to_vec(&serde_json::json!({ "generic_key": key_to_set }))
+            .map_err(|e| anyhow::anyhow!("Failed to serialize payload: {}", e))?;
+        let forwarded = self
+            .forward_to_leader_endpoint(
+                current_node_id,
+                "/update_key",
+                Bytes::from(payload),
+                admin_key,
+                None,
+                Duration::from_secs(self.internal.config.http.forward_timeout_sec),
+            )
+            .await?;
+        if forwarded {
+            info!(
+                "Gateway generic key updated (forwarded), prefix: {}",
+                Self::key_prefix(&key_to_set)
             );
-
-            let client = Http3ClientBuilder::new()
-                .server_domain(&leader_info.domain)
-                .server_ip(&server_ip)
-                .dangerous_skip_verification(self.internal.config.cert.dangerous_skip_verification)
-                .build()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to create HTTP3 client to leader: {:?}", e))?;
-
-            let payload = serde_json::to_vec(&serde_json::json!({ "generic_key": key_to_set }))
-                .map_err(|e| anyhow::anyhow!("Failed to serialize payload: {}", e))?;
-            let headers_vec: Vec<(&str, &str)> = admin_key
-                .map(|k| vec![("x-admin-key", k)])
-                .unwrap_or_default();
-            let extra_headers = (!headers_vec.is_empty()).then_some(headers_vec.as_slice());
-
-            match client
-                .post(
-                    &url,
-                    Bytes::from(payload),
-                    extra_headers,
-                    Some(Duration::from_secs(
-                        self.internal.config.http.forward_timeout_sec,
-                    )),
-                )
-                .await
-            {
-                Ok((status, _body)) if status.is_success() => {
-                    info!(
-                        "Gateway generic key updated (forwarded), prefix: {}",
-                        Self::key_prefix(&key_to_set)
-                    );
-                    return Ok(());
-                }
-                Ok((status, body)) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to forward to leader: {} {:?}",
-                        status,
-                        String::from_utf8_lossy(&body)
-                    ));
-                }
-                Err(e) => return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
-            }
+            return Ok(());
         }
 
         {
@@ -350,44 +420,28 @@ impl GatewayState {
         self.internal.rate_limit_queue.push(delta);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_activity(
-        &self,
-        user_id: Option<Uuid>,
-        user_email: Option<&str>,
-        company_id: Option<Uuid>,
-        company_name: Option<&str>,
-        action: &str,
-        tool: &str,
-        task_kind: &str,
-        model: Option<&str>,
-        task_id: Option<Uuid>,
-    ) {
+    pub fn record_activity_event(&self, event: ActivityEventRef<'_>) {
         self.internal.event_recorder.record_activity(
-            user_id,
-            user_email,
-            company_id,
-            company_name,
-            action,
-            tool,
-            task_kind,
-            model,
-            task_id,
+            event.user_id,
+            event.user_email,
+            event.company_id,
+            event.company_name,
+            event.action,
+            event.tool,
+            event.task_kind,
+            event.model,
+            event.task_id,
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_worker_event(
-        &self,
-        task_id: Option<Uuid>,
-        worker_id: Option<&str>,
-        action: &str,
-        task_kind: &str,
-        reason: Option<&str>,
-    ) {
-        self.internal
-            .event_recorder
-            .record_worker_event(task_id, worker_id, action, task_kind, reason);
+    pub fn record_worker_event(&self, event: WorkerEventRef<'_>) {
+        self.internal.event_recorder.record_worker_event(
+            event.task_id,
+            event.worker_id,
+            event.action,
+            event.task_kind,
+            event.reason,
+        );
     }
 
     pub async fn submit_rate_limit_deltas(
@@ -397,26 +451,12 @@ impl GatewayState {
     ) -> Result<()> {
         let request_id = Uuid::new_v4().as_u128();
         let current_node_id = self.internal.config.network.node_id;
+        let timeout = Duration::from_secs(self.internal.config.http.forward_timeout_sec);
 
         let forwarded = (|| async {
             if let Some(leader_id) = self.leader().await
                 && leader_id != current_node_id
             {
-                let leader_info = self
-                    .gateway(leader_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to obtain leader info: {:?}", e))?;
-
-                let client_storage;
-                let client = match client {
-                    Some(client) => client,
-                    None => {
-                        client_storage = self.build_leader_client(&leader_info).await?;
-                        &client_storage
-                    }
-                };
-                let url = self.leader_write_url(&leader_info);
-
                 let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitDeltas {
                     request_id,
                     deltas: deltas.as_slice(),
@@ -424,30 +464,16 @@ impl GatewayState {
                 .map_err(|e| anyhow::anyhow!("Failed to serialize deltas: {}", e))?;
 
                 let admin_key = self.admin_key();
-                let headers = [("x-admin-key", admin_key.as_str())];
-                match client
-                    .post(
-                        &url,
+                return self
+                    .forward_to_leader_endpoint(
+                        current_node_id,
+                        "/write",
                         Bytes::from(payload),
-                        Some(&headers),
-                        Some(Duration::from_secs(
-                            self.internal.config.http.forward_timeout_sec,
-                        )),
+                        Some(admin_key.as_str()),
+                        client,
+                        timeout,
                     )
-                    .await
-                {
-                    Ok((status, _body)) if status.is_success() => {
-                        return Ok(true);
-                    }
-                    Ok((status, body)) => {
-                        return Err(anyhow::anyhow!(
-                            "Failed to forward to leader: {} {:?}",
-                            status,
-                            String::from_utf8_lossy(&body)
-                        ));
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("Failed to forward to leader: {:?}", e)),
-                }
+                    .await;
             }
 
             Ok(false)

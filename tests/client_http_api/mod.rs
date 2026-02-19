@@ -1,3 +1,6 @@
+#[path = "../common/mod.rs"]
+mod common;
+
 mod add_task;
 mod get_result;
 mod get_status;

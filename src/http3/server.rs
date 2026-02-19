@@ -204,6 +204,12 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_task")
                     .hoop(add_task_size_limit_handler())
+                    // Order matters:
+                    // 1) unauthorized per-IP limiter
+                    // 2) auth check
+                    // 3) generic-key global limiter (all IPs combined)
+                    // 4) generic-key per-IP limiter
+                    // 5) distributed subject limiter (user/company)
                     .hoop(rate_limiters.unauthorized_only_limiter)
                     .hoop(api_or_generic_key_check)
                     .hoop(rate_limiters.generic_global_limiter)

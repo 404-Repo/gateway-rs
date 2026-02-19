@@ -15,7 +15,6 @@ use anyhow::bail;
 use backon::BackoffBuilder;
 use backon::ConstantBuilder;
 use backon::Retryable;
-use bytes::Bytes;
 use foldhash::HashMap as FoldHashMap;
 use foldhash::fast::RandomState;
 use futures_util::future::try_join_all;
@@ -138,7 +137,6 @@ impl Gateway {
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
-        let post_timeout = Duration::from_secs(config.http.post_timeout_sec);
         let update_interval = Duration::from_millis(config.basic.update_gateway_info_ms);
         let max_deltas_in_batch = config.basic.max_rate_limit_deltas_per_batch.max(1);
 
@@ -264,26 +262,9 @@ impl Gateway {
                 last_update,
             };
 
-            let payload = match rmp_serde::to_vec(&info_ext) {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("Serialization error: {:?}", e);
-                    continue;
-                }
-            };
-
-            let url = gateway_state.leader_write_url(&leader_info);
-
             if let Some(client) = client.as_ref() {
-                let admin_key = gateway_state.admin_key();
-                let headers = [("x-admin-key", admin_key.as_str())];
                 let (info_res, _) = tokio::join!(
-                    client.post(
-                        &url,
-                        Bytes::from(payload),
-                        Some(&headers),
-                        Some(post_timeout)
-                    ),
+                    gateway_state.submit_gateway_info_ext(info_ext, Some(client)),
                     Gateway::flush_rate_limit_deltas(
                         &gateway_state,
                         Arc::new(deltas),
@@ -291,13 +272,6 @@ impl Gateway {
                     )
                 );
                 match info_res {
-                    Ok((status, response)) if !status.is_success() => {
-                        error!(
-                            "Gateway info update failed with status: {}, response: {:?}",
-                            status,
-                            String::from_utf8_lossy(&response)
-                        );
-                    }
                     Ok(_) => {}
                     Err(e) => {
                         error!("Gateway info update failed: {:?}", e);
