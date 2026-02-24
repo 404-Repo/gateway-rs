@@ -102,27 +102,36 @@ pub struct NetworkConnection {
     target_node: BasicNode,
 }
 
+impl NetworkConnection {
+    async fn rpc<Err, Resp>(&self, message: RaftMessageType) -> Result<Resp, typ::RPCError<Err>>
+    where
+        Err: StdError + DeserializeOwned,
+        Resp: TryFrom<RaftMessageType, Error = ConversionError>,
+    {
+        let resp: RaftMessageType = self
+            .owner
+            .send_rpc::<typ::RaftError<Err>>(self.target, &self.target_node, message)
+            .await?;
+
+        let decoded = resp.try_into().map_err(|e: ConversionError| {
+            typ::RPCError::Network(openraft::error::NetworkError::from(
+                anyerror::AnyError::new(&e),
+            ))
+        })?;
+        Ok(decoded)
+    }
+}
+
 impl RaftNetwork<TypeConfig> for NetworkConnection {
     async fn append_entries(
         &mut self,
         req: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, typ::RPCError> {
-        let resp: RaftMessageType = self
-            .owner
-            .send_rpc(
-                self.target,
-                &self.target_node,
-                RaftMessageType::AppendEntriesRequest(req),
-            )
-            .await?;
-
-        let message = resp.try_into().map_err(|e: ConversionError| {
-            typ::RPCError::Network(openraft::error::NetworkError::from(
-                anyerror::AnyError::new(&e),
-            ))
-        })?;
-        Ok(message)
+        self.rpc::<openraft::error::Infallible, AppendEntriesResponse<NodeId>>(
+            RaftMessageType::AppendEntriesRequest(req),
+        )
+        .await
     }
 
     async fn install_snapshot(
@@ -130,21 +139,10 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, typ::RPCError<InstallSnapshotError>> {
-        let resp: RaftMessageType = self
-            .owner
-            .send_rpc(
-                self.target,
-                &self.target_node,
-                RaftMessageType::InstallSnapshotRequest(req),
-            )
-            .await?;
-
-        let message = resp.try_into().map_err(|e: ConversionError| {
-            typ::RPCError::Network(openraft::error::NetworkError::from(
-                anyerror::AnyError::new(&e),
-            ))
-        })?;
-        Ok(message)
+        self.rpc::<InstallSnapshotError, InstallSnapshotResponse<NodeId>>(
+            RaftMessageType::InstallSnapshotRequest(req),
+        )
+        .await
     }
 
     async fn vote(
@@ -152,20 +150,9 @@ impl RaftNetwork<TypeConfig> for NetworkConnection {
         req: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, typ::RPCError> {
-        let resp: RaftMessageType = self
-            .owner
-            .send_rpc(
-                self.target,
-                &self.target_node,
-                RaftMessageType::VoteRequest(req),
-            )
-            .await?;
-
-        let message = resp.try_into().map_err(|e: ConversionError| {
-            typ::RPCError::Network(openraft::error::NetworkError::from(
-                anyerror::AnyError::new(&e),
-            ))
-        })?;
-        Ok(message)
+        self.rpc::<openraft::error::Infallible, VoteResponse<NodeId>>(RaftMessageType::VoteRequest(
+            req,
+        ))
+        .await
     }
 }

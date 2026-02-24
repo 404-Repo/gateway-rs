@@ -27,6 +27,7 @@ use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_wo
 use crate::http3::rate_limits::RateLimitContext;
 use crate::http3::state::HttpState;
 use crate::metrics::TaskKind;
+use crate::raft::gateway_state::WorkerEventRef;
 
 const ASSIGNMENT_RECORD_CONCURRENCY: usize = 16;
 
@@ -421,13 +422,13 @@ pub async fn get_tasks_handler(
     }
 
     for task in &tasks {
-        gateway_state.record_worker_event(
-            Some(task.id),
-            Some(get_tasks.worker_id.as_ref()),
-            "task_assigned",
-            task_kind_label(task),
-            None,
-        );
+        gateway_state.record_worker_event(WorkerEventRef {
+            task_id: Some(task.id),
+            worker_id: Some(get_tasks.worker_id.as_ref()),
+            action: "task_assigned",
+            task_kind: task_kind_label(task),
+            reason: None,
+        });
     }
 
     metrics.set_queue_len(queue.len());

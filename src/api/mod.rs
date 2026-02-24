@@ -1,3 +1,4 @@
+pub mod gateway_info;
 pub mod request;
 pub mod response;
 

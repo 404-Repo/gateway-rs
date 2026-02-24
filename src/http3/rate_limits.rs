@@ -41,7 +41,7 @@ pub struct RateLimitPolicies {
 impl RateLimitPolicies {
     fn from_config(cfg: &HTTPConfig) -> Self {
         Self {
-            user_hourly_limit: cfg.add_task_user_id_per_user_hourly_rate_limit as u64,
+            user_hourly_limit: cfg.add_task_authenticated_per_user_hourly_rate_limit as u64,
         }
     }
 }
@@ -220,9 +220,12 @@ impl RateIssuer for CachedIpIssuer {
 pub struct RateLimiters {
     pub basic_limiter: PerIPRateLimiter,
     pub update_limiter: PerIPRateLimiter,
-    // This only prevents spam per IP (for unauthenticated users).
+    // /add_task only: applies before auth check and only for unauthorized attempts.
+    // It is strictly per source IP; there is no unauthorized global bucket.
     pub unauthorized_only_limiter: UnauthorizedOnlyRateLimiter,
+    // /add_task only: one shared bucket for generic-key requests from all IPs.
     pub generic_global_limiter: GlobalGenericKeyRateLimiter,
+    // /add_task only: generic-key bucket scoped by source IP.
     pub generic_per_ip_limiter: GenericKeyPerIpRateLimiter,
     pub read_limiter: PerIPRateLimiter,
     pub result_limiter: PerIPRateLimiter,
@@ -242,7 +245,7 @@ impl RateLimiters {
             FixedGuard::new(),
             MokaStore::new(),
             UnauthorizedOnlyIssuer,
-            BasicQuota::per_hour(http_config.add_task_basic_per_ip_rate_limit),
+            BasicQuota::per_hour(http_config.add_task_unauthorized_per_ip_hourly_rate_limit),
         )
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot
@@ -254,7 +257,8 @@ impl RateLimiters {
             FixedGuard::new(),
             MokaStore::new(),
             GlobalGenericKeyIssuer,
-            BasicQuota::per_hour(http_config.add_task_generic_global_hourly_rate_limit),
+            // One key ("g_gk"), so this quota is aggregated across all source IPs.
+            BasicQuota::per_hour(http_config.add_task_generic_key_global_hourly_rate_limit),
         )
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot
@@ -266,7 +270,7 @@ impl RateLimiters {
             FixedGuard::new(),
             MokaStore::new(),
             GenericKeyPerIpIssuer,
-            BasicQuota::per_hour(http_config.add_task_generic_per_ip_hourly_rate_limit),
+            BasicQuota::per_hour(http_config.add_task_generic_key_per_ip_hourly_rate_limit),
         )
         .with_skipper(|_: &mut Request, depot: &Depot| {
             depot

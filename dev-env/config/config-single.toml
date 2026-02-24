@@ -23,11 +23,21 @@ port = 4443
 tls_versions = ["1.2", "1.3"]
 basic_rate_limit = 30
 update_key_rate_limit = 10
-add_task_basic_per_ip_rate_limit = 50
-add_task_generic_global_hourly_rate_limit = 40
-add_task_generic_per_ip_hourly_rate_limit = 5
-add_task_user_id_global_hourly_rate_limit = 60
-add_task_user_id_per_user_hourly_rate_limit = 5
+# 1) Missing/invalid/unknown API key on /add_task:
+#    add_task_unauthorized_per_ip_hourly_rate_limit (per source IP, hourly)
+# 2) Valid generic key (http.generic_key):
+#    both add_task_generic_key_global_hourly_rate_limit
+#    (global hourly, aggregated across all source IPs)
+#    and add_task_generic_key_per_ip_hourly_rate_limit (per source IP hourly)
+# 3) Valid non-company user key:
+#    add_task_authenticated_per_user_hourly_rate_limit (per user id, hourly)
+# There is no separate unauthorized-global cap; unauthorized traffic is per-IP only.
+# Company API keys use DB-configured company hourly/daily limits instead.
+# rate_limit_whitelist skips rate limiting only; API-key validation still applies.
+add_task_unauthorized_per_ip_hourly_rate_limit = 50
+add_task_generic_key_global_hourly_rate_limit = 40
+add_task_generic_key_per_ip_hourly_rate_limit = 5
+add_task_authenticated_per_user_hourly_rate_limit = 5
 add_task_size_limit = 2097152
 load_rate_limit = 60
 leader_rate_limit = 10
@@ -124,5 +134,5 @@ allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
 [image]
 max_width = 1024
 max_height = 1024
-max_size_bytes = 2097152  # 2MB
+max_size_bytes = 2097152                 # 2MB
 allowed_formats = ["png", "jpg", "webp"]
