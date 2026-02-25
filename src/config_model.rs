@@ -1,18 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use foldhash::HashMap;
-use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
-use sdd::{AtomicOwned, Guard, Owned, Tag};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
-
-use crate::config::NodeConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelDefinition {
@@ -209,175 +199,6 @@ impl ModelConfig {
     }
 }
 
-pub async fn read_model_config_from_file<P: AsRef<Path>>(path: P) -> Result<ModelConfig> {
-    let contents = tokio::fs::read_to_string(&path).await?;
-
-    let node_config = match path.as_ref().extension().and_then(|ext| ext.to_str()) {
-        Some("toml") => toml::from_str::<NodeConfig>(&contents)?,
-        Some("json") => serde_json::from_str::<NodeConfig>(&contents)?,
-        _ => return Err(anyhow!("Unsupported file format")),
-    };
-
-    Ok(node_config.model_config)
-}
-
-fn system_time_millis(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_millis() as u64)
-}
-
-pub struct ModelConfigStore {
-    path: PathBuf,
-    inner: AtomicOwned<Arc<ModelConfig>>,
-    last_modified_millis: AtomicU64,
-    watcher_active: AtomicBool,
-}
-
-impl ModelConfigStore {
-    pub async fn new(path: PathBuf, initial: ModelConfig) -> Result<Self> {
-        initial
-            .validate()
-            .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
-        let last_modified_millis = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata
-                .modified()
-                .ok()
-                .and_then(system_time_millis)
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-
-        Ok(Self {
-            path,
-            inner: AtomicOwned::new(Arc::new(initial)),
-            last_modified_millis: AtomicU64::new(last_modified_millis),
-            watcher_active: AtomicBool::new(false),
-        })
-    }
-
-    pub async fn get(&self) -> Arc<ModelConfig> {
-        if !self.watcher_active.load(Acquire) {
-            self.maybe_reload().await;
-        }
-        let guard = Guard::new();
-        self.inner
-            .load(Acquire, &guard)
-            .as_ref()
-            .expect("model config must be initialized")
-            .clone()
-    }
-
-    pub fn start_watcher(
-        self: &Arc<Self>,
-        handle: tokio::runtime::Handle,
-    ) -> Result<ModelConfigWatcher> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
-        let store = Arc::clone(self);
-        let task_handle = handle.spawn(async move {
-            while rx.recv().await.is_some() {
-                store.reload_from_disk().await;
-            }
-            store.watcher_active.store(false, Release);
-        });
-
-        let path = self.path.clone();
-        let mut watcher =
-            recommended_watcher(move |res: notify::Result<notify::Event>| match res {
-                Ok(event) => {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let _ = tx.try_send(());
-                    }
-                }
-                Err(err) => {
-                    warn!("Model config watcher error: {}", err);
-                }
-            })?;
-
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
-        self.watcher_active.store(true, Release);
-        Ok(ModelConfigWatcher {
-            _watcher: watcher,
-            task_handle,
-        })
-    }
-
-    async fn maybe_reload(&self) {
-        let Some(modified_millis) = self.modified_millis().await else {
-            return;
-        };
-
-        let last_modified = self.last_modified_millis.load(Acquire);
-        if modified_millis <= last_modified {
-            return;
-        }
-
-        self.reload_with_millis(Some(modified_millis)).await;
-    }
-
-    async fn reload_from_disk(&self) -> bool {
-        let modified_millis = self.modified_millis().await;
-        self.reload_with_millis(modified_millis).await
-    }
-
-    async fn reload_with_millis(&self, modified_millis: Option<u64>) -> bool {
-        let config = match read_model_config_from_file(&self.path).await {
-            Ok(config) => config,
-            Err(err) => {
-                warn!(
-                    "Failed to reload model config {}: {}",
-                    self.path.display(),
-                    err
-                );
-                return false;
-            }
-        };
-
-        if let Err(err) = config.validate() {
-            warn!("Invalid model config reload: {}", err);
-            return false;
-        }
-
-        let previous = self
-            .inner
-            .swap((Some(Owned::new(Arc::new(config))), Tag::None), AcqRel)
-            .0;
-        drop(previous);
-        if let Some(modified_millis) = modified_millis {
-            self.last_modified_millis.store(modified_millis, Release);
-        }
-        true
-    }
-
-    async fn modified_millis(&self) -> Option<u64> {
-        match tokio::fs::metadata(&self.path).await {
-            Ok(metadata) => metadata.modified().ok().and_then(system_time_millis),
-            Err(err) => {
-                warn!(
-                    "Failed to stat model config {}: {}",
-                    self.path.display(),
-                    err
-                );
-                None
-            }
-        }
-    }
-}
-
-pub struct ModelConfigWatcher {
-    _watcher: notify::RecommendedWatcher,
-    task_handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for ModelConfigWatcher {
-    fn drop(&mut self) {
-        self.task_handle.abort();
-    }
-}
-
 impl fmt::Display for ModelResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -426,12 +247,190 @@ impl std::error::Error for ModelResolveError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelConfigStore, NodeConfig};
-    use anyhow::Result;
-    use std::path::PathBuf;
+    use super::ModelConfig;
+    use crate::config::NodeConfig;
+    use anyhow::{Result, anyhow};
+    use notify::{EventKind, RecursiveMode, Watcher, recommended_watcher};
+    use sdd::{AtomicOwned, Guard, Owned, Tag};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::Builder;
+    use tracing::warn;
 
     const BASE_CONFIG: &str = include_str!("../dev-env/config/config1.toml");
+
+    fn system_time_millis(time: SystemTime) -> Option<u64> {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64)
+    }
+
+    async fn read_model_config_from_file<P: AsRef<Path>>(path: P) -> Result<ModelConfig> {
+        let contents = tokio::fs::read_to_string(&path).await?;
+
+        let node_config = match path.as_ref().extension().and_then(|ext| ext.to_str()) {
+            Some("toml") => toml::from_str::<NodeConfig>(&contents)?,
+            Some("json") => serde_json::from_str::<NodeConfig>(&contents)?,
+            _ => return Err(anyhow!("Unsupported file format")),
+        };
+
+        Ok(node_config.model_config)
+    }
+
+    struct ModelConfigStore {
+        path: PathBuf,
+        inner: AtomicOwned<Arc<ModelConfig>>,
+        last_modified_millis: AtomicU64,
+        watcher_active: AtomicBool,
+    }
+
+    impl ModelConfigStore {
+        async fn new(path: PathBuf, initial: ModelConfig) -> Result<Self> {
+            initial
+                .validate()
+                .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+            let last_modified_millis = match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_millis)
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+
+            Ok(Self {
+                path,
+                inner: AtomicOwned::new(Arc::new(initial)),
+                last_modified_millis: AtomicU64::new(last_modified_millis),
+                watcher_active: AtomicBool::new(false),
+            })
+        }
+
+        async fn get(&self) -> Arc<ModelConfig> {
+            if !self.watcher_active.load(Acquire) {
+                self.maybe_reload().await;
+            }
+            let guard = Guard::new();
+            self.inner
+                .load(Acquire, &guard)
+                .as_ref()
+                .expect("model config must be initialized")
+                .clone()
+        }
+
+        #[allow(dead_code)]
+        fn start_watcher(
+            self: &Arc<Self>,
+            handle: tokio::runtime::Handle,
+        ) -> Result<ModelConfigWatcher> {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
+            let store = Arc::clone(self);
+            let task_handle = handle.spawn(async move {
+                while rx.recv().await.is_some() {
+                    store.reload_from_disk().await;
+                }
+                store.watcher_active.store(false, Release);
+            });
+
+            let path = self.path.clone();
+            let mut watcher =
+                recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+                    Ok(event) => {
+                        if matches!(
+                            event.kind,
+                            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                        ) {
+                            let _ = tx.try_send(());
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Model config watcher error: {}", err);
+                    }
+                })?;
+
+            watcher.watch(&path, RecursiveMode::NonRecursive)?;
+            self.watcher_active.store(true, Release);
+            Ok(ModelConfigWatcher {
+                _watcher: watcher,
+                task_handle,
+            })
+        }
+
+        async fn maybe_reload(&self) {
+            let Some(modified_millis) = self.modified_millis().await else {
+                return;
+            };
+
+            let last_modified = self.last_modified_millis.load(Acquire);
+            if modified_millis <= last_modified {
+                return;
+            }
+
+            self.reload_with_millis(Some(modified_millis)).await;
+        }
+
+        async fn reload_from_disk(&self) -> bool {
+            let modified_millis = self.modified_millis().await;
+            self.reload_with_millis(modified_millis).await
+        }
+
+        async fn reload_with_millis(&self, modified_millis: Option<u64>) -> bool {
+            let config = match read_model_config_from_file(&self.path).await {
+                Ok(config) => config,
+                Err(err) => {
+                    warn!(
+                        "Failed to reload model config {}: {}",
+                        self.path.display(),
+                        err
+                    );
+                    return false;
+                }
+            };
+
+            if let Err(err) = config.validate() {
+                warn!("Invalid model config reload: {}", err);
+                return false;
+            }
+
+            let previous = self
+                .inner
+                .swap((Some(Owned::new(Arc::new(config))), Tag::None), AcqRel)
+                .0;
+            drop(previous);
+            if let Some(modified_millis) = modified_millis {
+                self.last_modified_millis.store(modified_millis, Release);
+            }
+            true
+        }
+
+        async fn modified_millis(&self) -> Option<u64> {
+            match tokio::fs::metadata(&self.path).await {
+                Ok(metadata) => metadata.modified().ok().and_then(system_time_millis),
+                Err(err) => {
+                    warn!(
+                        "Failed to stat model config {}: {}",
+                        self.path.display(),
+                        err
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    struct ModelConfigWatcher {
+        _watcher: notify::RecommendedWatcher,
+        task_handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ModelConfigWatcher {
+        fn drop(&mut self) {
+            self.task_handle.abort();
+        }
+    }
 
     fn parse_node_config() -> Result<NodeConfig> {
         Ok(toml::from_str::<NodeConfig>(BASE_CONFIG)?)

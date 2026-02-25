@@ -2,6 +2,7 @@ pub mod api;
 pub mod common;
 pub mod config;
 pub mod config_model;
+pub mod config_runtime;
 pub mod crypto;
 pub mod db;
 pub mod http3;

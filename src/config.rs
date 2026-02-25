@@ -6,7 +6,7 @@ use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
-pub use crate::config_model::{ModelConfig, ModelConfigStore, ModelOutput, ModelResolveError};
+pub use crate::config_model::{ModelConfig, ModelOutput, ModelResolveError};
 use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -371,7 +371,11 @@ impl fmt::Display for NodeConfig {
 
 pub async fn read_config(path: Option<&String>) -> Result<NodeConfig> {
     let path = resolve_config_path(path)?;
-    let config = read_config_from_file(&path).await?;
+    read_config_from_path(&path).await
+}
+
+pub async fn read_config_from_path<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
+    let config = read_config_from_file(path.as_ref()).await?;
     config
         .model_config
         .validate()

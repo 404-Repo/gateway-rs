@@ -62,9 +62,10 @@ async fn parse_add_task_multipart(
     let byte_stream = multipart_stream(req);
 
     let state = depot.require::<HttpState>()?.clone();
-    let image_cfg = state.image_config();
-    let prompt_cfg = state.prompt_config();
-    let upload_limiter = state.image_upload_limiter().clone();
+    let cfg = state.config();
+    let image_cfg = cfg.image();
+    let prompt_cfg = cfg.prompt();
+    let upload_limiter = cfg.image_upload_limiter();
     let mut image_permit: Option<OwnedSemaphorePermit> = None;
 
     let constraints = Constraints::new()
@@ -171,6 +172,7 @@ fn validate_add_task_input(
     add_task: AddTaskMultipartData,
 ) -> Result<ValidatedAddTask, ServerError> {
     let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
     let has_prompt = add_task.prompt.as_ref().is_some_and(|p| !p.is_empty());
     let has_image = add_task.image.as_ref().is_some_and(|b| !b.is_empty());
     if has_prompt == has_image {
@@ -188,7 +190,7 @@ fn validate_add_task_input(
     };
 
     if let Some(prompt) = &add_task.prompt {
-        let prompt_cfg = state.prompt_config();
+        let prompt_cfg = cfg.prompt();
         let len = prompt.chars().count();
         if len < prompt_cfg.min_len {
             return Err(ServerError::BadRequest(format!(
@@ -197,7 +199,7 @@ fn validate_add_task_input(
             )));
         }
 
-        let prompt_regex = state.prompt_regex();
+        let prompt_regex = cfg.prompt_regex();
         if !prompt_regex.is_match(prompt) {
             return Err(ServerError::BadRequest(format!(
                 "Prompt contains invalid characters; allowed pattern: {}",
@@ -207,7 +209,7 @@ fn validate_add_task_input(
     }
 
     let validated_image = if let Some(image_data) = add_task.image {
-        let image_cfg = state.image_config();
+        let image_cfg = cfg.image();
         Some(validate_image(image_data, image_cfg)?)
     } else {
         None
@@ -236,13 +238,15 @@ pub async fn add_task_handler(
     let has_prompt = validated.prompt.is_some();
     let has_image = validated.image.is_some();
     let task_kind = validated.task_kind;
-    let user_seed = validated.seed;
-    let seed = user_seed.unwrap_or_else(rand::random::<i32>);
+    let user_seed = validated.seed.filter(|seed| *seed != -1);
+    // Draw from all u32 values except u32::MAX, after cast that excludes -1 sentinel.
+    let seed = user_seed.unwrap_or_else(|| rand::random_range(0..u32::MAX) as i32);
 
     let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
     let queue = state.task_queue().clone();
     let metrics = state.metrics().clone();
-    let http_cfg = state.http_config();
+    let http_cfg = cfg.http();
     let rate_ctx = depot.require::<RateLimitContext>()?;
     let record_origin = normalize_origin(req, http_cfg);
     metrics.inc_request_origin(record_origin);
@@ -251,8 +255,7 @@ pub async fn add_task_handler(
         return Err(ServerError::Internal("Task queue is full".to_string()));
     }
 
-    let model_store = Arc::clone(state.model_store());
-    let model_cfg = model_store.get().await;
+    let model_cfg = &cfg.node().model_config;
     let resolved_model = model_cfg
         .resolve_and_validate_input(validated.model.as_deref(), has_prompt, has_image)
         .map_err(|err| {
@@ -334,9 +337,9 @@ pub async fn get_tasks_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
-    let model_store = Arc::clone(state.model_store());
-    let model_cfg = model_store.get().await;
+    let cfg = state.config();
+    let http_cfg = cfg.http();
+    let model_cfg = &cfg.node().model_config;
     let gateway_state = state.gateway_state().clone();
     let queue = state.task_queue().clone();
     let metrics = state.metrics().clone();

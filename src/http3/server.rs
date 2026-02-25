@@ -1,5 +1,4 @@
 use anyhow::{Result, anyhow};
-use regex::Regex;
 use rustls::SupportedProtocolVersion;
 use salvo::catcher::Catcher;
 use salvo::conn::quinn::QuinnListener;
@@ -8,12 +7,12 @@ use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::warn;
 
 use crate::api::Task;
 use crate::common::queue::DupQueue;
-use crate::common::resolve::lookup_all_host_ips;
-use crate::config::{ModelConfigStore, NodeConfig};
+use crate::config_runtime::RuntimeConfigStore;
+use crate::http3::depot_ext::DepotExt;
+use crate::http3::error::ServerError;
 use crate::http3::handlers::admin::{
     admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
 };
@@ -24,16 +23,15 @@ use crate::http3::handlers::core::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::rate_limits::{
-    RateLimitService, RateLimiters, enforce_rate_limit, prepare_rate_limit_context,
+    basic_rate_limit, enforce_rate_limit, generic_global_rate_limit, generic_per_ip_rate_limit,
+    leader_rate_limit, load_rate_limit, metric_rate_limit, prepare_rate_limit_context,
+    read_rate_limit, result_rate_limit, status_rate_limit, unauthorized_only_rate_limit,
+    update_key_rate_limit,
 };
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
-use crate::http3::upload_limiter::ImageUploadLimiter;
-use crate::http3::whitelist::RateLimitWhitelist;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
-use std::collections::HashSet;
-use std::net::IpAddr;
 use tokio_util::sync::CancellationToken;
 
 // TLS version combinations
@@ -62,93 +60,95 @@ fn map_tls_versions_to_static(list: &[String]) -> &'static [&'static SupportedPr
     }
 }
 
+#[handler]
+async fn request_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().request_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+async fn add_task_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().add_task_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+async fn request_file_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().request_file_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+async fn raft_write_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().raft_write_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
 pub struct Http3Server {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
-async fn resolve_domain_ips(domains: &[&str]) -> Result<HashSet<IpAddr>> {
-    let resolved = lookup_all_host_ips(domains).await?;
-    Ok(resolved.into_iter().collect())
-}
-
 impl Http3Server {
     pub async fn run(
-        config: Arc<NodeConfig>,
-        model_store: Arc<ModelConfigStore>,
+        config: Arc<RuntimeConfigStore>,
         tls_config: RustlsConfig,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         metrics: Metrics,
         shutdown: CancellationToken,
     ) -> Result<Self> {
-        let addr_str = format!("{}:{}", config.network.bind_ip, config.http.port);
+        let cfg = config.snapshot();
+        let node_cfg = cfg.node();
+
+        let addr_str = format!("{}:{}", node_cfg.network.bind_ip, node_cfg.http.port);
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| anyhow!("Invalid listen address {}: {}", addr_str, e))?;
 
-        let mut whitelist_ips: HashSet<IpAddr> = HashSet::new();
-        let mut domains: Vec<&str> = Vec::new();
-        for entry in &config.http.rate_limit_whitelist {
-            if let Ok(ip) = entry.parse::<IpAddr>() {
-                whitelist_ips.insert(ip);
-            } else {
-                domains.push(entry.as_str());
-            }
-        }
-        if !domains.is_empty() {
-            match resolve_domain_ips(&domains).await {
-                Ok(resolved) => {
-                    whitelist_ips.extend(resolved);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to resolve some rate_limit_whitelist domains: {:?}",
-                        e
-                    );
-                }
-            }
-        }
-        let rate_limit_whitelist = RateLimitWhitelist {
-            ips: Arc::new(whitelist_ips),
-        };
-
-        // Resolve peer IPs for the cluster_check hoop
-        let mut cluster_ips: HashSet<IpAddr> = HashSet::new();
-        let self_domain = &config.network.domain;
-        let peer_domains: Vec<&str> = config
-            .network
-            .node_dns_names
-            .iter()
-            .map(|s| s.as_str())
-            .filter(|d| d != self_domain)
-            .collect();
-        if !peer_domains.is_empty()
-            && let Ok(resolved) = resolve_domain_ips(&peer_domains).await
-        {
-            cluster_ips.extend(resolved);
-        }
-
-        let prompt_regex = Regex::new(&config.prompt.allowed_pattern)
-            .map_err(|e| anyhow!("Invalid prompt regex: {}", e))?;
-
-        let (rate_limit_service, rate_limiters) = RateLimitService::new(&config.http);
-        let image_upload_limiter =
-            ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
-
         let state = HttpState::new(HttpStateInit {
             config: config.clone(),
-            model_store,
             gateway_state: gateway_state.clone(),
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
-            rate_limit_whitelist,
-            cluster_ips,
-            image_upload_limiter,
-            prompt_regex,
-            rate_limits: rate_limit_service,
         });
 
-        let router = Self::setup_router(state, rate_limiters)?;
+        let router = Self::setup_router(state)?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
@@ -156,7 +156,7 @@ impl Http3Server {
         const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
         // Build TCP-specific TLS versions from config (defaults to 1.2,1.3) using static slices.
-        let tcp_versions_static = map_tls_versions_to_static(&config.http.tls_versions);
+        let tcp_versions_static = map_tls_versions_to_static(&node_cfg.http.tls_versions);
         let tls_config_tcp = tls_config.clone().tls_versions(tcp_versions_static);
         let tls_config_quic = tls_config.tls_versions(TLS13_ONLY);
 
@@ -175,18 +175,11 @@ impl Http3Server {
         Ok(Self { join_handle })
     }
 
-    fn setup_router(state: HttpState, rate_limiters: RateLimiters) -> Result<Router> {
-        let compression = state.http_config().compression;
-        let compression_lvl = state.http_config().compression_lvl;
-        let request_size_limit = state.http_config().request_size_limit as usize;
-        let add_task_size_limit = state.http_config().add_task_size_limit as usize;
-        let request_file_size_limit = state.http_config().request_file_size_limit as usize;
-        let raft_write_size_limit = state.http_config().raft_write_size_limit as usize;
-
-        let size_limit_handler = || SecureMaxSize(request_size_limit);
-        let add_task_size_limit_handler = || SecureMaxSize(add_task_size_limit);
-        let file_size_limit_handler = || SecureMaxSize(request_file_size_limit);
-        let raft_write_size_limit_handler = || SecureMaxSize(raft_write_size_limit);
+    fn setup_router(state: HttpState) -> Result<Router> {
+        let cfg = state.config();
+        let http_cfg = cfg.http();
+        let compression = http_cfg.compression;
+        let compression_lvl = http_cfg.compression_lvl;
 
         let router = if compression {
             Router::new().hoop(
@@ -203,91 +196,91 @@ impl Http3Server {
             .hoop(prepare_rate_limit_context)
             .push(
                 Router::with_path("/add_task")
-                    .hoop(add_task_size_limit_handler())
+                    .hoop(add_task_size_limit)
                     // Order matters:
                     // 1) unauthorized per-IP limiter
                     // 2) auth check
                     // 3) generic-key global limiter (all IPs combined)
                     // 4) generic-key per-IP limiter
                     // 5) distributed subject limiter (user/company)
-                    .hoop(rate_limiters.unauthorized_only_limiter)
+                    .hoop(unauthorized_only_rate_limit)
                     .hoop(api_or_generic_key_check)
-                    .hoop(rate_limiters.generic_global_limiter)
-                    .hoop(rate_limiters.generic_per_ip_limiter)
+                    .hoop(generic_global_rate_limit)
+                    .hoop(generic_per_ip_rate_limit)
                     .hoop(enforce_rate_limit)
                     .post(add_task_handler),
             )
             .push(
                 Router::with_path("/add_result")
-                    .hoop(file_size_limit_handler())
-                    .hoop(rate_limiters.result_limiter)
+                    .hoop(request_file_size_limit)
+                    .hoop(result_rate_limit)
                     .post(add_result_handler),
             )
             .push(
                 Router::with_path("/get_tasks")
-                    .hoop(size_limit_handler())
+                    .hoop(request_size_limit)
                     .post(get_tasks_handler),
             )
             .push(
                 Router::with_path("/get_load")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.load_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(load_rate_limit)
                     .get(get_load_handler),
             )
             .push(
                 Router::with_path("/get_leader")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.leader_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(leader_rate_limit)
                     .get(get_leader_handler),
             )
             .push(
                 Router::with_path("/write")
-                    .hoop(raft_write_size_limit_handler())
+                    .hoop(raft_write_size_limit)
                     .hoop(cluster_check)
                     .hoop(admin_key_check)
                     .post(write_handler),
             )
             .push(
                 Router::with_path("/get_version")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.basic_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(basic_rate_limit)
                     .get(version_handler),
             )
             .push(
                 Router::with_path("/id")
-                    .hoop(size_limit_handler())
+                    .hoop(request_size_limit)
                     .get(id_handler),
             )
             .push(
                 Router::with_path("/get_result")
-                    .hoop(size_limit_handler())
+                    .hoop(request_size_limit)
                     .hoop(api_or_generic_key_check)
                     .get(get_result_handler),
             )
             .push(
                 Router::with_path("/get_status")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.status_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(status_rate_limit)
                     .hoop(api_or_generic_key_check)
                     .get(get_status_handler),
             )
             .push(
                 Router::with_path("/update_key")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.update_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(update_key_rate_limit)
                     .hoop(admin_key_check)
                     .post(generic_key_update_handler),
             )
             .push(
                 Router::with_path("/metrics")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.metric_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(metric_rate_limit)
                     .get(metrics_handler),
             )
             .push(
                 Router::with_path("/get_key")
-                    .hoop(size_limit_handler())
-                    .hoop(rate_limiters.read_limiter)
+                    .hoop(request_size_limit)
+                    .hoop(read_rate_limit)
                     .hoop(admin_key_check)
                     .get(generic_key_read_handler),
             ))

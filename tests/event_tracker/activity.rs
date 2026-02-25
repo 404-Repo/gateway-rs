@@ -121,7 +121,7 @@ async fn records_company_activity_with_image_task() {
 }
 
 #[tokio::test]
-async fn no_activity_event_without_user_or_company() {
+async fn records_generic_key_activity_event() {
     let rate_ctx = RateLimitContext {
         is_generic_key: true,
         key_is_uuid: true,
@@ -131,6 +131,7 @@ async fn no_activity_event_without_user_or_company() {
 
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header("x-client-origin", "blender", true)
         .json(&serde_json::json!({"prompt": "robot"}))
         .send(&h.service)
         .await;
@@ -138,5 +139,39 @@ async fn no_activity_event_without_user_or_company() {
     assert_eq!(status, StatusCode::OK);
 
     let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 1).await;
-    assert!(rows.is_empty(), "no activity events should be recorded");
+    let add_task = rows
+        .iter()
+        .find(|r| r.action == "add_task")
+        .expect("add_task");
+    assert_eq!(add_task.tool, "blender");
+    assert!(add_task.user_id.is_none());
+    assert!(add_task.company_id.is_none());
+}
+
+#[tokio::test]
+async fn records_generic_key_activity_event_for_unity_origin() {
+    let rate_ctx = RateLimitContext {
+        is_generic_key: true,
+        key_is_uuid: true,
+        ..RateLimitContext::default()
+    };
+    let h = build_harness(rate_ctx, None).await;
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header("x-client-origin", "unity", true)
+        .json(&serde_json::json!({"prompt": "robot"}))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 1).await;
+    let add_task = rows
+        .iter()
+        .find(|r| r.action == "add_task")
+        .expect("add_task");
+    assert_eq!(add_task.tool, "unity");
+    assert!(add_task.user_id.is_none());
+    assert!(add_task.company_id.is_none());
 }

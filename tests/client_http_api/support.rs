@@ -6,10 +6,10 @@ use base64_simd::STANDARD;
 use foldhash::HashSet;
 use http::StatusCode;
 use salvo::catcher::Catcher;
-use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use salvo::test::TestClient;
 use schnorrkel::{ExpansionMode, MiniSecretKey, context::signing_context};
+use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -17,12 +17,14 @@ use gateway::api::Task;
 use gateway::api::request::AddTaskResultRequest;
 use gateway::common::queue::DupQueue;
 use gateway::config::NodeConfig;
+use gateway::config_runtime::RuntimeConfigStore;
 use gateway::crypto::hotkey::Hotkey;
 use gateway::db::{EventRecorder, EventSinkHandle};
 use gateway::task::TaskManager;
 use gateway::test_support::{
     MultipartFilePart, add_task_handler, api_or_generic_key_check, build_multipart_form,
-    build_shared_harness_core, current_timestamp_secs, custom_response, enforce_rate_limit,
+    build_shared_harness_core, current_timestamp_secs, custom_response,
+    dynamic_add_task_size_limit, dynamic_request_size_limit, enforce_rate_limit,
     ensure_test_crypto_provider, get_load_handler, get_result_handler, get_status_handler,
     get_tasks_handler, id_handler, load_test_single_node_config, prepare_rate_limit_context,
     version_handler,
@@ -138,6 +140,9 @@ pub(crate) struct TestHarness {
     pub(crate) task_queue: DupQueue<Task>,
     pub(crate) task_manager: TaskManager,
     pub(crate) config: Arc<NodeConfig>,
+    pub(crate) runtime_config: Arc<RuntimeConfigStore>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) _config_file: NamedTempFile,
     pub(crate) shutdown: CancellationToken,
 }
 
@@ -161,12 +166,19 @@ async fn build_harness_inner(
 ) -> TestHarness {
     ensure_crypto_provider();
 
-    let (config, config_path) = load_config();
+    let (config, _config_path) = load_config();
     let mut config = config;
     if let Some(whitelist) = worker_whitelist {
         config.http.worker_whitelist = whitelist;
     }
     let config = Arc::new(config);
+    let config_file = tempfile::Builder::new()
+        .suffix(".toml")
+        .tempfile()
+        .expect("temp config file");
+    let config_toml = toml::to_string(config.as_ref()).expect("serialize test config");
+    std::fs::write(config_file.path(), config_toml).expect("write temp config");
+    let config_path = config_file.path().to_path_buf();
 
     let shutdown = CancellationToken::new();
 
@@ -185,7 +197,7 @@ async fn build_harness_inner(
 
     let core = build_shared_harness_core(
         Arc::clone(&config),
-        config_path,
+        config_path.clone(),
         event_recorder,
         include_gateway,
     )
@@ -193,51 +205,46 @@ async fn build_harness_inner(
 
     let state = core.state;
 
-    let request_size_limit = config.http.request_size_limit as usize;
-    let size_limit_handler = || SecureMaxSize(request_size_limit);
-    let add_task_size_limit = config.http.add_task_size_limit as usize;
-    let add_task_size_limit_handler = || SecureMaxSize(add_task_size_limit);
-
     let router = Router::new()
         .hoop(affix_state::inject(state))
         .hoop(prepare_rate_limit_context)
         .push(
             Router::with_path("/add_task")
-                .hoop(add_task_size_limit_handler())
+                .hoop(dynamic_add_task_size_limit)
                 .hoop(api_or_generic_key_check)
                 .hoop(enforce_rate_limit)
                 .post(add_task_handler),
         )
         .push(
             Router::with_path("/get_result")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .hoop(api_or_generic_key_check)
                 .get(get_result_handler),
         )
         .push(
             Router::with_path("/get_status")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .hoop(api_or_generic_key_check)
                 .get(get_status_handler),
         )
         .push(
             Router::with_path("/get_tasks")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .post(get_tasks_handler),
         )
         .push(
             Router::with_path("/get_load")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .get(get_load_handler),
         )
         .push(
             Router::with_path("/get_version")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .get(version_handler),
         )
         .push(
             Router::with_path("/id")
-                .hoop(size_limit_handler())
+                .hoop(dynamic_request_size_limit)
                 .get(id_handler),
         );
 
@@ -249,6 +256,9 @@ async fn build_harness_inner(
         task_queue: core.task_queue,
         task_manager: core.task_manager,
         config,
+        runtime_config: core.runtime_config,
+        config_path,
+        _config_file: config_file,
         shutdown,
     }
 }

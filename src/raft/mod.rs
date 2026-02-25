@@ -51,7 +51,8 @@ use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
 use crate::common::queue::DupQueue;
 use crate::common::resolve::lookup_one_ip_per_host;
-use crate::config::{ModelConfigStore, NodeConfig};
+use crate::config::NodeConfig;
+use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle};
 use crate::http3::client::Http3Client;
@@ -128,7 +129,7 @@ impl Gateway {
     }
 
     pub async fn gateway_info_updater(
-        config: Arc<NodeConfig>,
+        config: Arc<RuntimeConfigStore>,
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
@@ -137,10 +138,13 @@ impl Gateway {
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
-        let update_interval = Duration::from_millis(config.basic.update_gateway_info_ms);
-        let max_deltas_in_batch = config.basic.max_rate_limit_deltas_per_batch.max(1);
 
         loop {
+            let cfg = config.snapshot();
+            let node_cfg = cfg.node();
+            let update_interval = Duration::from_millis(node_cfg.basic.update_gateway_info_ms);
+            let max_deltas_in_batch = node_cfg.basic.max_rate_limit_deltas_per_batch.max(1);
+
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = sleep(update_interval) => {}
@@ -204,14 +208,14 @@ impl Gateway {
             let available_tasks = task_queue.len();
             let last_task_acquisition = last_task_acquisition.load(Ordering::Relaxed);
 
-            if leader == config.network.node_id {
+            if leader == node_cfg.network.node_id {
                 let _ = tokio::join!(
                     gateway_state.set_gateway_info(GatewayInfoRef {
-                        node_id: config.network.node_id,
-                        domain: &config.network.domain,
-                        ip: &config.network.external_ip,
-                        name: &config.network.name,
-                        http_port: config.http.port,
+                        node_id: node_cfg.network.node_id,
+                        domain: &node_cfg.network.domain,
+                        ip: &node_cfg.network.external_ip,
+                        name: &node_cfg.network.name,
+                        http_port: node_cfg.http.port,
                         available_tasks,
                         last_task_acquisition,
                         last_update,
@@ -251,13 +255,13 @@ impl Gateway {
             }
 
             let info_ext = GatewayInfoExtRef {
-                node_id: config.network.node_id,
-                domain: &config.network.domain,
-                ip: &config.network.external_ip,
-                name: &config.network.name,
-                http_port: config.http.port,
+                node_id: node_cfg.network.node_id,
+                domain: &node_cfg.network.domain,
+                ip: &node_cfg.network.external_ip,
+                name: &node_cfg.network.name,
+                http_port: node_cfg.http.port,
                 available_tasks,
-                cluster_name: &config.raft.cluster_name,
+                cluster_name: &node_cfg.raft.cluster_name,
                 last_task_acquisition,
                 last_update,
             };
@@ -613,49 +617,50 @@ async fn init_membership(
 
 pub async fn start_gateway(
     mode: GatewayMode,
-    config: Arc<NodeConfig>,
-    model_store: Arc<ModelConfigStore>,
+    config: Arc<RuntimeConfigStore>,
     shutdown: CancellationToken,
 ) -> Result<Gateway> {
     init_crypto_provider()?;
 
+    let cfg_view = config.snapshot();
+    let cfg = cfg_view.node();
+
     let clients_map = Arc::new(scc::HashMap::with_capacity_and_hasher(
-        config.network.node_dns_names.len(),
+        cfg.network.node_dns_names.len(),
         RandomState::default(),
     ));
 
-    let task_queue = build_task_queue(&config);
-    let raft_config = build_raft_config(&config)?;
+    let task_queue = build_task_queue(cfg);
+    let raft_config = build_raft_config(cfg)?;
     let gateway_shutdown = shutdown.child_token();
 
-    let snapshot_dir = PathBuf::from(&config.raft.snapshot_dir);
+    let snapshot_dir = PathBuf::from(&cfg.raft.snapshot_dir);
     let log_store_path = snapshot_dir.join("log_store.bin");
     let log_store = LogStore::with_persistence_and_thresholds(
         &log_store_path,
-        config.raft.compaction_threshold_bytes,
-        config.raft.compaction_ops,
-        config.raft.log_store_flush_interval_ms,
+        cfg.raft.compaction_threshold_bytes,
+        cfg.raft.compaction_ops,
+        cfg.raft.log_store_flush_interval_ms,
     )?;
     let state_machine_store = Arc::new(StateMachineStore::with_persistence(
         &snapshot_dir,
-        config.raft.max_snapshots_to_keep,
+        cfg.raft.max_snapshots_to_keep,
         Some(log_store_path.clone()),
     )?);
     let raft = Raft::new(
-        config.network.node_id,
+        cfg.network.node_id,
         Arc::clone(&raft_config),
         Network::new(clients_map.clone()),
         log_store.clone(),
         Arc::clone(&state_machine_store),
     )
     .await?;
-    let server_addr = format!("{}:{}", config.network.bind_ip, config.network.server_port);
+    let server_addr = format!("{}:{}", cfg.network.bind_ip, cfg.network.server_port);
 
-    let use_cert_files =
-        !config.cert.cert_file_path.is_empty() && !config.cert.key_file_path.is_empty();
+    let use_cert_files = !cfg.cert.cert_file_path.is_empty() && !cfg.cert.key_file_path.is_empty();
     let cert_tuple = if use_cert_files {
-        let cert = load_certificates(&config.cert.cert_file_path).await?;
-        let key = load_private_key(&config.cert.key_file_path).await?;
+        let cert = load_certificates(&cfg.cert.cert_file_path).await?;
+        let key = load_private_key(&cfg.cert.key_file_path).await?;
         Some((cert, key))
     } else {
         None
@@ -674,17 +679,17 @@ pub async fn start_gateway(
         &server_addr,
         cert_tuple,
         raft.clone(),
-        config.rserver.clone(),
+        cfg.rserver.clone(),
         gateway_shutdown.clone(),
     )
     .await?;
 
     let peer_dns_names: Vec<_> = {
-        let mut names = config
+        let mut names = cfg
             .network
             .node_dns_names
             .iter()
-            .filter(|&name| name != &config.network.domain)
+            .filter(|&name| name != &cfg.network.domain)
             .cloned()
             .collect::<Vec<_>>();
         names.sort();
@@ -698,36 +703,30 @@ pub async fn start_gateway(
     };
 
     if mode != GatewayMode::Single && !node_ips.is_empty() {
-        setup_remote_clients(
-            config.as_ref(),
-            &node_ips,
-            &peer_dns_names,
-            clients_map.clone(),
-        )
-        .await?;
+        setup_remote_clients(cfg, &node_ips, &peer_dns_names, clients_map.clone()).await?;
     }
 
     let last_task_acquisition = Arc::new(AtomicU64::from(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     ));
 
-    let db = Arc::new(DatabaseBuilder::from_config(&config.db).build().await?);
+    let db = Arc::new(DatabaseBuilder::from_config(&cfg.db).build().await?);
     let api_key_validator = ApiKeyValidator::new(
         Arc::clone(&db),
-        Duration::from_secs(config.db.api_keys_update_interval),
-        config.db.keys_cache_ttl_sec,
-        config.db.keys_cache_initial_capacity,
-        config.db.keys_cache_max_capacity,
-        &config.http.api_key_secret,
-        config.db.deleted_keys_ttl_minutes,
+        Duration::from_secs(cfg.db.api_keys_update_interval),
+        cfg.db.keys_cache_ttl_sec,
+        cfg.db.keys_cache_initial_capacity,
+        cfg.db.keys_cache_max_capacity,
+        &cfg.http.api_key_secret,
+        cfg.db.deleted_keys_ttl_minutes,
     )?;
     let api_key_validator = Arc::new(api_key_validator);
-    let events_flush_interval = config.db.events_flush_interval_sec.max(1);
-    let events_queue_capacity = config.db.events_queue_capacity.max(1);
+    let events_flush_interval = cfg.db.events_flush_interval_sec.max(1);
+    let events_queue_capacity = cfg.db.events_queue_capacity.max(1);
     let event_sink = Arc::new(EventSinkHandle::Database(Arc::clone(&db)));
     let event_recorder = EventRecorder::new(
         event_sink,
-        Arc::from(config.network.name.as_str()),
+        Arc::from(cfg.network.name.as_str()),
         Duration::from_secs(events_flush_interval),
         events_queue_capacity,
         gateway_shutdown.clone(),
@@ -740,10 +739,10 @@ pub async fn start_gateway(
     let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
 
     let task_manager = TaskManager::new(
-        config.basic.taskmanager_initial_capacity,
-        config.basic.unique_workers_per_task,
-        Duration::from_secs(config.basic.taskmanager_cleanup_interval),
-        Duration::from_secs(config.basic.taskmanager_result_lifetime),
+        cfg.basic.taskmanager_initial_capacity,
+        cfg.basic.unique_workers_per_task,
+        Duration::from_secs(cfg.basic.taskmanager_cleanup_interval),
+        Duration::from_secs(cfg.basic.taskmanager_result_lifetime),
         metrics.clone(),
         Some(event_recorder.clone()),
     )
@@ -764,15 +763,14 @@ pub async fn start_gateway(
 
     let key_cert = if use_cert_files {
         Keycert::new()
-            .cert_from_path(&config.cert.cert_file_path)?
-            .key_from_path(&config.cert.key_file_path)?
+            .cert_from_path(&cfg.cert.cert_file_path)?
+            .key_from_path(&cfg.cert.key_file_path)?
     } else {
         generate_and_create_keycert(vec!["localhost".to_string()])?
     };
 
     let http_server = match Http3Server::run(
         Arc::clone(&config),
-        model_store,
         RustlsConfig::new(key_cert),
         gateway_state.clone(),
         task_queue.clone(),
@@ -789,17 +787,17 @@ pub async fn start_gateway(
         Vec::new()
     } else {
         get_node_ids(
-            Duration::from_secs(config.http.get_timeout_sec),
+            Duration::from_secs(cfg.http.get_timeout_sec),
             &node_ips,
             &peer_dns_names,
-            Duration::from_secs(config.network.node_id_discovery_sleep),
-            config.cert.dangerous_skip_verification,
-            config.network.node_id_discovery_retries,
+            Duration::from_secs(cfg.network.node_id_discovery_sleep),
+            cfg.cert.dangerous_skip_verification,
+            cfg.network.node_id_discovery_retries,
         )
         .await?
     };
 
-    let node_id = config.network.node_id;
+    let node_id = cfg.network.node_id;
     info!("Starting node {} with mode {:?}", node_id, mode);
 
     // Initialize raft membership based on the mode.
@@ -808,7 +806,7 @@ pub async fn start_gateway(
         node_id,
         &node_ids,
         &node_ips,
-        &config,
+        cfg,
         &raft,
         &server_addr,
     )

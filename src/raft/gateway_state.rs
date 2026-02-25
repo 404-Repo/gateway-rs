@@ -4,7 +4,7 @@ use super::{NodeId, Raft, StateMachineStore};
 use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
-use crate::config::NodeConfig;
+use crate::config_runtime::RuntimeConfigStore;
 use crate::db::{ApiKeyLookup, ApiKeyValidator, EventRecorder};
 use crate::http3::client::{Http3Client, Http3ClientBuilder};
 use crate::task::TaskManager;
@@ -87,7 +87,7 @@ struct GatewayStateInner {
     last_task_acquisition: Arc<AtomicU64>,
     key_validator: Arc<ApiKeyValidator>,
     task_manager: TaskManager,
-    config: Arc<NodeConfig>,
+    config: Arc<RuntimeConfigStore>,
     rate_limit_queue: Arc<Queue<RateLimitDelta>>,
     event_recorder: EventRecorder,
 }
@@ -103,7 +103,7 @@ pub struct GatewayStateInit {
     pub last_task_acquisition: Arc<AtomicU64>,
     pub key_validator_updater: Arc<ApiKeyValidator>,
     pub task_manager: TaskManager,
-    pub config: Arc<NodeConfig>,
+    pub config: Arc<RuntimeConfigStore>,
     pub rate_limit_queue: Arc<Queue<RateLimitDelta>>,
     pub event_recorder: EventRecorder,
 }
@@ -114,7 +114,7 @@ impl GatewayState {
     }
 
     pub(crate) fn admin_key(&self) -> String {
-        self.internal.config.http.admin_key.to_string()
+        self.internal.config.snapshot().http().admin_key.to_string()
     }
 
     pub(crate) fn leader_server_addr(&self, info: &GatewayInfo) -> String {
@@ -132,13 +132,14 @@ impl GatewayState {
         &self,
         info: &GatewayInfo,
     ) -> anyhow::Result<Http3Client> {
+        let cfg = self.internal.config.snapshot();
         (|| async {
             Http3ClientBuilder::new()
                 .server_domain(&info.domain)
                 .server_ip(self.leader_server_addr(info))
-                .max_idle_timeout_sec(self.internal.config.http.max_idle_timeout_sec)
-                .keep_alive_interval(self.internal.config.http.keep_alive_interval_sec)
-                .dangerous_skip_verification(self.internal.config.cert.dangerous_skip_verification)
+                .max_idle_timeout_sec(cfg.http().max_idle_timeout_sec)
+                .keep_alive_interval(cfg.http().keep_alive_interval_sec)
+                .dangerous_skip_verification(cfg.node().cert.dangerous_skip_verification)
                 .build()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create HTTP3 client to leader: {:?}", e))
@@ -300,7 +301,7 @@ impl GatewayState {
         info: GatewayInfoExtRef<'_>,
         client: Option<&Http3Client>,
     ) -> Result<bool> {
-        let current_node_id = self.internal.config.network.node_id;
+        let current_node_id = self.internal.config.snapshot().node().network.node_id;
         if self.leader().await == Some(current_node_id) {
             self.set_gateway_info(GatewayInfoRef {
                 node_id: info.node_id,
@@ -325,7 +326,7 @@ impl GatewayState {
             Bytes::from(payload),
             Some(admin_key.as_str()),
             client,
-            Duration::from_secs(self.internal.config.http.post_timeout_sec),
+            Duration::from_secs(self.internal.config.snapshot().http().post_timeout_sec),
         )
         .await
     }
@@ -356,7 +357,7 @@ impl GatewayState {
                 Bytes::from(payload),
                 admin_key,
                 None,
-                Duration::from_secs(self.internal.config.http.forward_timeout_sec),
+                Duration::from_secs(self.internal.config.snapshot().http().forward_timeout_sec),
             )
             .await?;
         if forwarded {
@@ -404,8 +405,15 @@ impl GatewayState {
         self.internal.key_validator.lookup(api_key).await
     }
 
-    pub fn cluster_name(&self) -> &str {
-        &self.internal.config.raft.cluster_name
+    pub fn cluster_name_matches(&self, cluster_name: &str) -> bool {
+        self.internal
+            .config
+            .snapshot()
+            .node()
+            .raft
+            .cluster_name
+            .as_str()
+            == cluster_name
     }
 
     pub fn task_manager(&self) -> TaskManager {
@@ -413,7 +421,7 @@ impl GatewayState {
     }
 
     pub fn preconfigured_generic_key(&self) -> Option<Uuid> {
-        self.internal.config.http.generic_key
+        self.internal.config.snapshot().http().generic_key
     }
 
     pub fn enqueue_rate_limit_delta(&self, delta: RateLimitDelta) {
@@ -450,8 +458,9 @@ impl GatewayState {
         client: Option<&Http3Client>,
     ) -> Result<()> {
         let request_id = Uuid::new_v4().as_u128();
-        let current_node_id = self.internal.config.network.node_id;
-        let timeout = Duration::from_secs(self.internal.config.http.forward_timeout_sec);
+        let cfg = self.internal.config.snapshot();
+        let current_node_id = cfg.node().network.node_id;
+        let timeout = Duration::from_secs(cfg.http().forward_timeout_sec);
 
         let forwarded = (|| async {
             if let Some(leader_id) = self.leader().await

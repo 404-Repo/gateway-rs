@@ -330,6 +330,182 @@ impl RateLimiters {
     }
 }
 
+#[handler]
+pub async fn basic_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .basic_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn update_key_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .update_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn unauthorized_only_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .unauthorized_only_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn generic_global_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .generic_global_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn generic_per_ip_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .generic_per_ip_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn read_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .read_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn result_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .result_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn load_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .load_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn leader_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .leader_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn metric_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .metric_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn status_rate_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    cfg.ip_rate_limiters()
+        .status_limiter
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
 struct SubjectParams<'a> {
     subject: Subject,
     id: u128,
@@ -416,9 +592,11 @@ pub async fn enforce_rate_limit(depot: &mut Depot, _req: &mut Request) -> Result
     }
 
     let state = depot.require::<HttpState>()?.clone();
-    let limiter = state.rate_limits().distributed();
+    let cfg = state.config();
+    let rate_limits = cfg.rate_limits();
+    let limiter = rate_limits.distributed();
     let gs = state.gateway_state().clone();
-    let policies = state.rate_limits().policies();
+    let policies = rate_limits.policies();
 
     let epochs = limiter.epochs();
 
