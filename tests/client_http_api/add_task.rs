@@ -118,6 +118,10 @@ async fn add_task_negative_seed_is_ok() {
         "add_task body: {}",
         String::from_utf8_lossy(&body)
     );
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
+    let task_id = Uuid::parse_str(task_id).expect("uuid");
+    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
 }
 
 #[tokio::test]
@@ -145,7 +149,56 @@ async fn add_task_min_i32_seed_is_ok() {
 }
 
 #[tokio::test]
-async fn add_task_max_u32_seed_converts_to_signed_for_multipart() {
+async fn add_task_high_u32_seed_converts_to_signed_for_multipart() {
+    let h = build_harness().await;
+    let image = tiny_png_bytes();
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("2147483648"));
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "add_task body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
+    let task_id = Uuid::parse_str(task_id).expect("uuid");
+    assert_eq!(h.task_manager.get_seed(task_id).await, Some(i32::MIN));
+}
+
+#[tokio::test]
+async fn add_task_high_u32_seed_converts_to_signed_for_json() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot", "seed": 2147483648u64}))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "add_task body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
+    let task_id = Uuid::parse_str(task_id).expect("uuid");
+    assert_eq!(h.task_manager.get_seed(task_id).await, Some(i32::MIN));
+}
+
+#[tokio::test]
+async fn add_task_max_u32_seed_randomizes_for_multipart() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
     let (boundary, body) = multipart_body(None, Some(&image), None, Some("4294967295"));
@@ -169,11 +222,11 @@ async fn add_task_max_u32_seed_converts_to_signed_for_multipart() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_eq!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
 }
 
 #[tokio::test]
-async fn add_task_max_u32_seed_converts_to_signed_for_json() {
+async fn add_task_max_u32_seed_randomizes_for_json() {
     let h = build_harness().await;
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
@@ -190,7 +243,28 @@ async fn add_task_max_u32_seed_converts_to_signed_for_json() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_eq!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
+}
+
+#[tokio::test]
+async fn add_task_json_negative_seed_randomizes() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot", "seed": -1}))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "add_task body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
+    let task_id = Uuid::parse_str(task_id).expect("uuid");
+    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
 }
 
 #[tokio::test]

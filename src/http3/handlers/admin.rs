@@ -63,7 +63,8 @@ pub async fn generic_key_read_handler(
 #[handler]
 pub async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
+    let cfg = state.config();
+    let http_cfg = cfg.http();
 
     let is_admin = req
         .headers()
@@ -90,7 +91,7 @@ pub async fn cluster_check(depot: &mut Depot, req: &mut Request) -> Result<(), S
         _ => None,
     };
     if let Some(ip) = remote_ip_opt
-        && state.cluster_ips().contains(&ip)
+        && state.is_cluster_ip(&ip)
     {
         return Ok(());
     }

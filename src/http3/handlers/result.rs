@@ -75,7 +75,8 @@ pub async fn get_result_handler(
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
+    let cfg = state.config();
+    let http_cfg = cfg.http();
     let record_origin = normalize_origin(req, http_cfg);
     let gateway_state = state.gateway_state().clone();
     let task_manager = gateway_state.task_manager();
@@ -92,8 +93,7 @@ pub async fn get_result_handler(
         },
         "get_result",
     );
-    let model_store = Arc::clone(state.model_store());
-    let model_cfg = model_store.get().await;
+    let model_cfg = &cfg.node().model_config;
 
     let results_bundle = task_manager
         .get_result(get_task.id)
@@ -379,7 +379,8 @@ async fn parse_add_result_request(
     let byte_stream = multipart_stream(req);
 
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
+    let cfg = state.config();
+    let http_cfg = cfg.http();
 
     let constraints = Constraints::new()
         .allowed_fields(vec![
@@ -484,7 +485,8 @@ pub async fn add_result_handler(
 ) -> Result<(), ServerError> {
     let (task_id, task_result, timestamp, signature) = parse_add_result_request(depot, req).await?;
     let state = depot.require::<HttpState>()?.clone();
-    let http_cfg = state.http_config();
+    let cfg = state.config();
+    let http_cfg = cfg.http();
     validate_worker_request(
         http_cfg,
         &task_result.worker_hotkey,

@@ -2,6 +2,7 @@ mod api;
 mod common;
 mod config;
 mod config_model;
+mod config_runtime;
 mod crypto;
 mod db;
 mod http3;
@@ -16,7 +17,8 @@ use clap::ValueEnum;
 use common::log::{init_tracing, log_app_config, log_build_information};
 use std::{env, sync::Arc, time::Duration};
 
-use config::{ModelConfigStore, read_config, resolve_config_path};
+use config::{read_config, resolve_config_path};
+use config_runtime::RuntimeConfigStore;
 use raft::{GatewayExit, GatewayMode, start_gateway};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -110,32 +112,36 @@ async fn main() {
     };
 
     let node_config = match read_config(config_path).await {
-        Ok(config) => Arc::new(config),
+        Ok(config) => config,
         Err(e) => {
             eprintln!("Failed to load config file: {e}");
             std::process::exit(1);
         }
     };
-    let model_store =
-        match ModelConfigStore::new(resolved_path, node_config.model_config.clone()).await {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                eprintln!("Failed to initialize model config store: {e}");
-                std::process::exit(1);
-            }
-        };
-    let _model_watcher = match model_store.start_watcher(tokio::runtime::Handle::current()) {
+    let runtime_config = match RuntimeConfigStore::new(resolved_path, node_config).await {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            eprintln!("Failed to initialize runtime config store: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let startup_cfg = runtime_config.snapshot();
+    let _guards = init_tracing(
+        &startup_cfg.node().log.path,
+        (&startup_cfg.node().log.level).into(),
+    );
+
+    let _runtime_watcher = match runtime_config.start_watcher(tokio::runtime::Handle::current()) {
         Ok(watcher) => Some(watcher),
         Err(e) => {
-            warn!("Failed to start model config watcher: {e}");
+            warn!("Failed to start runtime config watcher: {e}");
             None
         }
     };
 
-    let _guards = init_tracing(&node_config.log.path, (&node_config.log.level).into());
-
     log_build_information();
-    log_app_config(&node_config);
+    log_app_config(startup_cfg.node());
 
     let restart_delay_secs = match env::var("GATEWAY_RESTART_DELAY_SECS") {
         Ok(value) => match value.parse::<u64>() {
@@ -150,7 +156,7 @@ async fn main() {
         Err(_) => RESTART_DELAY_SECS,
     };
 
-    let max_attempts = node_config.basic.max_restart_attempts;
+    let max_attempts = startup_cfg.node().basic.max_restart_attempts;
     let mut attempts = 0;
 
     let shutdown = CancellationToken::new();
@@ -175,14 +181,7 @@ async fn main() {
             break;
         }
 
-        match start_gateway(
-            gateway_mode,
-            Arc::clone(&node_config),
-            Arc::clone(&model_store),
-            shutdown.clone(),
-        )
-        .await
-        {
+        match start_gateway(gateway_mode, Arc::clone(&runtime_config), shutdown.clone()).await {
             Ok(gateway) => {
                 let exit = gateway.wait_for_exit().await;
                 if shutdown.is_cancelled() {

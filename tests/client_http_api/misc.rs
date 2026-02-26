@@ -50,3 +50,41 @@ async fn id_success() {
     let body_str = String::from_utf8_lossy(&body);
     assert_eq!(body_str.trim(), h.config.network.node_id.to_string());
 }
+
+#[tokio::test]
+async fn add_task_size_limit_updates_after_runtime_reload() {
+    let h = build_harness().await;
+    let payload = serde_json::json!({
+        "prompt": "x".repeat(1024),
+    });
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&payload)
+        .send(&h.service)
+        .await;
+    let (status_before, _headers, body_before) = read_response(res).await;
+    assert_eq!(
+        status_before,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body_before)
+    );
+
+    let mut updated = h.config.as_ref().clone();
+    updated.http.add_task_size_limit = 128;
+    let updated_toml = toml::to_string(&updated).expect("serialize updated config");
+    std::fs::write(&h.config_path, updated_toml).expect("write updated config");
+    assert!(h.runtime_config.reload_from_disk().await);
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&payload)
+        .send(&h.service)
+        .await;
+    let (status_after, _headers, _body_after) = read_response(res).await;
+    assert!(matches!(
+        status_after,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
+    ));
+}

@@ -1,3 +1,4 @@
+use crate::http3::depot_ext::DepotExt;
 pub use crate::http3::distributed_rate_limiter::DistributedRateLimiter;
 pub use crate::http3::handlers::core::api_or_generic_key_check;
 pub use crate::http3::handlers::core::{id_handler, version_handler};
@@ -22,12 +23,15 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use openraft::BasicNode;
+use salvo::http::request::SecureMaxSize;
+use salvo::prelude::*;
 use uuid::Uuid;
 
 use crate::api::Task;
 use crate::api::response::GatewayInfo;
 use crate::common::queue::DupQueue;
 use crate::config::NodeConfig;
+use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{ApiKeyValidator, Database, EventRecorder};
 use crate::metrics::Metrics;
@@ -73,6 +77,8 @@ pub struct SharedHarnessCore {
     pub task_manager: TaskManager,
     pub key_validator: Arc<ApiKeyValidator>,
     pub state: HttpState,
+    pub runtime_config: Arc<RuntimeConfigStore>,
+    pub config_path: PathBuf,
 }
 
 pub async fn build_shared_harness_core(
@@ -82,11 +88,10 @@ pub async fn build_shared_harness_core(
     include_gateway_info: bool,
 ) -> SharedHarnessCore {
     let generic_key = config.http.generic_key.unwrap_or_else(Uuid::new_v4);
-
-    let model_store = Arc::new(
-        crate::config::ModelConfigStore::new(config_path, config.model_config.clone())
+    let runtime_config = Arc::new(
+        RuntimeConfigStore::new(config_path.clone(), config.as_ref().clone())
             .await
-            .expect("model store"),
+            .expect("runtime config store"),
     );
 
     let metrics = Metrics::new(0.05).expect("metrics");
@@ -190,28 +195,16 @@ pub async fn build_shared_harness_core(
         last_task_acquisition: Arc::new(AtomicU64::new(0)),
         key_validator_updater: key_validator.clone(),
         task_manager: task_manager.clone(),
-        config: Arc::clone(&config),
+        config: Arc::clone(&runtime_config),
         rate_limit_queue,
         event_recorder,
     });
 
-    let prompt_regex = regex::Regex::new(&config.prompt.allowed_pattern).expect("prompt regex");
-    let rate_limit_whitelist = RateLimitWhitelist {
-        ips: Arc::new(std::collections::HashSet::new()),
-    };
-    let image_upload_limiter = ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
-    let (rate_limit_service, _rate_limiters) = RateLimitService::new(&config.http);
     let state = HttpState::new(HttpStateInit {
-        config,
-        model_store,
+        config: Arc::clone(&runtime_config),
         gateway_state,
         task_queue: task_queue.clone(),
         metrics,
-        rate_limit_whitelist,
-        cluster_ips: std::collections::HashSet::<std::net::IpAddr>::new(),
-        image_upload_limiter,
-        prompt_regex,
-        rate_limits: rate_limit_service,
     });
 
     SharedHarnessCore {
@@ -220,7 +213,39 @@ pub async fn build_shared_harness_core(
         task_manager,
         key_validator,
         state,
+        runtime_config,
+        config_path,
     }
+}
+
+#[handler]
+pub async fn dynamic_request_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), crate::http3::error::ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().request_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
+}
+
+#[handler]
+pub async fn dynamic_add_task_size_limit(
+    depot: &mut Depot,
+    req: &mut Request,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) -> Result<(), crate::http3::error::ServerError> {
+    let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
+    SecureMaxSize(cfg.http().add_task_size_limit as usize)
+        .handle(req, depot, res, ctrl)
+        .await;
+    Ok(())
 }
 
 pub fn build_multipart_form(

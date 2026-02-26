@@ -21,8 +21,9 @@ pub async fn write_handler(
     res: &mut Response,
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
+    let cfg = state.config();
     let body = req
-        .payload_with_max_size(state.http_config().raft_write_size_limit as usize)
+        .payload_with_max_size(cfg.http().raft_write_size_limit as usize)
         .await
         .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
@@ -53,7 +54,7 @@ pub async fn write_handler(
     let gi: GatewayInfoExt = rmp_serde::from_slice(body.as_ref())
         .map_err(|e| ServerError::BadRequest(format!("Failed to parse msgpack: {}", e)))?;
 
-    if gi.cluster_name != gateway_state.cluster_name() {
+    if !gateway_state.cluster_name_matches(&gi.cluster_name) {
         return Err(ServerError::Unauthorized("Unauthorized access".to_string()));
     }
 
