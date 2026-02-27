@@ -10,6 +10,17 @@ use crate::support::{
     add_task_prompt, build_harness, multipart_body, read_response, tiny_png_bytes,
 };
 
+fn model_params_json_object_text_with_total_len(total_len: usize) -> String {
+    // {"p":"<payload>"} -> fixed overhead is 8 bytes/chars.
+    assert!(total_len >= 8, "total_len must be at least 8");
+    format!(r#"{{"p":"{}"}}"#, "a".repeat(total_len - 8))
+}
+
+fn model_params_json_object_with_total_len(total_len: usize) -> serde_json::Value {
+    serde_json::from_str(&model_params_json_object_text_with_total_len(total_len))
+        .expect("model params object")
+}
+
 #[tokio::test]
 async fn add_task_json_success() {
     let h = build_harness().await;
@@ -17,26 +28,60 @@ async fn add_task_json_success() {
 }
 
 #[tokio::test]
-async fn add_task_rejects_invalid_model_params_json() {
+async fn add_task_rejects_non_object_model_params_json() {
     let h = build_harness().await;
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .json(&serde_json::json!({
             "prompt": "robot",
-            "model_params": "not-json"
+            "model_params": "not-an-object"
         }))
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
+    let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params must be a JSON object"));
+}
+
+#[tokio::test]
+async fn add_task_rejects_null_model_params_json() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": serde_json::Value::Null
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params must be a JSON object"));
+}
+
+#[tokio::test]
+async fn add_task_rejects_array_model_params_json() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": [1, 2, 3]
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params must be a JSON object"));
 }
 
 #[tokio::test]
 async fn add_task_multipart_rejects_invalid_model_params() {
     let h = build_harness().await;
-    let image = tiny_png_bytes();
-    let (boundary, body) =
-        multipart_body(Some("robot"), Some(&image), None, None, Some("not-json"));
+    let (boundary, body) = multipart_body(Some("robot"), None, None, None, Some("not-json"));
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -47,15 +92,37 @@ async fn add_task_multipart_rejects_invalid_model_params() {
         .body(body)
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
+    let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params must be valid JSON"));
+}
+
+#[tokio::test]
+async fn add_task_multipart_rejects_non_object_model_params() {
+    let h = build_harness().await;
+    let (boundary, body) = multipart_body(Some("robot"), None, None, None, Some("[1,2,3]"));
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params must be a JSON object"));
 }
 
 #[tokio::test]
 async fn add_task_rejects_too_long_model_params_json() {
     let h = build_harness().await;
     let max_len = h.config.model_params.max_len;
-    let too_long = "a".repeat(max_len + 1);
+    let too_long = model_params_json_object_with_total_len(max_len + 1);
 
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
@@ -65,17 +132,18 @@ async fn add_task_rejects_too_long_model_params_json() {
         }))
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
+    let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    assert!(body_text.contains("Model params is too long"));
 }
 
 #[tokio::test]
 async fn add_task_multipart_rejects_too_long_model_params() {
     let h = build_harness().await;
     let max_len = h.config.model_params.max_len;
-    let too_long = "a".repeat(max_len + 1);
-    let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None, None, Some(&too_long));
+    let too_long = model_params_json_object_text_with_total_len(max_len + 1);
+    let (boundary, body) = multipart_body(Some("robot"), None, None, None, Some(&too_long));
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -86,14 +154,23 @@ async fn add_task_multipart_rejects_too_long_model_params() {
         .body(body)
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
+    let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body_text = String::from_utf8_lossy(&body);
+    let body_lower = body_text.to_ascii_lowercase();
+    assert!(
+        body_text.contains("Model params is too long")
+            || (body_lower.contains("model_params")
+                && (body_lower.contains("exceed") || body_lower.contains("size"))),
+        "unexpected multipart over-limit error: {body_text}"
+    );
 }
 
 #[tokio::test]
-async fn add_task_accepts_valid_model_params_json() {
+async fn add_task_accepts_model_params_json_at_max_len() {
     let h = build_harness().await;
-    let params = r#"{"temperature":0.5}"#;
+    let params = model_params_json_object_with_total_len(h.config.model_params.max_len);
+
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .json(&serde_json::json!({
@@ -107,13 +184,34 @@ async fn add_task_accepts_valid_model_params_json() {
 }
 
 #[tokio::test]
-async fn add_task_accepts_null_model_params_json() {
+async fn add_task_accepts_model_params_multipart_at_max_len() {
     let h = build_harness().await;
+    let params = model_params_json_object_text_with_total_len(h.config.model_params.max_len);
+    let (boundary, body) = multipart_body(Some("robot"), None, None, None, Some(&params));
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn add_task_accepts_valid_model_params_json() {
+    let h = build_harness().await;
+    let params = serde_json::json!({"temperature": 0.5});
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .json(&serde_json::json!({
             "prompt": "robot",
-            "model_params": serde_json::Value::Null
+            "model_params": params
         }))
         .send(&h.service)
         .await;

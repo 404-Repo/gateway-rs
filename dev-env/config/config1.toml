@@ -132,7 +132,7 @@ max_len = 384
 allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
 
 [model_params]
-# Maximum length (in bytes) of the `model_params` JSON string accepted by the API.
+# Maximum serialized length (in bytes) of the `model_params` JSON object accepted by the API.
 # This should stay in sync with `ModelParamsConfig::max_len` defaults.
 max_len = 1024
 

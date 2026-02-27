@@ -261,7 +261,9 @@ async fn get_result_invalid_model_config() {
             image: None,
             model: Some("missing-model".to_string()),
             seed: 0,
-            model_params: Some(r#"{"preset":"default"}"#.to_string()),
+            model_params: Some(
+                serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+            ),
         })
         .await;
 

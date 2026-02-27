@@ -226,6 +226,12 @@ fn default_model_params_max_len() -> usize {
     1024
 }
 
+fn default_model_params_config() -> ModelParamsConfig {
+    ModelParamsConfig {
+        max_len: default_model_params_max_len(),
+    }
+}
+
 fn default_snapshot_dir() -> String {
     "data/snapshots".to_string()
 }
@@ -266,6 +272,7 @@ pub struct NodeConfig {
     pub rclient: RClientConfig,
     pub http: HTTPConfig,
     pub prompt: PromptConfig,
+    #[serde(default = "default_model_params_config")]
     pub model_params: ModelParamsConfig,
     pub image: ImageConfig,
     pub db: DbConfig,
