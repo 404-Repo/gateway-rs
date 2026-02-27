@@ -9,9 +9,9 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::api::Task;
 use crate::api::request::{AddTaskRequest, GetTasksRequest};
 use crate::api::response::{GetTasksResponse, LoadResponse};
+use crate::api::{ModelParams, Task};
 use crate::common::image::validate_image;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
@@ -44,6 +44,7 @@ struct AddTaskMultipartData {
     prompt: Option<String>,
     image: Option<Bytes>,
     model: Option<String>,
+    model_params: Option<serde_json::Value>,
 }
 
 struct ValidatedAddTask {
@@ -51,6 +52,7 @@ struct ValidatedAddTask {
     prompt: Option<String>,
     image: Option<crate::common::image::ImageValidationResult>,
     model: Option<String>,
+    model_params: Option<ModelParams>,
     task_kind: TaskKind,
 }
 
@@ -65,17 +67,19 @@ async fn parse_add_task_multipart(
     let cfg = state.config();
     let image_cfg = cfg.image();
     let prompt_cfg = cfg.prompt();
+    let model_params_cfg = cfg.model_params();
     let upload_limiter = cfg.image_upload_limiter();
     let mut image_permit: Option<OwnedSemaphorePermit> = None;
 
     let constraints = Constraints::new()
-        .allowed_fields(vec!["seed", "prompt", "image", "model"])
+        .allowed_fields(vec!["seed", "prompt", "image", "model", "model_params"])
         .size_limit(
             SizeLimit::new()
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
                 .for_field("model", 64)
-                .for_field("seed", 11),
+                .for_field("seed", 11)
+                .for_field("model_params", model_params_cfg.max_len as u64),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
@@ -83,6 +87,7 @@ async fn parse_add_task_multipart(
     let mut seed = None;
     let mut image = None;
     let mut model = None;
+    let mut model_params = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -116,6 +121,16 @@ async fn parse_add_task_multipart(
             "seed" => {
                 seed = Some(parse_seed_text(&read_text_field(field, "seed").await?)?);
             }
+            "model_params" => {
+                let raw_model_params = read_text_field(field, "model_params").await?;
+                let parsed_model_params = serde_json::from_str::<serde_json::Value>(
+                    &raw_model_params,
+                )
+                .map_err(|err| {
+                    ServerError::BadRequest(format!("Model params must be valid JSON: {}", err))
+                })?;
+                model_params = Some(parsed_model_params);
+            }
             _ => continue,
         }
     }
@@ -125,6 +140,7 @@ async fn parse_add_task_multipart(
         image,
         model,
         seed,
+        model_params,
     })
 }
 
@@ -143,15 +159,27 @@ async fn parse_add_task_request(
         let boundary = parse_boundary(&content_type)?;
         parse_add_task_multipart(depot, req, boundary).await
     } else {
-        let add_task: AddTaskRequest = req
-            .parse_json::<AddTaskRequest>()
+        let add_task_json = req
+            .parse_json::<serde_json::Value>()
             .await
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        if add_task_json
+            .as_object()
+            .and_then(|payload| payload.get("model_params"))
+            .is_some_and(|value| value.is_null())
+        {
+            return Err(ServerError::BadRequest(
+                "Model params must be a JSON object".into(),
+            ));
+        }
+        let add_task: AddTaskRequest = serde_json::from_value(add_task_json)
             .map_err(|e| ServerError::BadRequest(e.to_string()))?;
         Ok(AddTaskMultipartData {
             prompt: add_task.prompt,
             image: None,
             model: add_task.model,
             seed: add_task.seed.map(|seed| seed.into_i32()),
+            model_params: add_task.model_params,
         })
     }
 }
@@ -173,8 +201,16 @@ fn validate_add_task_input(
 ) -> Result<ValidatedAddTask, ServerError> {
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
-    let has_prompt = add_task.prompt.as_ref().is_some_and(|p| !p.is_empty());
-    let has_image = add_task.image.as_ref().is_some_and(|b| !b.is_empty());
+    let AddTaskMultipartData {
+        seed,
+        prompt,
+        image,
+        model,
+        model_params,
+    } = add_task;
+
+    let has_prompt = prompt.as_ref().is_some_and(|p| !p.is_empty());
+    let has_image = image.as_ref().is_some_and(|b| !b.is_empty());
     if has_prompt == has_image {
         return Err(ServerError::BadRequest(if has_prompt {
             "Cannot provide both prompt and image. Choose one.".into()
@@ -189,7 +225,7 @@ fn validate_add_task_input(
         TaskKind::TextTo3D
     };
 
-    if let Some(prompt) = &add_task.prompt {
+    if let Some(prompt) = &prompt {
         let prompt_cfg = cfg.prompt();
         let len = prompt.chars().count();
         if len < prompt_cfg.min_len {
@@ -208,7 +244,31 @@ fn validate_add_task_input(
         }
     }
 
-    let validated_image = if let Some(image_data) = add_task.image {
+    let validated_model_params = if let Some(model_params_value) = model_params {
+        let model_params = model_params_value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| ServerError::BadRequest("Model params must be a JSON object".into()))?;
+        let model_params_cfg = cfg.model_params();
+        let serialized_len = serde_json::to_vec(&model_params)
+            .map_err(|err| {
+                ServerError::BadRequest(format!("Model params must be valid JSON: {}", err))
+            })?
+            .len();
+
+        if serialized_len > model_params_cfg.max_len {
+            return Err(ServerError::BadRequest(format!(
+                "Model params is too long: maximum length is {} bytes (got {})",
+                model_params_cfg.max_len, serialized_len
+            )));
+        }
+
+        Some(model_params)
+    } else {
+        None
+    };
+
+    let validated_image = if let Some(image_data) = image {
         let image_cfg = cfg.image();
         Some(validate_image(image_data, image_cfg)?)
     } else {
@@ -216,11 +276,12 @@ fn validate_add_task_input(
     };
 
     Ok(ValidatedAddTask {
-        seed: add_task.seed,
-        prompt: add_task.prompt,
+        seed,
+        prompt,
         image: validated_image,
-        model: add_task.model,
+        model,
         task_kind,
+        model_params: validated_model_params,
     })
 }
 
@@ -241,6 +302,7 @@ pub async fn add_task_handler(
     let user_seed = validated.seed.filter(|seed| *seed != -1);
     // Draw from all u32 values except u32::MAX, after cast that excludes -1 sentinel.
     let seed = user_seed.unwrap_or_else(|| rand::random_range(0..u32::MAX) as i32);
+    let model_params = validated.model_params;
 
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
@@ -285,6 +347,7 @@ pub async fn add_task_handler(
         image: validated.image.as_ref().map(|img| img.data.clone()),
         model: Some(resolved_model.model),
         seed,
+        model_params,
     };
 
     queue.push(task.clone());

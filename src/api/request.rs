@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -11,6 +12,7 @@ pub struct AddTaskRequest {
     pub seed: Option<SeedValue>,
     pub prompt: Option<String>,
     pub model: Option<String>,
+    pub model_params: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

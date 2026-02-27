@@ -9,7 +9,10 @@ use std::sync::Arc;
 use crate::common::image::serialize_image_base64;
 use bytes::Bytes;
 use serde::Serialize;
+use serde_json::{Map, Value};
 use uuid::Uuid;
+
+pub type ModelParams = Map<String, Value>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Task {
@@ -28,6 +31,8 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub seed: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_params: Option<ModelParams>,
 }
 
 pub trait HasUuid {

@@ -261,6 +261,9 @@ async fn get_result_invalid_model_config() {
             image: None,
             model: Some("missing-model".to_string()),
             seed: 0,
+            model_params: Some(
+                serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+            ),
         })
         .await;
 
@@ -273,6 +276,34 @@ async fn get_result_invalid_model_config() {
         .await;
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn get_result_allows_none_model_params() {
+    let h = build_harness().await;
+    let task_id = Uuid::new_v4();
+    h.task_manager
+        .add_task(Task {
+            id: task_id,
+            prompt: Some(Arc::new("robot".to_string())),
+            image: None,
+            model: Some("404-3dgs".to_string()),
+            seed: 0,
+            model_params: None,
+        })
+        .await;
+
+    let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 18);
+    let payload = b"spz".to_vec();
+    add_success_result(&h.task_manager, task_id, worker, payload.clone()).await;
+
+    let res = TestClient::get(format!("http://localhost/get_result?id={task_id}"))
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
 }
 
 #[tokio::test]

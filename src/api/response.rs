@@ -125,6 +125,7 @@ mod tests {
             image: None,
             model: Some("404-3dgs".to_string()),
             seed: 0,
+            model_params: None,
         };
 
         let resp = GetTasksResponse {
@@ -151,6 +152,7 @@ mod tests {
             image: Some(Bytes::from(vec![1u8, 2u8, 3u8])),
             model: Some("404-mesh".to_string()),
             seed: 0,
+            model_params: None,
         };
 
         let resp = GetTasksResponse {

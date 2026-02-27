@@ -183,6 +183,7 @@ async fn image_task_persists_until_all_assignments_complete() {
         image: Some(image.clone()),
         model: Some("404-mesh".to_string()),
         seed: 0,
+        model_params: None,
     };
     task_manager.add_task(task).await;
 
@@ -265,6 +266,7 @@ async fn model_persists_until_result_retrieval() {
         image: None,
         model: Some("404-3dgs".to_string()),
         seed: 0,
+        model_params: None,
     };
     task_manager.add_task(task).await;
 
@@ -327,6 +329,7 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
         image: None,
         model: None,
         seed: 0,
+        model_params: None,
     };
     task_manager.add_task(task).await;
     task_manager
@@ -415,6 +418,7 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
         image: None,
         model: None,
         seed: 0,
+        model_params: None,
     };
     task_manager.add_task(task).await;
 
@@ -486,6 +490,7 @@ async fn test_timeout_increments_metric() {
         image: Some(Bytes::from_static(b"")),
         model: None,
         seed: 0,
+        model_params: None,
     };
     task_manager.add_task(task).await;
 

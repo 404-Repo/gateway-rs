@@ -157,6 +157,12 @@ pub struct PromptConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelParamsConfig {
+    #[serde(default = "default_model_params_max_len")]
+    pub max_len: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ImageConfig {
     pub max_width: u32,
     pub max_height: u32,
@@ -216,6 +222,16 @@ fn default_max_rate_limit_deltas_per_batch() -> usize {
     16_384
 }
 
+fn default_model_params_max_len() -> usize {
+    1024
+}
+
+fn default_model_params_config() -> ModelParamsConfig {
+    ModelParamsConfig {
+        max_len: default_model_params_max_len(),
+    }
+}
+
 fn default_snapshot_dir() -> String {
     "data/snapshots".to_string()
 }
@@ -256,6 +272,8 @@ pub struct NodeConfig {
     pub rclient: RClientConfig,
     pub http: HTTPConfig,
     pub prompt: PromptConfig,
+    #[serde(default = "default_model_params_config")]
+    pub model_params: ModelParamsConfig,
     pub image: ImageConfig,
     pub db: DbConfig,
     pub cert: Certificate,

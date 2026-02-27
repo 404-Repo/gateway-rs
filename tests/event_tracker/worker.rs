@@ -28,6 +28,9 @@ async fn records_worker_events() {
         image: None,
         model: None,
         seed: 0,
+        model_params: Some(
+            serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+        ),
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);
@@ -103,6 +106,9 @@ async fn records_worker_failure_event() {
         image: None,
         model: None,
         seed: 0,
+        model_params: Some(
+            serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+        ),
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);
@@ -185,6 +191,9 @@ async fn records_worker_timeout_event() {
         image: None,
         model: None,
         seed: 0,
+        model_params: Some(
+            serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+        ),
     };
     task_manager.add_task(task).await;
     let worker = Hotkey::from_bytes(&[3u8; 32]);

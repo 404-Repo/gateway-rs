@@ -81,6 +81,7 @@ async fn get_tasks_requested_count_zero_returns_empty() {
         image: None,
         model: None,
         seed: 1,
+        model_params: None,
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);
@@ -117,6 +118,7 @@ async fn get_tasks_requested_count_large_returns_available() {
         image: None,
         model: None,
         seed: 1,
+        model_params: Some(serde_json::from_str(r#"{"quality":"high"}"#).expect("object")),
     };
     h.task_manager.add_task(task.clone()).await;
     h.task_queue.push(task);
@@ -141,6 +143,12 @@ async fn get_tasks_requested_count_large_returns_available() {
         .and_then(|v| v.as_array())
         .expect("tasks");
     assert_eq!(tasks.len(), 1);
+    assert!(
+        tasks[0]
+            .get("model_params")
+            .and_then(|value| value.as_object())
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -152,6 +160,7 @@ async fn get_tasks_single_model_filters_results() {
         image: None,
         model: Some("404-3dgs".to_string()),
         seed: 0,
+        model_params: Some(serde_json::from_str(r#"{"preset":"fast"}"#).expect("object")),
     };
     let task_b = Task {
         id: Uuid::new_v4(),
@@ -159,6 +168,7 @@ async fn get_tasks_single_model_filters_results() {
         image: None,
         model: Some("404-mesh".to_string()),
         seed: 0,
+        model_params: Some(serde_json::from_str(r#"{"preset":"high_quality"}"#).expect("object")),
     };
     h.task_manager.add_task(task_a.clone()).await;
     h.task_manager.add_task(task_b.clone()).await;
@@ -201,6 +211,7 @@ async fn get_tasks_multiple_models_returns_all_matches() {
         image: None,
         model: Some("404-3dgs".to_string()),
         seed: 0,
+        model_params: Some(serde_json::from_str(r#"{"preset":"fast"}"#).expect("object")),
     };
     let task_b = Task {
         id: Uuid::new_v4(),
@@ -208,6 +219,7 @@ async fn get_tasks_multiple_models_returns_all_matches() {
         image: None,
         model: Some("404-mesh".to_string()),
         seed: 0,
+        model_params: Some(serde_json::from_str(r#"{"preset":"high_quality"}"#).expect("object")),
     };
     h.task_manager.add_task(task_a.clone()).await;
     h.task_manager.add_task(task_b.clone()).await;
