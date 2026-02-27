@@ -67,6 +67,7 @@ async fn parse_add_task_multipart(
     let cfg = state.config();
     let image_cfg = cfg.image();
     let prompt_cfg = cfg.prompt();
+    let model_params_cfg = cfg.model_params();
     let upload_limiter = cfg.image_upload_limiter();
     let mut image_permit: Option<OwnedSemaphorePermit> = None;
 
@@ -77,7 +78,8 @@ async fn parse_add_task_multipart(
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
                 .for_field("model", 64)
-                .for_field("seed", 11),
+                .for_field("seed", 11)
+                .for_field("model_params", model_params_cfg.max_len as u64),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
