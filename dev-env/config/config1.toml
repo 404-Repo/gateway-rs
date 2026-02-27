@@ -131,6 +131,11 @@ min_len = 3
 max_len = 384
 allowed_pattern = "^[A-Za-z0-9 .,'():;/?!+%-]+$"
 
+[model_params]
+# Maximum length (in bytes) of the `model_params` JSON string accepted by the API.
+# This should stay in sync with `ModelParamsConfig::max_len` defaults.
+max_len = 1024
+
 [image]
 max_width = 1024
 max_height = 1024
