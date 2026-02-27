@@ -28,6 +28,8 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub seed: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_params: Option<String>,
 }
 
 pub trait HasUuid {

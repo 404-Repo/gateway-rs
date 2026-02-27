@@ -226,6 +226,7 @@ mod tests {
             image: None,
             model: None,
             seed: 0,
+            model_params: None,
         }
     }
 
@@ -285,6 +286,7 @@ mod tests {
             image: None,
             model: Some("404-3dgs".to_string()),
             seed: 0,
+            model_params: None,
         };
         let task_b = Task {
             id: Uuid::new_v4(),
@@ -292,6 +294,7 @@ mod tests {
             image: None,
             model: Some("404-mesh".to_string()),
             seed: 0,
+            model_params: None,
         };
 
         queue.push(task_a.clone());

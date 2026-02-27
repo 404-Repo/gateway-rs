@@ -109,6 +109,7 @@ pub(crate) fn multipart_body(
     image: Option<&[u8]>,
     model: Option<&str>,
     seed: Option<&str>,
+    model_params: Option<&str>,
 ) -> (String, Vec<u8>) {
     let mut fields = Vec::<(&str, &str)>::new();
     if let Some(p) = prompt {
@@ -119,6 +120,9 @@ pub(crate) fn multipart_body(
     }
     if let Some(s) = seed {
         fields.push(("seed", s));
+    }
+    if let Some(mp) = model_params {
+        fields.push(("model_params", mp));
     }
 
     let mut files = Vec::new();
@@ -295,7 +299,7 @@ pub(crate) async fn add_task_prompt(h: &TestHarness, prompt: &str, model: Option
 }
 
 pub(crate) async fn add_task_image(h: &TestHarness, image: &[u8], model: Option<&str>) -> Uuid {
-    let (boundary, body) = multipart_body(None, Some(image), model, None);
+    let (boundary, body) = multipart_body(None, Some(image), model, None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(

@@ -13,7 +13,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::config::{HTTPConfig, ImageConfig, NodeConfig, PromptConfig, read_config_from_path};
+use crate::config::{
+    HTTPConfig, ImageConfig, ModelParamsConfig, NodeConfig, PromptConfig, read_config_from_path,
+};
 use crate::http3::rate_limits::{RateLimitService, RateLimiters};
 use crate::http3::upload_limiter::ImageUploadLimiter;
 use crate::http3::whitelist::{
@@ -50,6 +52,10 @@ impl RuntimeConfigView {
 
     pub fn image(&self) -> &ImageConfig {
         &self.snapshot.raw.image
+    }
+
+    pub fn model_params(&self) -> &ModelParamsConfig {
+        &self.snapshot.raw.model_params
     }
 
     pub fn prompt_regex(&self) -> &Regex {

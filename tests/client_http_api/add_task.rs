@@ -17,6 +17,111 @@ async fn add_task_json_success() {
 }
 
 #[tokio::test]
+async fn add_task_rejects_invalid_model_params_json() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": "not-json"
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn add_task_multipart_rejects_invalid_model_params() {
+    let h = build_harness().await;
+    let image = tiny_png_bytes();
+    let (boundary, body) =
+        multipart_body(Some("robot"), Some(&image), None, None, Some("not-json"));
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn add_task_rejects_too_long_model_params_json() {
+    let h = build_harness().await;
+    let max_len = h.config.model_params.max_len;
+    let too_long = "a".repeat(max_len + 1);
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": too_long
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn add_task_multipart_rejects_too_long_model_params() {
+    let h = build_harness().await;
+    let max_len = h.config.model_params.max_len;
+    let too_long = "a".repeat(max_len + 1);
+    let image = tiny_png_bytes();
+    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None, None, Some(&too_long));
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .add_header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+            true,
+        )
+        .body(body)
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn add_task_accepts_valid_model_params_json() {
+    let h = build_harness().await;
+    let params = r#"{"temperature":0.5}"#;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": params
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn add_task_accepts_null_model_params_json() {
+    let h = build_harness().await;
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model_params": serde_json::Value::Null
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn add_task_origin_header_success() {
     let h = build_harness().await;
     let res = TestClient::post("http://localhost/add_task")
@@ -52,7 +157,7 @@ async fn add_task_origin_header_success() {
 async fn add_task_image_multipart_success() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("1"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("1"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -76,7 +181,7 @@ async fn add_task_image_multipart_success() {
 async fn add_task_without_seed_is_ok() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, None);
+    let (boundary, body) = multipart_body(None, Some(&image), None, None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -100,7 +205,7 @@ async fn add_task_without_seed_is_ok() {
 async fn add_task_negative_seed_is_ok() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("-1"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("-1"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -128,7 +233,7 @@ async fn add_task_negative_seed_is_ok() {
 async fn add_task_min_i32_seed_is_ok() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("-2147483648"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("-2147483648"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -152,7 +257,7 @@ async fn add_task_min_i32_seed_is_ok() {
 async fn add_task_high_u32_seed_converts_to_signed_for_multipart() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("2147483648"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("2147483648"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -201,7 +306,7 @@ async fn add_task_high_u32_seed_converts_to_signed_for_json() {
 async fn add_task_max_u32_seed_randomizes_for_multipart() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("4294967295"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("4294967295"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -271,7 +376,7 @@ async fn add_task_json_negative_seed_randomizes() {
 async fn add_task_invalid_seed_returns_bad_request() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("not-a-number"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("not-a-number"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -290,7 +395,7 @@ async fn add_task_invalid_seed_returns_bad_request() {
 async fn add_task_out_of_range_seed_returns_bad_request() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(None, Some(&image), None, Some("4294967296"));
+    let (boundary, body) = multipart_body(None, Some(&image), None, Some("4294967296"), None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -308,7 +413,7 @@ async fn add_task_out_of_range_seed_returns_bad_request() {
 #[tokio::test]
 async fn add_task_rejects_invalid_image_data() {
     let h = build_harness().await;
-    let (boundary, body) = multipart_body(None, Some(b"not-an-image"), None, None);
+    let (boundary, body) = multipart_body(None, Some(b"not-an-image"), None, None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -394,7 +499,7 @@ async fn add_task_rejects_missing_prompt_and_image() {
 async fn add_task_rejects_prompt_and_image() {
     let h = build_harness().await;
     let image = tiny_png_bytes();
-    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None, None);
+    let (boundary, body) = multipart_body(Some("robot"), Some(&image), None, None, None);
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header(
@@ -508,6 +613,7 @@ async fn add_task_rejects_when_queue_full() {
             image: None,
             model: None,
             seed: 0,
+            model_params: None,
         });
     }
     let res = TestClient::post("http://localhost/add_task")

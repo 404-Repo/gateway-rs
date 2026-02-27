@@ -44,6 +44,7 @@ struct AddTaskMultipartData {
     prompt: Option<String>,
     image: Option<Bytes>,
     model: Option<String>,
+    model_params: Option<String>,
 }
 
 struct ValidatedAddTask {
@@ -51,6 +52,7 @@ struct ValidatedAddTask {
     prompt: Option<String>,
     image: Option<crate::common::image::ImageValidationResult>,
     model: Option<String>,
+    model_params: Option<String>,
     task_kind: TaskKind,
 }
 
@@ -65,17 +67,19 @@ async fn parse_add_task_multipart(
     let cfg = state.config();
     let image_cfg = cfg.image();
     let prompt_cfg = cfg.prompt();
+    let model_params_cfg = cfg.model_params();
     let upload_limiter = cfg.image_upload_limiter();
     let mut image_permit: Option<OwnedSemaphorePermit> = None;
 
     let constraints = Constraints::new()
-        .allowed_fields(vec!["seed", "prompt", "image", "model"])
+        .allowed_fields(vec!["seed", "prompt", "image", "model", "model_params"])
         .size_limit(
             SizeLimit::new()
                 .for_field("image", image_cfg.max_size_bytes as u64)
                 .for_field("prompt", prompt_cfg.max_len as u64)
                 .for_field("model", 64)
-                .for_field("seed", 11),
+                .for_field("seed", 11)
+                .for_field("model_params", model_params_cfg.max_len as u64),
         );
 
     let mut multipart = Multipart::with_constraints(byte_stream, boundary, constraints);
@@ -83,6 +87,7 @@ async fn parse_add_task_multipart(
     let mut seed = None;
     let mut image = None;
     let mut model = None;
+    let mut model_params = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -116,6 +121,9 @@ async fn parse_add_task_multipart(
             "seed" => {
                 seed = Some(parse_seed_text(&read_text_field(field, "seed").await?)?);
             }
+            "model_params" => {
+                model_params = Some(read_text_field(field, "model_params").await?);
+            }
             _ => continue,
         }
     }
@@ -125,6 +133,7 @@ async fn parse_add_task_multipart(
         image,
         model,
         seed,
+        model_params,
     })
 }
 
@@ -152,6 +161,7 @@ async fn parse_add_task_request(
             image: None,
             model: add_task.model,
             seed: add_task.seed.map(|seed| seed.into_i32()),
+            model_params: add_task.model_params,
         })
     }
 }
@@ -208,6 +218,24 @@ fn validate_add_task_input(
         }
     }
 
+    if let Some(model_params) = &add_task.model_params {
+        let model_params_cfg = cfg.model_params();
+        if model_params.len() > model_params_cfg.max_len {
+            return Err(ServerError::BadRequest(format!(
+                "Model params is too long: maximum length is {} characters (got {})",
+                model_params_cfg.max_len,
+                model_params.len()
+            )));
+        }
+
+        if let Err(err) = serde_json::from_str::<serde_json::Value>(model_params) {
+            return Err(ServerError::BadRequest(format!(
+                "Model params must be valid JSON: {}",
+                err
+            )));
+        }
+    }
+
     let validated_image = if let Some(image_data) = add_task.image {
         let image_cfg = cfg.image();
         Some(validate_image(image_data, image_cfg)?)
@@ -221,6 +249,7 @@ fn validate_add_task_input(
         image: validated_image,
         model: add_task.model,
         task_kind,
+        model_params: add_task.model_params,
     })
 }
 
@@ -241,6 +270,7 @@ pub async fn add_task_handler(
     let user_seed = validated.seed.filter(|seed| *seed != -1);
     // Draw from all u32 values except u32::MAX, after cast that excludes -1 sentinel.
     let seed = user_seed.unwrap_or_else(|| rand::random_range(0..u32::MAX) as i32);
+    let model_params = validated.model_params;
 
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
@@ -285,6 +315,7 @@ pub async fn add_task_handler(
         image: validated.image.as_ref().map(|img| img.data.clone()),
         model: Some(resolved_model.model),
         seed,
+        model_params,
     };
 
     queue.push(task.clone());

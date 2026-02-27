@@ -11,6 +11,7 @@ pub struct AddTaskRequest {
     pub seed: Option<SeedValue>,
     pub prompt: Option<String>,
     pub model: Option<String>,
+    pub model_params: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

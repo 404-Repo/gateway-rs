@@ -218,6 +218,7 @@ async fn add_result_not_assigned_returns_unauthorized() {
             image: None,
             model: None,
             seed: 0,
+            model_params: Some(r#"{"preset":"default"}"#.to_string()),
         })
         .await;
 
