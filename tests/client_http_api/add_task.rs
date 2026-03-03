@@ -5,6 +5,7 @@ use salvo::test::TestClient;
 use uuid::Uuid;
 
 use gateway::api::Task;
+use gateway::crypto::hotkey::Hotkey;
 
 use crate::support::{
     add_task_prompt, build_harness, multipart_body, read_response, tiny_png_bytes,
@@ -19,6 +20,15 @@ fn model_params_json_object_text_with_total_len(total_len: usize) -> String {
 fn model_params_json_object_with_total_len(total_len: usize) -> serde_json::Value {
     serde_json::from_str(&model_params_json_object_text_with_total_len(total_len))
         .expect("model params object")
+}
+
+fn pop_seed_for_task(h: &crate::support::TestHarness, task_id: Uuid) -> i32 {
+    let worker = Hotkey::from_bytes(&[200u8; 32]);
+    let tasks = h.task_queue.pop(1, &worker);
+    assert_eq!(tasks.len(), 1, "expected one queued task");
+    let task = &tasks[0].0;
+    assert_eq!(task.id, task_id, "seed check popped unexpected task");
+    task.seed
 }
 
 #[tokio::test]
@@ -324,7 +334,7 @@ async fn add_task_negative_seed_is_ok() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(pop_seed_for_task(&h, task_id), -1);
 }
 
 #[tokio::test]
@@ -376,7 +386,7 @@ async fn add_task_high_u32_seed_converts_to_signed_for_multipart() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_eq!(h.task_manager.get_seed(task_id).await, Some(i32::MIN));
+    assert_eq!(pop_seed_for_task(&h, task_id), i32::MIN);
 }
 
 #[tokio::test]
@@ -397,7 +407,7 @@ async fn add_task_high_u32_seed_converts_to_signed_for_json() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_eq!(h.task_manager.get_seed(task_id).await, Some(i32::MIN));
+    assert_eq!(pop_seed_for_task(&h, task_id), i32::MIN);
 }
 
 #[tokio::test]
@@ -425,7 +435,7 @@ async fn add_task_max_u32_seed_randomizes_for_multipart() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(pop_seed_for_task(&h, task_id), -1);
 }
 
 #[tokio::test]
@@ -446,7 +456,7 @@ async fn add_task_max_u32_seed_randomizes_for_json() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(pop_seed_for_task(&h, task_id), -1);
 }
 
 #[tokio::test]
@@ -467,7 +477,7 @@ async fn add_task_json_negative_seed_randomizes() {
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
-    assert_ne!(h.task_manager.get_seed(task_id).await, Some(-1));
+    assert_ne!(pop_seed_for_task(&h, task_id), -1);
 }
 
 #[tokio::test]
@@ -721,4 +731,110 @@ async fn add_task_rejects_when_queue_full() {
         .await;
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn add_task_queue_full_before_reservation_does_not_consume_distributed_quota() {
+    let h = build_harness().await;
+
+    let mut updated = (*h.config).clone();
+    updated.http.max_task_queue_len = 0;
+    updated
+        .http
+        .add_task_authenticated_per_user_hourly_rate_limit = 1;
+
+    let updated_toml = toml::to_string(&updated).expect("serialize config");
+    std::fs::write(&h.config_path, updated_toml).expect("write config");
+    assert!(h.runtime_config.reload_from_disk().await);
+
+    for attempt in 1..=2 {
+        let res = TestClient::post("http://localhost/add_task")
+            .add_header("x-api-key", h.api_key.to_string(), true)
+            .json(&serde_json::json!({"prompt": "robot"}))
+            .send(&h.service)
+            .await;
+        let (status, _headers, body) = read_response(res).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attempt {attempt} should fail from queue-full (not rate-limited), got {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn add_task_bad_request_does_not_consume_distributed_quota() {
+    let h = build_harness().await;
+
+    let mut updated = (*h.config).clone();
+    updated.http.basic_rate_limit = 1000;
+    updated.http.add_task_generic_key_global_hourly_rate_limit = 1;
+    updated.http.add_task_generic_key_per_ip_hourly_rate_limit = 1000;
+
+    let updated_toml = toml::to_string(&updated).expect("serialize config");
+    std::fs::write(&h.config_path, updated_toml).expect("write config");
+    assert!(h.runtime_config.reload_from_disk().await);
+
+    // Invalid payload should be rejected by validation.
+    let bad = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({}))
+        .send(&h.service)
+        .await;
+    let (bad_status, _headers, _body) = read_response(bad).await;
+    assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+    // First valid request should still pass (bad payload did not consume distributed quota).
+    let first_valid = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot"}))
+        .send(&h.service)
+        .await;
+    let (first_status, _headers, first_body) = read_response(first_valid).await;
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "first valid request failed: {}",
+        String::from_utf8_lossy(&first_body)
+    );
+
+    // Second valid request should now be limited by distributed generic quota.
+    let second_valid = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot"}))
+        .send(&h.service)
+        .await;
+    let (next_status, _headers, _body) = read_response(second_valid).await;
+    assert_eq!(next_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn add_task_attempt_limiter_applies_before_validation() {
+    let h = build_harness().await;
+
+    let mut updated = (*h.config).clone();
+    updated.http.basic_rate_limit = 1;
+    updated.http.add_task_generic_key_global_hourly_rate_limit = 1000;
+    updated.http.add_task_generic_key_per_ip_hourly_rate_limit = 1000;
+
+    let updated_toml = toml::to_string(&updated).expect("serialize config");
+    std::fs::write(&h.config_path, updated_toml).expect("write config");
+    assert!(h.runtime_config.reload_from_disk().await);
+
+    let bad = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({}))
+        .send(&h.service)
+        .await;
+    let (bad_status, _headers, _body) = read_response(bad).await;
+    assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+    let next = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot"}))
+        .send(&h.service)
+        .await;
+    let (next_status, _headers, _body) = read_response(next).await;
+    assert_eq!(next_status, StatusCode::TOO_MANY_REQUESTS);
 }

@@ -255,16 +255,19 @@ async fn get_result_invalid_model_config() {
     let h = build_harness().await;
     let task_id = Uuid::new_v4();
     h.task_manager
-        .add_task(Task {
-            id: task_id,
-            prompt: Some(Arc::new("robot".to_string())),
-            image: None,
-            model: Some("missing-model".to_string()),
-            seed: 0,
-            model_params: Some(
-                serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
-            ),
-        })
+        .add_task_with_rate_limit_reservation(
+            Task {
+                id: task_id,
+                prompt: Some(Arc::new("robot".to_string())),
+                image: None,
+                model: Some("missing-model".to_string()),
+                seed: 0,
+                model_params: Some(
+                    serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+                ),
+            },
+            None,
+        )
         .await;
 
     let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 17);
@@ -283,14 +286,17 @@ async fn get_result_allows_none_model_params() {
     let h = build_harness().await;
     let task_id = Uuid::new_v4();
     h.task_manager
-        .add_task(Task {
-            id: task_id,
-            prompt: Some(Arc::new("robot".to_string())),
-            image: None,
-            model: Some("404-3dgs".to_string()),
-            seed: 0,
-            model_params: None,
-        })
+        .add_task_with_rate_limit_reservation(
+            Task {
+                id: task_id,
+                prompt: Some(Arc::new("robot".to_string())),
+                image: None,
+                model: Some("404-3dgs".to_string()),
+                seed: 0,
+                model_params: None,
+            },
+            None,
+        )
         .await;
 
     let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 18);

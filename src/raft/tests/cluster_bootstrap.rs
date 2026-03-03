@@ -7,29 +7,18 @@ use openraft::Membership;
 async fn test_three_node_cluster() -> Result<()> {
     init_tracing();
 
-    let node_configs = vec![
-        (1, "127.0.0.1:21001"),
-        (2, "127.0.0.1:21002"),
-        (3, "127.0.0.1:21003"),
-    ];
+    let node_configs = reserve_node_configs(3)?;
     let node_clients = make_node_clients(node_configs.len());
 
-    let (_config, pcfg, raft_nodes, state_machines, _server_handles) =
-        setup_cluster(&node_configs, node_clients.clone(), None).await?;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    connect_clients(&node_configs, &node_clients, &pcfg, |i, _| {
-        format!("127.0.0.1:{}", 22001 + i)
-    })
-    .await?;
+    let (_config, _pcfg, raft_nodes, state_machines, _server_handles) =
+        setup_connected_cluster(&node_configs, node_clients.clone(), None).await?;
 
     // Initialize and configure the first node as leader
     let mut initial_nodes = BTreeMap::new();
     initial_nodes.insert(
         1,
         BasicNode {
-            addr: node_configs[0].1.to_string(),
+            addr: node_configs[0].1.clone(),
         },
     );
 
@@ -41,9 +30,7 @@ async fn test_three_node_cluster() -> Result<()> {
     let last_log_id = {
         let mut last_log_id = None;
         for (_i, (node_id, addr)) in node_configs.iter().enumerate().skip(1) {
-            let node = BasicNode {
-                addr: addr.to_string(),
-            };
+            let node = BasicNode { addr: addr.clone() };
             let add_learner_result = raft_nodes[0].add_learner(*node_id, node, false).await?;
             last_log_id = Some(add_learner_result.log_id);
         }
@@ -73,54 +60,30 @@ async fn test_three_node_cluster() -> Result<()> {
 async fn test_vote_mode_all_initialized() -> Result<()> {
     init_tracing();
 
-    let node_configs = vec![
-        (1, "127.0.0.1:24004"),
-        (2, "127.0.0.1:24005"),
-        (3, "127.0.0.1:24006"),
-    ];
+    let node_configs = reserve_node_configs(3)?;
     let node_clients = make_node_clients(node_configs.len());
 
-    let (_config, pcfg, raft_nodes, state_machines, _server_handles) =
-        setup_cluster(&node_configs, node_clients.clone(), None).await?;
+    let (_config, _pcfg, raft_nodes, state_machines, _server_handles) =
+        setup_connected_cluster(&node_configs, node_clients.clone(), None).await?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let refs = node_config_refs(&node_configs);
 
-    connect_clients(&node_configs, &node_clients, &pcfg, |i, _| {
-        format!("127.0.0.1:{}", 25001 + i as u16)
-    })
-    .await?;
-
-    for (i, raft) in raft_nodes.clone().into_iter().enumerate() {
-        let initial_nodes = membership_from(&node_configs);
-        let membership: Membership<_, _> = Membership::from(initial_nodes.clone());
+    for (i, _) in raft_nodes.iter().enumerate() {
+        let membership: Membership<_, _> = Membership::from(membership_from(&refs));
         info!(
             "Node {} initializing with membership configuration: {}",
             node_configs[i].0, membership
         );
-
-        tokio::spawn(async move {
-            raft.initialize(initial_nodes).await.unwrap();
-        });
     }
+    initialize_all_nodes_membership(&raft_nodes, &node_configs);
 
     // Wait until a leader is elected.
-    let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
+    let (leader_id, leader_index) =
+        wait_for_consistent_leader_index(&raft_nodes, &node_configs, Duration::from_secs(10))
+            .await?;
 
     info!("Leader elected: {:?}", leader_id);
-    for (i, raft) in raft_nodes.iter().enumerate() {
-        let observed_leader = raft.metrics().borrow().current_leader;
-        assert_eq!(
-            observed_leader,
-            Some(leader_id),
-            "Node {} sees a different leader",
-            i + 1
-        );
-    }
-
-    let leader_index = node_configs
-        .iter()
-        .position(|(id, _)| *id == leader_id)
-        .expect("Leader must be one of the nodes");
+    assert_all_nodes_see_leader(&raft_nodes, leader_id);
     client_write_and_wait(
         &raft_nodes[leader_index],
         &raft_nodes,

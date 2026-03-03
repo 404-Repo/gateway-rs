@@ -10,7 +10,9 @@ use gateway::api::Task;
 use gateway::crypto::hotkey::Hotkey;
 use gateway::db::{EventRecorder, EventSinkHandle, InMemoryEventSink};
 use gateway::metrics::Metrics;
-use gateway::task::TaskManager;
+use gateway::raft::store::RateLimitMutation;
+use gateway::task::{TaskManager, TaskManagerInit};
+use scc::Queue;
 
 use crate::support::{
     build_harness, default_rate_ctx, multipart_add_result, read_response, sign_worker,
@@ -32,7 +34,9 @@ async fn records_worker_events() {
             serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
         ),
     };
-    h.task_manager.add_task(task.clone()).await;
+    h.task_manager
+        .add_task_with_rate_limit_reservation(task.clone(), None)
+        .await;
     h.task_queue.push(task);
 
     let (worker_hotkey, timestamp, signature) = sign_worker([1u8; 32]);
@@ -110,7 +114,9 @@ async fn records_worker_failure_event() {
             serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
         ),
     };
-    h.task_manager.add_task(task.clone()).await;
+    h.task_manager
+        .add_task_with_rate_limit_reservation(task.clone(), None)
+        .await;
     h.task_queue.push(task);
 
     let (worker_hotkey, timestamp, signature) = sign_worker([1u8; 32]);
@@ -174,14 +180,15 @@ async fn records_worker_timeout_event() {
         shutdown.clone(),
     );
     let metrics = Metrics::new(0.05).expect("metrics");
-    let task_manager = TaskManager::new(
-        1,
-        1,
-        Duration::from_millis(5),
-        Duration::from_millis(10),
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 1,
+        expected_results: 1,
+        cleanup_interval: Duration::from_millis(5),
+        result_lifetime: Duration::from_millis(10),
+        rate_limit_mutation_queue: Arc::new(Queue::<RateLimitMutation>::default()),
         metrics,
-        Some(event_recorder.clone()),
-    )
+        worker_event_recorder: Some(event_recorder.clone()),
+    })
     .await;
 
     let task_id = Uuid::new_v4();
@@ -195,7 +202,9 @@ async fn records_worker_timeout_event() {
             serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
         ),
     };
-    task_manager.add_task(task).await;
+    task_manager
+        .add_task_with_rate_limit_reservation(task, None)
+        .await;
     let worker = Hotkey::from_bytes(&[3u8; 32]);
     task_manager
         .record_assignment(task_id, worker.clone(), worker.to_string().into())

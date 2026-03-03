@@ -31,12 +31,46 @@ pub async fn write_handler(
 
     if let Ok(request) = rmp_serde::from_slice::<RaftRequest>(body.as_ref()) {
         match request {
+            RaftRequest::RateLimitMutations {
+                request_id,
+                mutations,
+            } => {
+                gateway_state
+                    .apply_rate_limit_mutations(request_id, mutations)
+                    .await
+                    .map_err(|e| {
+                        ServerError::Internal(format!(
+                            "Failed to apply rate limit mutations: {:?}",
+                            e
+                        ))
+                    })?;
+                res.status_code(StatusCode::OK);
+                res.render(Text::Plain("Ok"));
+                return Ok(());
+            }
             RaftRequest::RateLimitDeltas { request_id, deltas } => {
                 gateway_state
                     .apply_rate_limit_deltas(request_id, deltas)
                     .await
                     .map_err(|e| {
                         ServerError::Internal(format!("Failed to apply rate limit deltas: {:?}", e))
+                    })?;
+                res.status_code(StatusCode::OK);
+                res.render(Text::Plain("Ok"));
+                return Ok(());
+            }
+            RaftRequest::RateLimitRefunds {
+                request_id,
+                refunds,
+            } => {
+                gateway_state
+                    .apply_rate_limit_refunds(request_id, refunds)
+                    .await
+                    .map_err(|e| {
+                        ServerError::Internal(format!(
+                            "Failed to apply rate limit refunds: {:?}",
+                            e
+                        ))
                     })?;
                 res.status_code(StatusCode::OK);
                 res.render(Text::Plain("Ok"));
