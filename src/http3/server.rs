@@ -23,10 +23,9 @@ use crate::http3::handlers::core::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::rate_limits::{
-    basic_rate_limit, enforce_rate_limit, generic_global_rate_limit, generic_per_ip_rate_limit,
-    leader_rate_limit, load_rate_limit, metric_rate_limit, prepare_rate_limit_context,
-    read_rate_limit, result_rate_limit, status_rate_limit, unauthorized_only_rate_limit,
-    update_key_rate_limit,
+    basic_rate_limit, leader_rate_limit, load_rate_limit, metric_rate_limit,
+    prepare_rate_limit_context, read_rate_limit, result_rate_limit, status_rate_limit,
+    unauthorized_only_rate_limit, update_key_rate_limit,
 };
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
@@ -198,16 +197,13 @@ impl Http3Server {
                 Router::with_path("/add_task")
                     .hoop(add_task_size_limit)
                     // Order matters:
-                    // 1) unauthorized per-IP limiter
-                    // 2) auth check
-                    // 3) generic-key global limiter (all IPs combined)
-                    // 4) generic-key per-IP limiter
-                    // 5) distributed subject limiter (user/company)
+                    // 1) cheap per-IP limiter (all requests, pre-parse)
+                    // 2) unauthorized per-IP limiter
+                    // 3) auth check
+                    // 4) distributed subject limiter in handler after validation
+                    .hoop(basic_rate_limit)
                     .hoop(unauthorized_only_rate_limit)
                     .hoop(api_or_generic_key_check)
-                    .hoop(generic_global_rate_limit)
-                    .hoop(generic_per_ip_rate_limit)
-                    .hoop(enforce_rate_limit)
                     .post(add_task_handler),
             )
             .push(

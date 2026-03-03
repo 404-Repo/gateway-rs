@@ -3,13 +3,17 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rand::RngExt;
+use scc::Queue;
 use uuid::Uuid;
 
-use super::{TaskManager, TaskStatus};
+use super::{TaskManager, TaskManagerInit, TaskStatus};
 use crate::api::Task;
 use crate::api::request::AddTaskResultRequest;
 use crate::crypto::hotkey::Hotkey;
+use crate::http3::rate_limits::RateLimitReservation;
 use crate::metrics::Metrics;
+use crate::raft::rate_limit::{ClientKey, DistributedRateLimiter};
+use crate::raft::store::{RateLimitDelta, RateLimitMutation, Subject};
 
 fn tasks_in_progress_total(metrics: &Metrics) -> f64 {
     metrics
@@ -524,4 +528,358 @@ async fn test_timeout_increments_metric() {
         }
     }
     assert!(found, "timeout_failures_total for worker was not found");
+}
+
+#[tokio::test]
+async fn emits_refund_when_task_completes_with_only_failures() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(500);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let limiter = DistributedRateLimiter::new(64);
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 4,
+        expected_results: 2,
+        cleanup_interval: CLEANUP_INTERVAL,
+        result_lifetime: RESULT_LIFETIME,
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+
+    let task_id = Uuid::new_v4();
+    let task = Task {
+        id: task_id,
+        prompt: Some(Arc::new("refund".to_string())),
+        image: None,
+        model: None,
+        seed: 0,
+        model_params: None,
+    };
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            task,
+            Some(RateLimitReservation::new(
+                limiter.clone(),
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 777u128,
+                    hour_epoch: 900,
+                    day_epoch: 90,
+                    add_hour: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker1: Hotkey = Hotkey::from_bytes(&[11u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[12u8; 32]);
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1.to_string().into())
+        .await;
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2.to_string().into())
+        .await;
+
+    let _ = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker1.clone(),
+                worker_id: worker1.to_string().into(),
+                asset: None,
+                reason: Some("worker failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+    let completed = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker2.clone(),
+                worker_id: worker2.to_string().into(),
+                asset: None,
+                reason: Some("worker failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(completed.completed);
+
+    let refund = mutation_queue
+        .pop()
+        .expect("a refund should be emitted for all-failure completion");
+    assert_eq!(refund.subject, Subject::User);
+    assert_eq!(refund.id, 777u128);
+    assert_eq!(refund.hour_epoch, 900);
+    assert_eq!(refund.day_epoch, 90);
+    assert_eq!(refund.hour_delta, -1);
+    assert_eq!(refund.day_delta, 0);
+}
+
+#[tokio::test]
+async fn waits_for_expected_results_before_emitting_refund() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(500);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let limiter = DistributedRateLimiter::new(64);
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 4,
+        expected_results: 2,
+        cleanup_interval: CLEANUP_INTERVAL,
+        result_lifetime: RESULT_LIFETIME,
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+
+    let task_id = Uuid::new_v4();
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            Task {
+                id: task_id,
+                prompt: Some(Arc::new("deferred refund".to_string())),
+                image: None,
+                model: None,
+                seed: 0,
+                model_params: None,
+            },
+            Some(RateLimitReservation::new(
+                limiter,
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 901u128,
+                    hour_epoch: 910,
+                    day_epoch: 91,
+                    add_hour: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker1: Hotkey = Hotkey::from_bytes(&[31u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[32u8; 32]);
+
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1.to_string().into())
+        .await;
+
+    let first = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker1.clone(),
+                worker_id: worker1.to_string().into(),
+                asset: None,
+                reason: Some("worker failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !first.completed,
+        "single failed attempt must not complete when more results are expected"
+    );
+    assert!(
+        mutation_queue.pop().is_none(),
+        "refund must wait until expected attempts are exhausted"
+    );
+
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2.to_string().into())
+        .await;
+
+    let second = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker2.clone(),
+                worker_id: worker2.to_string().into(),
+                asset: None,
+                reason: Some("worker failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(second.completed);
+    assert!(
+        mutation_queue.pop().is_some(),
+        "refund should be emitted after final expected failure"
+    );
+}
+
+#[tokio::test]
+async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(120);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let limiter = DistributedRateLimiter::new(64);
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 4,
+        expected_results: 2,
+        cleanup_interval: CLEANUP_INTERVAL,
+        result_lifetime: RESULT_LIFETIME,
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+
+    let task_id = Uuid::new_v4();
+    let task = Task {
+        id: task_id,
+        prompt: Some(Arc::new("partial".to_string())),
+        image: None,
+        model: None,
+        seed: 0,
+        model_params: None,
+    };
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            task,
+            Some(RateLimitReservation::new(
+                limiter.clone(),
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 888u128,
+                    hour_epoch: 901,
+                    day_epoch: 90,
+                    add_hour: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker1: Hotkey = Hotkey::from_bytes(&[21u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[22u8; 32]);
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1.to_string().into())
+        .await;
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2.to_string().into())
+        .await;
+
+    let _ = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker1.clone(),
+                worker_id: worker1.to_string().into(),
+                asset: Some(vec![1, 2, 3]),
+                reason: None,
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(
+        RESULT_LIFETIME.as_millis() as u64 + 200,
+    ))
+    .await;
+
+    assert!(
+        mutation_queue.pop().is_none(),
+        "partial success must not trigger refund on timeout"
+    );
+}
+
+#[tokio::test]
+async fn refund_rolls_back_local_pending_capacity() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(50);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(500);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let limiter = DistributedRateLimiter::new(64);
+    let key = ClientKey {
+        subject: Subject::User,
+        id: 999u128,
+    };
+    let epochs = (901u64, 90u64);
+
+    assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+    assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 2,
+        expected_results: 1,
+        cleanup_interval: CLEANUP_INTERVAL,
+        result_lifetime: RESULT_LIFETIME,
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+
+    let task_id = Uuid::new_v4();
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            Task {
+                id: task_id,
+                prompt: Some(Arc::new("rollback".to_string())),
+                image: None,
+                model: None,
+                seed: 0,
+                model_params: None,
+            },
+            Some(RateLimitReservation::new(
+                limiter.clone(),
+                vec![RateLimitDelta {
+                    subject: key.subject,
+                    id: key.id,
+                    hour_epoch: epochs.0,
+                    day_epoch: epochs.1,
+                    add_hour: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker: Hotkey = Hotkey::from_bytes(&[42u8; 32]);
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker.to_string().into())
+        .await;
+    let completed = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker.clone(),
+                worker_id: worker.to_string().into(),
+                asset: None,
+                reason: Some("worker failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(completed.completed);
+
+    let refund = mutation_queue
+        .pop()
+        .expect("a refund mutation should be emitted");
+    assert_eq!(refund.subject, Subject::User);
+    assert_eq!(refund.id, 999u128);
+    assert_eq!(refund.hour_delta, -1);
+
+    assert!(
+        limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+        "refund must restore local pending capacity immediately"
+    );
 }

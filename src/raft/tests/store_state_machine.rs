@@ -2,6 +2,7 @@ use crate::raft::TypeConfig;
 use crate::raft::memstore::persistence::LOG_STORE_ARCHIVE_PREFIX;
 use crate::raft::memstore::persistence::PersistedLogState;
 use crate::raft::memstore::persistence::TypeConfigLogPersistence;
+use crate::raft::store::RateLimitRefund;
 use crate::raft::test_utils::unique_path;
 
 use super::*;
@@ -77,6 +78,33 @@ fn collect_sorted_log_archives(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
         .collect();
     archives.sort_by_key(|(_, idx)| *idx);
     Ok(archives)
+}
+
+fn rate_limit_entry(
+    leader: LeaderId<u64>,
+    idx: u64,
+    request_id: u128,
+    deltas: Vec<RateLimitDelta>,
+) -> Entry<TypeConfig> {
+    Entry {
+        log_id: LogId::new(leader, idx),
+        payload: EntryPayload::Normal(Request::RateLimitDeltas { request_id, deltas }),
+    }
+}
+
+fn rate_limit_refund_entry(
+    leader: LeaderId<u64>,
+    idx: u64,
+    request_id: u128,
+    refunds: Vec<RateLimitRefund>,
+) -> Entry<TypeConfig> {
+    Entry {
+        log_id: LogId::new(leader, idx),
+        payload: EntryPayload::Normal(Request::RateLimitRefunds {
+            request_id,
+            refunds,
+        }),
+    }
 }
 
 #[tokio::test]
@@ -336,6 +364,311 @@ async fn log_store_archive_contains_full_state() -> Result<()> {
             .index,
         1_999
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_resets_on_hour_and_day_rollover() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    let key = rate_limit_key(Subject::User, 999u128);
+    let leader = LeaderId::new(1, 1);
+
+    let mut sm = Arc::clone(&store);
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        1,
+        10u128,
+        vec![RateLimitDelta {
+            subject: Subject::User,
+            id: 999u128,
+            hour_epoch: 100,
+            day_epoch: 10,
+            add_hour: 3,
+            add_day: 4,
+        }],
+    )])
+    .await?;
+
+    let (hour, day) = store.get_rate_limit_usage(&key, 100, 10).await;
+    assert_eq!(hour, 3);
+    assert_eq!(day, 4);
+
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        2,
+        11u128,
+        vec![RateLimitDelta {
+            subject: Subject::User,
+            id: 999u128,
+            hour_epoch: 101,
+            day_epoch: 10,
+            add_hour: 2,
+            add_day: 1,
+        }],
+    )])
+    .await?;
+
+    let (hour_after_hour_rollover, day_same_window) =
+        store.get_rate_limit_usage(&key, 101, 10).await;
+    assert_eq!(hour_after_hour_rollover, 2);
+    assert_eq!(day_same_window, 5);
+
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        3,
+        12u128,
+        vec![RateLimitDelta {
+            subject: Subject::User,
+            id: 999u128,
+            hour_epoch: 101,
+            day_epoch: 11,
+            add_hour: 1,
+            add_day: 2,
+        }],
+    )])
+    .await?;
+
+    let (hour_same_window, day_after_day_rollover) =
+        store.get_rate_limit_usage(&key, 101, 11).await;
+    assert_eq!(hour_same_window, 3);
+    assert_eq!(day_after_day_rollover, 2);
+
+    let (old_hour, old_day) = store.get_rate_limit_usage(&key, 100, 10).await;
+    assert_eq!(old_hour, 0);
+    assert_eq!(old_day, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_ignores_stale_epoch_updates_even_in_mixed_batch() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    let key = rate_limit_key(Subject::Company, 777u128);
+    let leader = LeaderId::new(1, 1);
+
+    let mut sm = Arc::clone(&store);
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        1,
+        20u128,
+        vec![
+            RateLimitDelta {
+                subject: Subject::Company,
+                id: 777u128,
+                hour_epoch: 50,
+                day_epoch: 5,
+                add_hour: 9,
+                add_day: 9,
+            },
+            RateLimitDelta {
+                subject: Subject::Company,
+                id: 777u128,
+                hour_epoch: 51,
+                day_epoch: 6,
+                add_hour: 1,
+                add_day: 1,
+            },
+        ],
+    )])
+    .await?;
+
+    let (new_hour, new_day) = store.get_rate_limit_usage(&key, 51, 6).await;
+    assert_eq!(new_hour, 1);
+    assert_eq!(new_day, 1);
+
+    let (old_hour, old_day) = store.get_rate_limit_usage(&key, 50, 5).await;
+    assert_eq!(old_hour, 0);
+    assert_eq!(old_day, 0);
+
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        2,
+        21u128,
+        vec![RateLimitDelta {
+            subject: Subject::Company,
+            id: 777u128,
+            hour_epoch: 49,
+            day_epoch: 4,
+            add_hour: 50,
+            add_day: 50,
+        }],
+    )])
+    .await?;
+
+    let (hour_after_stale, day_after_stale) = store.get_rate_limit_usage(&key, 51, 6).await;
+    assert_eq!(hour_after_stale, 1);
+    assert_eq!(day_after_stale, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_rate_limit_request_ids_are_deduplicated() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    let key = rate_limit_key(Subject::GenericIp, 12345u128);
+    let leader = LeaderId::new(1, 1);
+    let request_id = 424242u128;
+
+    let mut sm = Arc::clone(&store);
+    sm.apply(vec![
+        rate_limit_entry(
+            leader,
+            1,
+            request_id,
+            vec![RateLimitDelta {
+                subject: Subject::GenericIp,
+                id: 12345u128,
+                hour_epoch: 200,
+                day_epoch: 20,
+                add_hour: 2,
+                add_day: 0,
+            }],
+        ),
+        rate_limit_entry(
+            leader,
+            2,
+            request_id,
+            vec![RateLimitDelta {
+                subject: Subject::GenericIp,
+                id: 12345u128,
+                hour_epoch: 200,
+                day_epoch: 20,
+                add_hour: 2,
+                add_day: 0,
+            }],
+        ),
+    ])
+    .await?;
+
+    let (hour, day) = store.get_rate_limit_usage(&key, 200, 20).await;
+    assert_eq!(hour, 2);
+    assert_eq!(day, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_refunds_decrement_counters_and_saturate() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    let key = rate_limit_key(Subject::GenericGlobal, 0u128);
+    let leader = LeaderId::new(1, 1);
+
+    let mut sm = Arc::clone(&store);
+    sm.apply(vec![rate_limit_entry(
+        leader,
+        1,
+        30u128,
+        vec![RateLimitDelta {
+            subject: Subject::GenericGlobal,
+            id: 0u128,
+            hour_epoch: 400,
+            day_epoch: 40,
+            add_hour: 3,
+            add_day: 0,
+        }],
+    )])
+    .await?;
+
+    sm.apply(vec![rate_limit_refund_entry(
+        leader,
+        2,
+        31u128,
+        vec![RateLimitRefund {
+            subject: Subject::GenericGlobal,
+            id: 0u128,
+            hour_epoch: 400,
+            day_epoch: 40,
+            sub_hour: 1,
+            sub_day: 0,
+        }],
+    )])
+    .await?;
+
+    let (hour_after_refund, day_after_refund) = store.get_rate_limit_usage(&key, 400, 40).await;
+    assert_eq!(hour_after_refund, 2);
+    assert_eq!(day_after_refund, 0);
+
+    sm.apply(vec![rate_limit_refund_entry(
+        leader,
+        3,
+        32u128,
+        vec![RateLimitRefund {
+            subject: Subject::GenericGlobal,
+            id: 0u128,
+            hour_epoch: 400,
+            day_epoch: 40,
+            sub_hour: 999,
+            sub_day: 0,
+        }],
+    )])
+    .await?;
+
+    let (hour_after_saturating_refund, day_after_saturating_refund) =
+        store.get_rate_limit_usage(&key, 400, 40).await;
+    assert_eq!(hour_after_saturating_refund, 0);
+    assert_eq!(day_after_saturating_refund, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn persists_and_recovers_rate_limit_counters() -> Result<()> {
+    let (temp_dir, log_store_path) = prepare_snapshot_dir()?;
+    let dir_path = temp_dir.path();
+
+    let store = Arc::new(StateMachineStore::with_persistence(
+        dir_path,
+        2,
+        Some(log_store_path.clone()),
+    )?);
+
+    let mut state_machine = Arc::clone(&store);
+    state_machine
+        .apply(vec![rate_limit_entry(
+            LeaderId::new(1, 1),
+            1,
+            500u128,
+            vec![
+                RateLimitDelta {
+                    subject: Subject::GenericGlobal,
+                    id: 0u128,
+                    hour_epoch: 300,
+                    day_epoch: 30,
+                    add_hour: 7,
+                    add_day: 0,
+                },
+                RateLimitDelta {
+                    subject: Subject::Company,
+                    id: 333u128,
+                    hour_epoch: 300,
+                    day_epoch: 30,
+                    add_hour: 3,
+                    add_day: 2,
+                },
+            ],
+        )])
+        .await?;
+
+    let mut builder = Arc::clone(&store);
+    builder.build_snapshot().await?;
+
+    drop(builder);
+    drop(state_machine);
+    drop(store);
+
+    let restored = StateMachineStore::with_persistence(dir_path, 2, Some(log_store_path.clone()))?;
+
+    let global_key = rate_limit_key(Subject::GenericGlobal, 0u128);
+    let company_key = rate_limit_key(Subject::Company, 333u128);
+
+    let (global_hour, global_day) = restored.get_rate_limit_usage(&global_key, 300, 30).await;
+    assert_eq!(global_hour, 7);
+    assert_eq!(global_day, 0);
+
+    let (company_hour, company_day) = restored.get_rate_limit_usage(&company_key, 300, 30).await;
+    assert_eq!(company_hour, 3);
+    assert_eq!(company_day, 2);
 
     Ok(())
 }

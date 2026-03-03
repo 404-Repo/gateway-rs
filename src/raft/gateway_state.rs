@@ -1,5 +1,5 @@
 use super::store::Request;
-use super::store::{RateLimitDelta, Subject, rate_limit_key};
+use super::store::{RateLimitDelta, RateLimitMutation, RateLimitRefund, Subject, rate_limit_key};
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfo;
@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use uuid::Uuid;
 
-type RateLimitDeltaBatch = Arc<Vec<RateLimitDelta>>;
+type RateLimitMutationBatch = Arc<Vec<RateLimitMutation>>;
 
 pub struct ActivityEventRef<'a> {
     pub user_id: Option<Uuid>,
@@ -47,9 +47,9 @@ pub struct WorkerEventRef<'a> {
 
 #[derive(Serialize)]
 enum RateLimitRequestRef<'a> {
-    RateLimitDeltas {
+    RateLimitMutations {
         request_id: u128,
-        deltas: &'a [RateLimitDelta],
+        mutations: &'a [RateLimitMutation],
     },
 }
 
@@ -57,6 +57,11 @@ enum RateLimitRequestRef<'a> {
 pub enum GatewayStateError {
     NotFound(String),
     DeserializeError(rmp_serde::decode::Error),
+}
+
+#[derive(Debug)]
+pub enum UpdateGenericKeyError {
+    OverlapsExistingApiKey,
 }
 
 impl fmt::Display for GatewayStateError {
@@ -72,6 +77,19 @@ impl fmt::Display for GatewayStateError {
     }
 }
 
+impl fmt::Display for UpdateGenericKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UpdateGenericKeyError::OverlapsExistingApiKey => {
+                write!(
+                    f,
+                    "Refusing to set generic key because it overlaps with an existing API key"
+                )
+            }
+        }
+    }
+}
+
 impl std::error::Error for GatewayStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -81,6 +99,8 @@ impl std::error::Error for GatewayStateError {
     }
 }
 
+impl std::error::Error for UpdateGenericKeyError {}
+
 struct GatewayStateInner {
     state: Arc<StateMachineStore>,
     raft: Raft,
@@ -88,7 +108,7 @@ struct GatewayStateInner {
     key_validator: Arc<ApiKeyValidator>,
     task_manager: TaskManager,
     config: Arc<RuntimeConfigStore>,
-    rate_limit_queue: Arc<Queue<RateLimitDelta>>,
+    rate_limit_queue: Arc<Queue<RateLimitMutation>>,
     event_recorder: EventRecorder,
 }
 
@@ -104,7 +124,7 @@ pub struct GatewayStateInit {
     pub key_validator_updater: Arc<ApiKeyValidator>,
     pub task_manager: TaskManager,
     pub config: Arc<RuntimeConfigStore>,
-    pub rate_limit_queue: Arc<Queue<RateLimitDelta>>,
+    pub rate_limit_queue: Arc<Queue<RateLimitMutation>>,
     pub event_recorder: EventRecorder,
 }
 
@@ -345,6 +365,12 @@ impl GatewayState {
             return Ok(());
         };
 
+        let key_to_set_str = key_to_set.to_string();
+        let existing = self.lookup_api_key(key_to_set_str.as_str()).await;
+        if existing.user_id.is_some() || existing.company_id.is_some() {
+            return Err(UpdateGenericKeyError::OverlapsExistingApiKey.into());
+        }
+
         let serialized_key = rmp_serde::to_vec(&key_to_set)
             .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to rmp: {}", e))?;
 
@@ -424,8 +450,8 @@ impl GatewayState {
         self.internal.config.snapshot().http().generic_key
     }
 
-    pub fn enqueue_rate_limit_delta(&self, delta: RateLimitDelta) {
-        self.internal.rate_limit_queue.push(delta);
+    pub fn enqueue_rate_limit_mutation(&self, mutation: RateLimitMutation) {
+        self.internal.rate_limit_queue.push(mutation);
     }
 
     pub fn record_activity_event(&self, event: ActivityEventRef<'_>) {
@@ -452,12 +478,12 @@ impl GatewayState {
         );
     }
 
-    pub async fn submit_rate_limit_deltas(
+    pub async fn submit_rate_limit_mutations_with_request_id(
         &self,
-        deltas: RateLimitDeltaBatch,
+        request_id: u128,
+        mutations: RateLimitMutationBatch,
         client: Option<&Http3Client>,
     ) -> Result<()> {
-        let request_id = Uuid::new_v4().as_u128();
         let cfg = self.internal.config.snapshot();
         let current_node_id = cfg.node().network.node_id;
         let timeout = Duration::from_secs(cfg.http().forward_timeout_sec);
@@ -466,11 +492,11 @@ impl GatewayState {
             if let Some(leader_id) = self.leader().await
                 && leader_id != current_node_id
             {
-                let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitDeltas {
+                let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitMutations {
                     request_id,
-                    deltas: deltas.as_slice(),
+                    mutations: mutations.as_slice(),
                 })
-                .map_err(|e| anyhow::anyhow!("Failed to serialize deltas: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to serialize mutations: {}", e))?;
 
                 let admin_key = self.admin_key();
                 return self
@@ -491,20 +517,24 @@ impl GatewayState {
         .await
         .map_err(|e| {
             error!(
-                "Rate limit deltas submission failed after retries (request_id: {}): {}",
+                "Rate limit mutations submission failed after retries (request_id: {}): {}",
                 request_id, e
             );
-            anyhow::anyhow!("Rate limit deltas submission failed after retries: {}", e)
+            anyhow::anyhow!(
+                "Rate limit mutations submission failed after retries: {}",
+                e
+            )
         })?;
 
         if forwarded {
             Ok(())
         } else {
-            let owned_deltas = match Arc::try_unwrap(deltas) {
+            let owned_mutations = match Arc::try_unwrap(mutations) {
                 Ok(vec) => vec,
                 Err(arc) => arc.as_ref().clone(),
             };
-            self.apply_rate_limit_deltas(request_id, owned_deltas).await
+            self.apply_rate_limit_mutations(request_id, owned_mutations)
+                .await
         }
     }
 
@@ -513,12 +543,45 @@ impl GatewayState {
         request_id: u128,
         deltas: Vec<RateLimitDelta>,
     ) -> Result<()> {
+        self.apply_rate_limit_mutations(
+            request_id,
+            deltas
+                .into_iter()
+                .map(RateLimitMutation::from_delta)
+                .collect(),
+        )
+        .await
+    }
+
+    pub async fn apply_rate_limit_mutations(
+        &self,
+        request_id: u128,
+        mutations: Vec<RateLimitMutation>,
+    ) -> Result<()> {
         self.internal
             .raft
-            .client_write(Request::RateLimitDeltas { request_id, deltas })
+            .client_write(Request::RateLimitMutations {
+                request_id,
+                mutations,
+            })
             .await
             .map(|_r| ())
             .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))
+    }
+
+    pub async fn apply_rate_limit_refunds(
+        &self,
+        request_id: u128,
+        refunds: Vec<RateLimitRefund>,
+    ) -> Result<()> {
+        self.apply_rate_limit_mutations(
+            request_id,
+            refunds
+                .into_iter()
+                .map(RateLimitMutation::from_refund)
+                .collect(),
+        )
+        .await
     }
 
     pub async fn get_cluster_rate_usage(
@@ -533,5 +596,46 @@ impl GatewayState {
             .state
             .get_rate_limit_usage(&key, hour_epoch, day_epoch)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_request_ref_encodes_compatibly_with_request() {
+        let request_id = 42u128;
+        let delta = RateLimitDelta {
+            subject: Subject::User,
+            id: 7u128,
+            hour_epoch: 10,
+            day_epoch: 1,
+            add_hour: 1,
+            add_day: 0,
+        };
+        let refund = RateLimitRefund::from_delta(delta);
+        let mutation_delta = RateLimitMutation::from_delta(delta);
+        let mutation_refund = RateLimitMutation::from_refund(refund);
+
+        let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitMutations {
+            request_id,
+            mutations: &[mutation_delta, mutation_refund],
+        })
+        .expect("serialize mutation request");
+        match rmp_serde::from_slice::<Request>(&payload).expect("decode mutation request") {
+            Request::RateLimitMutations {
+                request_id: decoded_id,
+                mutations,
+            } => {
+                assert_eq!(decoded_id, request_id);
+                assert_eq!(mutations.len(), 2);
+                assert_eq!(mutations[0].subject, Subject::User);
+                assert_eq!(mutations[0].id, 7u128);
+                assert_eq!(mutations[0].hour_delta, 1);
+                assert_eq!(mutations[1].hour_delta, -1);
+            }
+            other => panic!("unexpected decoded variant: {:?}", other),
+        }
     }
 }

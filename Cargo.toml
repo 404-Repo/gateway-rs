@@ -5,7 +5,7 @@ edition = "2024"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { version = "0.89.1", features = [
+salvo = { version = "0.89.2", features = [
     "quinn",
     "rustls",
     "rate-limiter",
@@ -59,8 +59,8 @@ anyhow = "1.0.102"
 bytes = "1.11.1"
 rcgen = { version = "0.14.7", features = ["pem"] }
 foldhash = "0.2.0"
-scc = "3.6.5"
-sdd = "4.6.3"
+scc = "3.6.6"
+sdd = "4.6.7"
 schnorrkel = "0.11.5"
 base64-simd = "0.8"
 parity-scale-codec = { version = "3.7.5", features = ["derive"] }
@@ -68,7 +68,7 @@ blake2 = "0.10.6"
 bs58 = "0.5.1"
 prometheus = "0.14.0"
 blake3 = "1.8.3"
-moka = { version = "0.12.13", features = ["sync"] }
+moka = { version = "0.12.14", features = ["sync"] }
 mimalloc = { version = "0.1.48", default-features = false }
 regex = "1.12.3"
 image = "0.25.9"

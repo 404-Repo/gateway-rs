@@ -8,6 +8,7 @@ use crate::api::response::GenericKeyResponse;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
+use crate::raft::gateway_state::UpdateGenericKeyError;
 
 // curl --http3 -X POST "https://gateway-eu.404.xyz:4443/update_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "content-type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
 #[handler]
@@ -32,8 +33,13 @@ pub async fn generic_key_update_handler(
     gateway_state
         .update_gateway_generic_key(current_node_id, Some(ugk.generic_key), admin_key)
         .await
-        .map_err(|e| {
-            ServerError::Internal(format!("Failed to update gateway generic key: {:?}", e))
+        .map_err(|e| match e.downcast::<UpdateGenericKeyError>() {
+            Ok(UpdateGenericKeyError::OverlapsExistingApiKey) => ServerError::BadRequest(
+                "Generic key overlaps with an existing user/company API key".to_string(),
+            ),
+            Err(err) => {
+                ServerError::Internal(format!("Failed to update gateway generic key: {:?}", err))
+            }
         })?;
 
     res.status_code(StatusCode::OK);

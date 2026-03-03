@@ -24,12 +24,53 @@ use crate::http3::handlers::common::multipart::{
 };
 use crate::http3::handlers::common::origin::normalize_origin;
 use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_worker_request};
-use crate::http3::rate_limits::RateLimitContext;
+use crate::http3::rate_limits::{
+    RateLimitContext, RateLimitReservation, reserve_add_task_rate_limit,
+};
 use crate::http3::state::HttpState;
 use crate::metrics::TaskKind;
 use crate::raft::gateway_state::WorkerEventRef;
 
 const ASSIGNMENT_RECORD_CONCURRENCY: usize = 16;
+
+struct PendingRateLimitRollbackGuard {
+    reservation: Option<RateLimitReservation>,
+}
+
+impl PendingRateLimitRollbackGuard {
+    fn new(reservation: Option<RateLimitReservation>) -> Self {
+        Self { reservation }
+    }
+
+    fn arm(&mut self, reservation: Option<RateLimitReservation>) {
+        self.reservation = reservation;
+    }
+
+    fn disarm(&mut self) {
+        self.reservation = None;
+    }
+
+    async fn rollback_now(&mut self) {
+        if let Some(reservation) = self.reservation.as_ref() {
+            reservation.rollback_pending().await;
+            self.reservation = None;
+        }
+    }
+}
+
+impl Drop for PendingRateLimitRollbackGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                reservation.rollback_pending().await;
+            });
+        }
+    }
+}
 
 fn task_kind_label(task: &Task) -> &'static str {
     if task.image.is_some() {
@@ -294,95 +335,120 @@ pub async fn add_task_handler(
     req: &mut Request,
     res: &mut Response,
 ) -> Result<(), ServerError> {
-    let add_task = parse_add_task_request(depot, req).await?;
-    let validated = validate_add_task_input(depot, add_task)?;
-    let has_prompt = validated.prompt.is_some();
-    let has_image = validated.image.is_some();
-    let task_kind = validated.task_kind;
-    let user_seed = validated.seed.filter(|seed| *seed != -1);
-    // Draw from all u32 values except u32::MAX, after cast that excludes -1 sentinel.
-    let seed = user_seed.unwrap_or_else(|| rand::random_range(0..u32::MAX) as i32);
-    let model_params = validated.model_params;
-
     let state = depot.require::<HttpState>()?.clone();
-    let cfg = state.config();
-    let queue = state.task_queue().clone();
-    let metrics = state.metrics().clone();
-    let http_cfg = cfg.http();
-    let rate_ctx = depot.require::<RateLimitContext>()?;
-    let record_origin = normalize_origin(req, http_cfg);
-    metrics.inc_request_origin(record_origin);
-
-    if queue.len() >= http_cfg.max_task_queue_len {
-        return Err(ServerError::Internal("Task queue is full".to_string()));
-    }
-
-    let model_cfg = &cfg.node().model_config;
-    let resolved_model = model_cfg
-        .resolve_and_validate_input(validated.model.as_deref(), has_prompt, has_image)
-        .map_err(|err| {
-            model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
-        })?;
-
-    let task_id = Uuid::new_v4();
-    let task_description = if let Some(prompt) = &validated.prompt {
-        format!("prompt: {}", prompt)
-    } else if let Some(img) = &validated.image {
-        format!(
-            "image - format: {:?}, dimensions: {}x{}",
-            img.format, img.width, img.height
-        )
-    } else {
-        return Err(ServerError::Internal(
-            "Neither prompt nor image present after validation".to_string(),
-        ));
-    };
-
     let gateway_state = state.gateway_state().clone();
+    let mut rollback_guard = PendingRateLimitRollbackGuard::new(None);
 
-    let model_name = resolved_model.model.clone();
-    let task = Task {
-        id: task_id,
-        prompt: validated.prompt.map(Arc::new),
-        image: validated.image.as_ref().map(|img| img.data.clone()),
-        model: Some(resolved_model.model),
-        seed,
-        model_params,
-    };
+    let outcome = async {
+        let add_task = parse_add_task_request(depot, req).await?;
+        let validated = validate_add_task_input(depot, add_task)?;
+        let has_prompt = validated.prompt.is_some();
+        let has_image = validated.image.is_some();
+        let task_kind = validated.task_kind;
+        let user_seed = validated.seed.filter(|seed| *seed != -1);
+        // Draw from all u32 values except u32::MAX, after cast that excludes -1 sentinel.
+        let seed = user_seed.unwrap_or_else(|| rand::random_range(0..u32::MAX) as i32);
+        let model_params = validated.model_params;
 
-    queue.push(task.clone());
-    metrics.set_queue_len(queue.len());
+        let cfg = state.config();
+        let queue = state.task_queue().clone();
+        let metrics = state.metrics().clone();
+        let http_cfg = cfg.http();
+        let rate_ctx = depot.require::<RateLimitContext>()?.clone();
+        let record_origin = normalize_origin(req, http_cfg);
+        metrics.inc_request_origin(record_origin);
 
-    if let Some(user_seed) = user_seed {
-        info!(
-            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}, seed: {}",
-            task_id, model_name, record_origin, task_description, user_seed
+        if queue.len() >= http_cfg.max_task_queue_len {
+            return Err(ServerError::Internal("Task queue is full".to_string()));
+        }
+
+        let model_cfg = &cfg.node().model_config;
+        let resolved_model = model_cfg
+            .resolve_and_validate_input(validated.model.as_deref(), has_prompt, has_image)
+            .map_err(|err| {
+                model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
+            })?;
+        let reservation = reserve_add_task_rate_limit(depot).await?;
+        rollback_guard.arm(reservation.clone());
+
+        let task_id = Uuid::new_v4();
+        let task_description = if let Some(prompt) = &validated.prompt {
+            format!("prompt: {}", prompt)
+        } else if let Some(img) = &validated.image {
+            format!(
+                "image - format: {:?}, dimensions: {}x{}",
+                img.format, img.width, img.height
+            )
+        } else {
+            return Err(ServerError::Internal(
+                "Neither prompt nor image present after validation".to_string(),
+            ));
+        };
+
+        let model_name = resolved_model.model.clone();
+        let task = Task {
+            id: task_id,
+            prompt: validated.prompt.map(Arc::new),
+            image: validated.image.as_ref().map(|img| img.data.clone()),
+            model: Some(resolved_model.model),
+            seed,
+            model_params,
+        };
+
+        gateway_state
+            .task_manager()
+            .add_task_with_rate_limit_reservation(task.clone(), reservation.clone())
+            .await;
+        if let Some(reservation) = reservation.as_ref() {
+            for mutation in reservation.charge_mutations() {
+                gateway_state.enqueue_rate_limit_mutation(mutation);
+            }
+        }
+
+        queue.push(task);
+        metrics.set_queue_len(queue.len());
+
+        if let Some(user_seed) = user_seed {
+            info!(
+                "A new task has been pushed with ID: {}, model: {}, origin: {}, {}, seed: {}",
+                task_id, model_name, record_origin, task_description, user_seed
+            );
+        } else {
+            info!(
+                "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
+                task_id, model_name, record_origin, task_description
+            );
+        }
+
+        record_task_activity(
+            TaskActivityContext {
+                gateway_state: &gateway_state,
+                rate_ctx: &rate_ctx,
+                origin: record_origin,
+                task_kind: task_kind.label(),
+                model: Some(model_name.as_str()),
+                task_id: Some(task_id),
+            },
+            "add_task",
         );
-    } else {
-        info!(
-            "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
-            task_id, model_name, record_origin, task_description
-        );
+
+        res.render(Json(serde_json::json!({
+            "id": task_id
+        })));
+        Ok(())
     }
+    .await;
 
-    gateway_state.task_manager().add_task(task).await;
-
-    record_task_activity(
-        TaskActivityContext {
-            gateway_state: &gateway_state,
-            rate_ctx,
-            origin: record_origin,
-            task_kind: task_kind.label(),
-            model: Some(model_name.as_str()),
-            task_id: Some(task_id),
-        },
-        "add_task",
-    );
-
-    res.render(Json(serde_json::json!({
-        "id": task_id
-    })));
-    Ok(())
+    match outcome {
+        Ok(()) => {
+            rollback_guard.disarm();
+            Ok(())
+        }
+        Err(err) => {
+            rollback_guard.rollback_now().await;
+            Err(err)
+        }
+    }
 }
 
 // curl --http3 -X POST https://gateway-eu.404.xyz:4443/get_tasks \
@@ -543,4 +609,80 @@ pub async fn get_load_handler(
     let load_response = LoadResponse { gateways };
     res.render(Json(load_response));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingRateLimitRollbackGuard, RateLimitReservation};
+    use crate::raft::rate_limit::{ClientKey, DistributedRateLimiter};
+    use crate::raft::store::{RateLimitDelta, Subject};
+
+    #[tokio::test]
+    async fn rollback_guard_restores_local_pending_capacity_on_drop() {
+        let limiter = DistributedRateLimiter::new(64);
+        let key = ClientKey {
+            subject: Subject::User,
+            id: 42u128,
+        };
+        let epochs = (500u64, 50u64);
+
+        assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+
+        {
+            let reservation = RateLimitReservation::new(
+                limiter.clone(),
+                vec![RateLimitDelta {
+                    subject: key.subject,
+                    id: key.id,
+                    hour_epoch: epochs.0,
+                    day_epoch: epochs.1,
+                    add_hour: 1,
+                    add_day: 0,
+                }],
+            );
+            let mut guard = PendingRateLimitRollbackGuard::new(None);
+            guard.arm(Some(reservation));
+        }
+
+        // Drop-based rollback is spawned; allow it to run.
+        tokio::task::yield_now().await;
+
+        assert!(
+            limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+            "rollback guard should release pending local capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_guard_restores_local_pending_capacity_on_explicit_rollback() {
+        let limiter = DistributedRateLimiter::new(64);
+        let key = ClientKey {
+            subject: Subject::User,
+            id: 99u128,
+        };
+        let epochs = (800u64, 80u64);
+
+        assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+
+        let reservation = RateLimitReservation::new(
+            limiter.clone(),
+            vec![RateLimitDelta {
+                subject: key.subject,
+                id: key.id,
+                hour_epoch: epochs.0,
+                day_epoch: epochs.1,
+                add_hour: 1,
+                add_day: 0,
+            }],
+        );
+        let mut guard = PendingRateLimitRollbackGuard::new(Some(reservation));
+        guard.rollback_now().await;
+
+        assert!(
+            limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+            "explicit rollback should release pending local capacity"
+        );
+    }
 }

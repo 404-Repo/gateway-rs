@@ -1,13 +1,12 @@
 use crate::http3::depot_ext::DepotExt;
-pub use crate::http3::distributed_rate_limiter::DistributedRateLimiter;
 pub use crate::http3::handlers::core::api_or_generic_key_check;
 pub use crate::http3::handlers::core::{id_handler, version_handler};
 pub use crate::http3::handlers::result::add_result_handler;
 pub use crate::http3::handlers::result::{get_result_handler, get_status_handler};
 pub use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
-pub use crate::http3::rate_limits::{CompanyRateLimit, RateLimitService};
+pub use crate::http3::rate_limits::CompanyRateLimit;
 pub use crate::http3::rate_limits::{
-    RateLimitContext, RateLimiters, enforce_rate_limit, prepare_rate_limit_context,
+    RateLimitContext, RateLimiters, basic_rate_limit, prepare_rate_limit_context,
 };
 pub use crate::http3::response::custom_response;
 pub use crate::http3::state::{HttpState, HttpStateInit};
@@ -15,6 +14,7 @@ pub use crate::http3::upload_limiter::ImageUploadLimiter;
 pub use crate::http3::whitelist::RateLimitWhitelist;
 pub use crate::raft::gateway_state::{GatewayState, GatewayStateInit};
 pub use crate::raft::network::Network;
+pub use crate::raft::rate_limit::{DistributedRateLimiter, RateLimitService};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,9 +35,9 @@ use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{ApiKeyValidator, Database, EventRecorder};
 use crate::metrics::Metrics;
-use crate::raft::store::RateLimitDelta;
+use crate::raft::store::RateLimitMutation;
 use crate::raft::{LogStore, StateMachineStore};
-use crate::task::TaskManager;
+use crate::task::{TaskManager, TaskManagerInit};
 
 static TEST_CRYPTO_INIT: Once = Once::new();
 
@@ -177,17 +177,17 @@ pub async fn build_shared_harness_core(
             .insert(config.network.node_id.to_string(), gateway_bytes);
     }
 
-    let task_manager = TaskManager::new(
-        config.basic.taskmanager_initial_capacity,
-        config.basic.unique_workers_per_task,
-        Duration::from_secs(config.basic.taskmanager_cleanup_interval),
-        Duration::from_secs(config.basic.taskmanager_result_lifetime),
-        metrics.clone(),
-        Some(event_recorder.clone()),
-    )
+    let rate_limit_mutation_queue = Arc::new(scc::Queue::<RateLimitMutation>::default());
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: config.basic.taskmanager_initial_capacity,
+        expected_results: config.basic.unique_workers_per_task,
+        cleanup_interval: Duration::from_secs(config.basic.taskmanager_cleanup_interval),
+        result_lifetime: Duration::from_secs(config.basic.taskmanager_result_lifetime),
+        rate_limit_mutation_queue: rate_limit_mutation_queue.clone(),
+        metrics: metrics.clone(),
+        worker_event_recorder: Some(event_recorder.clone()),
+    })
     .await;
-
-    let rate_limit_queue = Arc::new(scc::Queue::<RateLimitDelta>::default());
 
     let gateway_state = GatewayState::new(GatewayStateInit {
         state: Arc::clone(&state_machine_store),
@@ -196,7 +196,7 @@ pub async fn build_shared_harness_core(
         key_validator_updater: key_validator.clone(),
         task_manager: task_manager.clone(),
         config: Arc::clone(&runtime_config),
-        rate_limit_queue,
+        rate_limit_queue: rate_limit_mutation_queue,
         event_recorder,
     });
 

@@ -2,16 +2,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Instant;
+use std::{io::ErrorKind, time::Duration as StdDuration};
 
 use anyhow::{Result, bail};
 use foldhash::fast::RandomState;
 use openraft::{BasicNode, LogId};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
-use crate::raft::{NodeId, Raft, client::RClient};
+use crate::config::RServerConfig;
+use crate::raft::client::{RClient, RClientBuilder};
+use crate::raft::server::RServer;
+use crate::raft::{LogStore, Network, NodeId, Raft, StateMachineStore, TypeConfig};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static TRACING: Once = Once::new();
+static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 pub(crate) fn unique_path(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -147,4 +154,122 @@ pub(crate) fn make_node_clients(len: usize) -> Arc<scc::HashMap<String, RClient,
         len,
         RandomState::default(),
     ))
+}
+
+pub(crate) fn reserve_udp_addresses(
+    count: usize,
+) -> Result<(Vec<String>, Vec<std::net::UdpSocket>)> {
+    let mut addrs = Vec::with_capacity(count);
+    let mut sockets = Vec::with_capacity(count);
+    for _ in 0..count {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let addr = socket.local_addr()?.to_string();
+        addrs.push(addr);
+        sockets.push(socket);
+    }
+    Ok((addrs, sockets))
+}
+
+pub(crate) async fn setup_standalone_raft_node(
+    node_id: u64,
+) -> Result<(openraft::Raft<TypeConfig>, Arc<StateMachineStore>)> {
+    CRYPTO_PROVIDER_INIT.call_once(|| {
+        crate::raft::init_crypto_provider().expect("crypto provider init must succeed");
+    });
+
+    let log_store = LogStore::default();
+    let state_machine_store = Arc::new(StateMachineStore::default());
+    let node_clients = scc::HashMap::with_capacity_and_hasher(5, RandomState::default());
+    let network = Network::new(Arc::new(node_clients));
+
+    let config = Arc::new(
+        openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 300,
+            election_timeout_max: 600,
+            ..Default::default()
+        }
+        .validate()?,
+    );
+
+    let raft = openraft::Raft::new(
+        node_id,
+        Arc::clone(&config),
+        network,
+        log_store,
+        state_machine_store.clone(),
+    )
+    .await?;
+
+    Ok((raft, state_machine_store))
+}
+
+pub(crate) async fn start_server_on_reserved_addr(
+    raft: Raft,
+    pcfg: &RServerConfig,
+) -> Result<(String, RServer)> {
+    let (addrs, addr_reservations) = reserve_udp_addresses(1)?;
+    let addr = addrs[0].clone();
+    drop(addr_reservations);
+    let server = start_test_rserver(addr.as_str(), raft, pcfg).await?;
+
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+
+    Ok((addr, server))
+}
+
+pub(crate) async fn start_test_rserver(
+    bind_addr: &str,
+    raft: Raft,
+    pcfg: &RServerConfig,
+) -> Result<RServer> {
+    const MAX_BIND_RETRIES: usize = 50;
+    const BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    let mut last_addr_in_use = None;
+    for attempt in 1..=MAX_BIND_RETRIES {
+        match RServer::new(
+            bind_addr,
+            None,
+            raft.clone(),
+            pcfg.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        {
+            Ok(server) => return Ok(server),
+            Err(err) if is_addr_in_use(&err) && attempt < MAX_BIND_RETRIES => {
+                warn!(
+                    "RServer bind addr {bind_addr} in use (attempt {attempt}/{MAX_BIND_RETRIES}); retrying"
+                );
+                last_addr_in_use = Some(err);
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_addr_in_use.expect("addr-in-use retry loop must capture last error"))
+}
+
+fn is_addr_in_use(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == ErrorKind::AddrInUse)
+    })
+}
+
+pub(crate) async fn create_default_local_rclient(
+    remote_addr: &str,
+    pcfg: &RServerConfig,
+) -> Result<RClient> {
+    RClientBuilder::new()
+        .remote_addr(remote_addr)
+        .server_name("localhost")
+        .local_bind_addr("127.0.0.1:0")
+        .dangerous_skip_verification(true)
+        .protocol_cfg(pcfg.clone())
+        .build()
+        .await
 }

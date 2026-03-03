@@ -16,7 +16,29 @@ use uuid::Uuid;
 use crate::api::request::AddTaskResultRequest;
 use crate::crypto::hotkey::Hotkey;
 use crate::db::EventRecorder;
+use crate::http3::rate_limits::RateLimitReservation;
 use crate::metrics::{Metrics, TaskInProgressGuard};
+use crate::raft::store::RateLimitMutation;
+
+struct TaskManagerInnerInit {
+    initial_capacity: usize,
+    expected_results: usize,
+    result_lifetime: Duration,
+    expiration_queue: scc::Queue<ExpirationEvent>,
+    rate_limit_mutation_queue: Arc<scc::Queue<RateLimitMutation>>,
+    metrics: Metrics,
+    worker_event_recorder: Option<EventRecorder>,
+}
+
+pub struct TaskManagerInit {
+    pub initial_capacity: usize,
+    pub expected_results: usize,
+    pub cleanup_interval: Duration,
+    pub result_lifetime: Duration,
+    pub rate_limit_mutation_queue: Arc<scc::Queue<RateLimitMutation>>,
+    pub metrics: Metrics,
+    pub worker_event_recorder: Option<EventRecorder>,
+}
 
 struct TaskManagerInner {
     tasks: HashMap<Uuid, TaskState, RandomState>,
@@ -25,6 +47,7 @@ struct TaskManagerInner {
     metrics: Metrics,
     worker_event_recorder: Option<EventRecorder>,
     expiration_queue: scc::Queue<ExpirationEvent>,
+    rate_limit_mutation_queue: Arc<scc::Queue<RateLimitMutation>>,
 }
 
 struct TaskState {
@@ -43,6 +66,8 @@ struct TaskState {
     assigned_worker_ids: FoldHashMap<Hotkey, Arc<str>>,
     in_progress: FoldHashMap<Hotkey, TaskInProgressGuard>,
     seed: Option<i32>,
+    finished_results_count: usize,
+    rate_limit_reservation: Option<RateLimitReservation>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -58,14 +83,16 @@ struct ExpirationEvent {
 }
 
 impl TaskManagerInner {
-    fn new(
-        initial_capacity: usize,
-        expected_results: usize,
-        result_lifetime: Duration,
-        expiration_queue: scc::Queue<ExpirationEvent>,
-        metrics: Metrics,
-        worker_event_recorder: Option<EventRecorder>,
-    ) -> Self {
+    fn new(init: TaskManagerInnerInit) -> Self {
+        let TaskManagerInnerInit {
+            initial_capacity,
+            expected_results,
+            result_lifetime,
+            expiration_queue,
+            rate_limit_mutation_queue,
+            metrics,
+            worker_event_recorder,
+        } = init;
         Self {
             expected_results,
             result_lifetime,
@@ -73,6 +100,7 @@ impl TaskManagerInner {
             worker_event_recorder,
             tasks: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
             expiration_queue,
+            rate_limit_mutation_queue,
         }
     }
 
@@ -111,6 +139,8 @@ impl TaskState {
             assigned_worker_ids: FoldHashMap::default(),
             in_progress: FoldHashMap::default(),
             seed: Some(task.seed),
+            finished_results_count: 0,
+            rate_limit_reservation: None,
         }
     }
 
@@ -131,6 +161,8 @@ impl TaskState {
             assigned_worker_ids: FoldHashMap::default(),
             in_progress: FoldHashMap::default(),
             seed: None,
+            finished_results_count: 0,
+            rate_limit_reservation: None,
         }
     }
 }
@@ -185,6 +217,7 @@ impl fmt::Display for TaskStatus {
 }
 
 impl TaskManager {
+    #[cfg(test)]
     pub async fn new(
         initial_capacity: usize,
         expected_results: usize,
@@ -193,14 +226,38 @@ impl TaskManager {
         metrics: Metrics,
         worker_event_recorder: Option<EventRecorder>,
     ) -> Self {
-        let inner = Arc::new(TaskManagerInner::new(
+        Self::new_with_rate_limit_mutation_queue(TaskManagerInit {
+            initial_capacity,
+            expected_results,
+            cleanup_interval,
+            result_lifetime,
+            rate_limit_mutation_queue: Arc::new(scc::Queue::<RateLimitMutation>::default()),
+            metrics,
+            worker_event_recorder,
+        })
+        .await
+    }
+
+    pub async fn new_with_rate_limit_mutation_queue(init: TaskManagerInit) -> Self {
+        let TaskManagerInit {
+            initial_capacity,
+            expected_results,
+            cleanup_interval,
+            result_lifetime,
+            rate_limit_mutation_queue,
+            metrics,
+            worker_event_recorder,
+        } = init;
+
+        let inner = Arc::new(TaskManagerInner::new(TaskManagerInnerInit {
             initial_capacity,
             expected_results,
             result_lifetime,
-            scc::Queue::default(),
+            expiration_queue: scc::Queue::default(),
+            rate_limit_mutation_queue,
             metrics,
             worker_event_recorder,
-        ));
+        }));
 
         let cancel_token = CancellationToken::new();
         let token_child = cancel_token.child_token();
@@ -243,6 +300,7 @@ impl TaskManager {
                                         };
                                         let task_id = Uuid::from_u128(id);
                                         let is_task_expiration = kind == ExpirationKind::Task as u8;
+                                        let mut reservation_to_refund = None;
                                         match inner.tasks.entry_async(task_id).await {
                                             Entry::Occupied(mut entry) => {
                                                 let state = entry.get_mut();
@@ -301,6 +359,14 @@ impl TaskManager {
                                                     state.model = None;
                                                     state.execution_start = None;
                                                     state.task_expires_at = None;
+                                                    if state.success_count == 0
+                                                        && let Some(reservation) =
+                                                            state.rate_limit_reservation.take()
+                                                    {
+                                                        reservation_to_refund = Some(reservation);
+                                                    } else {
+                                                        state.rate_limit_reservation = None;
+                                                    }
                                                 } else {
                                                     let Some(expires_at) = state.results_expires_at else {
                                                         continue;
@@ -330,9 +396,14 @@ impl TaskManager {
                                                     state.last_result_instant = None;
                                                     state.results_expires_at = None;
                                                     state.model = None;
+                                                    state.finished_results_count = 0;
+                                                    state.rate_limit_reservation = None;
                                                 }
                                             }
                                             Entry::Vacant(_) => {}
+                                        }
+                                        if let Some(reservation) = reservation_to_refund {
+                                            Self::emit_refund(inner.as_ref(), reservation).await;
                                         }
                                     }
                                 }
@@ -358,6 +429,7 @@ impl TaskManager {
             is_success: result.is_success(),
         };
         let worker = &result.worker_hotkey;
+        let mut reservation_to_refund = None;
         let (completed, results_expires_at) = match self.inner.tasks.entry_async(task_id).await {
             Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
@@ -372,18 +444,34 @@ impl TaskManager {
                     if state.first_success_worker_id.is_none() {
                         state.first_success_worker_id = Some(result.worker_id.clone());
                     }
+                    state.rate_limit_reservation = None;
                 } else if let Some(reason) = result.reason.as_ref() {
                     state.last_failure_reason = Some(Arc::clone(reason));
                 }
                 state.last_result_instant = Some(result.instant);
                 state.results_expires_at = Some(result.instant + self.inner.result_lifetime);
                 state.results.push(result);
-                (state.assigned_workers.is_empty(), state.results_expires_at)
+                state.finished_results_count = state.finished_results_count.saturating_add(1);
+                let completed = state.assigned_workers.is_empty();
+                if completed
+                    && state.finished_results_count >= self.inner.expected_results
+                    && state.success_count == 0
+                    && let Some(reservation) = state.rate_limit_reservation.take()
+                {
+                    reservation_to_refund = Some(reservation);
+                }
+                (
+                    completed && state.finished_results_count >= self.inner.expected_results,
+                    state.results_expires_at,
+                )
             }
             Entry::Vacant(_) => {
                 return Err(AddResultError::NotAssigned);
             }
         };
+        if let Some(reservation) = reservation_to_refund {
+            Self::emit_refund(self.inner.as_ref(), reservation).await;
+        }
         if let Some(when) = results_expires_at {
             self.inner.schedule_results_expiration(task_id, when);
         }
@@ -437,7 +525,16 @@ impl TaskManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn add_task(&self, task: crate::api::Task) {
+        self.add_task_with_rate_limit_reservation(task, None).await;
+    }
+
+    pub async fn add_task_with_rate_limit_reservation(
+        &self,
+        task: crate::api::Task,
+        rate_limit_reservation: Option<RateLimitReservation>,
+    ) {
         let now = Instant::now();
         match self.inner.tasks.entry_async(task.id).await {
             Entry::Occupied(mut entry) => {
@@ -448,13 +545,24 @@ impl TaskManager {
                 state.execution_start = Some(now);
                 state.task_expires_at = Some(now + self.inner.result_lifetime);
                 state.seed = Some(task.seed);
+                state.finished_results_count = 0;
+                state.rate_limit_reservation = rate_limit_reservation;
             }
             Entry::Vacant(entry) => {
-                entry.insert_entry(TaskState::new(&task, now, self.inner.result_lifetime));
+                let mut state = TaskState::new(&task, now, self.inner.result_lifetime);
+                state.rate_limit_reservation = rate_limit_reservation;
+                entry.insert_entry(state);
             }
         }
         self.inner
             .schedule_task_expiration(task.id, now + self.inner.result_lifetime);
+    }
+
+    async fn emit_refund(inner: &TaskManagerInner, reservation: RateLimitReservation) {
+        reservation.rollback_pending().await;
+        for mutation in reservation.refund_mutations() {
+            inner.rate_limit_mutation_queue.push(mutation);
+        }
     }
 
     #[cfg(test)]
@@ -511,16 +619,6 @@ impl TaskManager {
             .get_async(&task_id)
             .await
             .and_then(|entry| entry.image.clone())
-    }
-
-    #[cfg(feature = "test-support")]
-    #[allow(dead_code)]
-    pub async fn get_seed(&self, task_id: Uuid) -> Option<i32> {
-        self.inner
-            .tasks
-            .get_async(&task_id)
-            .await
-            .and_then(|entry| entry.seed)
     }
 
     pub async fn get_time(&self, task_id: Uuid) -> Option<f64> {
