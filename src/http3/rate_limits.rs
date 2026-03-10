@@ -107,6 +107,46 @@ impl RateLimitContext {
     }
 }
 
+/// Builds the identity key used for batched rate-limit violation aggregation.
+///
+/// Priority:
+/// 1. company id
+/// 2. user id
+/// 3. decimal source IP
+/// 4. unknown
+fn violation_client_key(ctx: &RateLimitContext) -> String {
+    if let Some(company) = ctx.company.as_ref() {
+        return format!("company:{}", company.id);
+    }
+    if let Some(user_id) = ctx.user_id {
+        return format!("user:{user_id}");
+    }
+    if let Some(ip) = ctx.decimal_ip.as_ref() {
+        return format!("ip:{ip}");
+    }
+    "unknown".to_string()
+}
+
+fn violation_client_key_for_subject(subject: Subject, id: u128) -> String {
+    match subject {
+        Subject::Company => format!("company:{}", Uuid::from_u128(id)),
+        Subject::User => format!("user:{}", Uuid::from_u128(id)),
+    }
+}
+
+fn maybe_record_local_violation(state: &HttpState, depot: &Depot, res: &Response) {
+    if res.status_code != Some(salvo::http::StatusCode::TOO_MANY_REQUESTS) {
+        return;
+    }
+    if let Ok(ctx) = depot.obtain::<RateLimitContext>() {
+        state
+            .gateway_state()
+            .record_rate_limit_violation(violation_client_key(ctx).as_str());
+    } else {
+        state.gateway_state().record_rate_limit_violation("unknown");
+    }
+}
+
 #[handler]
 pub async fn prepare_rate_limit_context(
     depot: &mut Depot,
@@ -343,6 +383,7 @@ pub async fn basic_rate_limit(
         .basic_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -359,6 +400,7 @@ pub async fn update_key_rate_limit(
         .update_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -375,6 +417,7 @@ pub async fn unauthorized_only_rate_limit(
         .unauthorized_only_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -391,6 +434,7 @@ pub async fn generic_global_rate_limit(
         .generic_global_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -407,6 +451,7 @@ pub async fn generic_per_ip_rate_limit(
         .generic_per_ip_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -423,6 +468,7 @@ pub async fn read_rate_limit(
         .read_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -439,6 +485,7 @@ pub async fn result_rate_limit(
         .result_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -455,6 +502,7 @@ pub async fn load_rate_limit(
         .load_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -471,6 +519,7 @@ pub async fn leader_rate_limit(
         .leader_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -487,6 +536,7 @@ pub async fn metric_rate_limit(
         .metric_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -503,6 +553,7 @@ pub async fn status_rate_limit(
         .status_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    maybe_record_local_violation(&state, depot, res);
     Ok(())
 }
 
@@ -563,6 +614,7 @@ async fn enforce_subject(
         )
         .await
     {
+        gs.record_rate_limit_violation(violation_client_key_for_subject(subject, id).as_str());
         return Err(ServerError::TooManyRequests(error_msg.to_string()));
     }
 
