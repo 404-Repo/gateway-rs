@@ -130,6 +130,7 @@ impl Http3Server {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         metrics: Metrics,
+        violation_tracker: crate::db::RateLimitViolationTracker,
         shutdown: CancellationToken,
     ) -> Result<Self> {
         let cfg = config.snapshot();
@@ -145,6 +146,7 @@ impl Http3Server {
             gateway_state: gateway_state.clone(),
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
+            violation_tracker,
         });
 
         let router = Self::setup_router(state)?;

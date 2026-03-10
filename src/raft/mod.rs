@@ -55,7 +55,10 @@ use crate::common::resolve::lookup_one_ip_per_host;
 use crate::config::NodeConfig;
 use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
-use crate::db::{ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle};
+use crate::db::{
+    ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle, RateLimitViolationTracker,
+    ViolationSinkHandle,
+};
 use crate::http3::client::Http3Client;
 use crate::http3::client::Http3ClientBuilder;
 use crate::http3::server::Http3Server;
@@ -796,6 +799,15 @@ pub async fn start_gateway(
         gateway_shutdown.clone(),
     );
 
+    let violation_flush_interval = cfg.db.violation_flush_interval_sec.max(1);
+    let violation_sink = Arc::new(ViolationSinkHandle::Database(Arc::clone(&db)));
+    let violation_tracker = RateLimitViolationTracker::new(
+        violation_sink,
+        Arc::from(cfg.network.name.as_str()),
+        Duration::from_secs(violation_flush_interval),
+        gateway_shutdown.clone(),
+    );
+
     let api_key_validator_updater = tokio::spawn(ApiKeyValidator::run(
         Arc::clone(&api_key_validator),
         gateway_shutdown.clone(),
@@ -839,6 +851,7 @@ pub async fn start_gateway(
         gateway_state.clone(),
         task_queue.clone(),
         metrics.clone(),
+        violation_tracker,
         gateway_shutdown.clone(),
     )
     .await
