@@ -5,11 +5,10 @@ use http::StatusCode;
 use salvo::prelude::*;
 use salvo::test::TestClient;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use gateway::db::{EventRecorder, EventSinkHandle};
 use gateway::test_support::{
-    RateLimitContext, build_shared_harness_core, enforce_rate_limit, ensure_test_crypto_provider,
+    basic_rate_limit, build_shared_harness_core, ensure_test_crypto_provider,
     load_test_single_node_config,
 };
 
@@ -21,12 +20,10 @@ async fn ok_handler() -> &'static str {
 }
 
 #[tokio::test]
-async fn distributed_user_rate_limit_returns_429() {
+async fn basic_rate_limit_returns_429() {
     ensure_test_crypto_provider();
     let (mut config, _path) = load_test_single_node_config();
-    config
-        .http
-        .add_task_authenticated_per_user_hourly_rate_limit = 1;
+    config.http.basic_rate_limit = 1;
     let config = Arc::new(config);
 
     let config_file = tempfile::Builder::new()
@@ -50,13 +47,7 @@ async fn distributed_user_rate_limit_returns_429() {
 
     let router = Router::new().hoop(affix_state::inject(state)).push(
         Router::with_path("/rl-probe")
-            .hoop(affix_state::inject(RateLimitContext {
-                user_id: Some(Uuid::new_v4()),
-                has_valid_api_key: true,
-                key_is_uuid: true,
-                ..RateLimitContext::default()
-            }))
-            .hoop(enforce_rate_limit)
+            .hoop(basic_rate_limit)
             .get(ok_handler),
     );
     let service = Service::new(router);

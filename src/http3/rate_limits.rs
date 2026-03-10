@@ -166,6 +166,8 @@ fn violation_client_key_for_subject(subject: Subject, id: u128) -> String {
     match subject {
         Subject::Company => format!("company:{}", Uuid::from_u128(id)),
         Subject::User => format!("user:{}", Uuid::from_u128(id)),
+        Subject::GenericGlobal => "generic:global".to_string(),
+        Subject::GenericIp => format!("generic:ip:{id}"),
     }
 }
 
@@ -391,6 +393,7 @@ pub async fn unauthorized_only_rate_limit(
     Ok(())
 }
 
+#[handler]
 pub async fn read_rate_limit(
     depot: &mut Depot,
     req: &mut Request,
