@@ -5,12 +5,12 @@ use uuid::Uuid;
 
 use crate::config::HTTPConfig;
 use crate::http3::depot_ext::DepotExt;
-use crate::http3::distributed_rate_limiter::DistributedRateLimiter;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
 use crate::http3::whitelist::is_whitelisted_ip;
 use crate::raft::gateway_state::GatewayState;
-use crate::raft::store::{RateLimitDelta, Subject};
+use crate::raft::rate_limit::{ClientKey, ClusterUsageParams, DistributedRateLimiter};
+use crate::raft::store::{RateLimitDelta, RateLimitMutation, Subject};
 
 #[derive(Clone, Debug, Default)]
 pub struct RateLimitContext {
@@ -23,6 +23,7 @@ pub struct RateLimitContext {
     pub key_is_uuid: bool,
     pub company: Option<CompanyRateLimit>,
     pub decimal_ip: Option<Arc<str>>,
+    pub source_addr: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -33,43 +34,47 @@ pub struct CompanyRateLimit {
     pub daily_limit: u64,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct RateLimitPolicies {
-    pub user_hourly_limit: u64,
-}
-
-impl RateLimitPolicies {
-    fn from_config(cfg: &HTTPConfig) -> Self {
-        Self {
-            user_hourly_limit: cfg.add_task_authenticated_per_user_hourly_rate_limit as u64,
-        }
-    }
-}
-
 #[derive(Clone)]
-pub struct RateLimitService {
-    distributed: DistributedRateLimiter,
-    policies: RateLimitPolicies,
+pub struct RateLimitReservation {
+    deltas: Vec<RateLimitDelta>,
+    limiter: DistributedRateLimiter,
 }
 
-impl RateLimitService {
-    pub fn new(http_config: &HTTPConfig) -> (Self, RateLimiters) {
-        let service = Self {
-            distributed: DistributedRateLimiter::new(
-                http_config.distributed_rate_limiter_max_capacity,
-            ),
-            policies: RateLimitPolicies::from_config(http_config),
-        };
-        let limiters = RateLimiters::new(http_config);
-        (service, limiters)
+impl RateLimitReservation {
+    pub fn new(limiter: DistributedRateLimiter, deltas: Vec<RateLimitDelta>) -> Self {
+        Self { deltas, limiter }
     }
 
-    pub fn distributed(&self) -> &DistributedRateLimiter {
-        &self.distributed
+    pub fn charge_mutations(&self) -> Vec<RateLimitMutation> {
+        self.deltas
+            .iter()
+            .copied()
+            .map(RateLimitMutation::from_delta)
+            .collect()
     }
 
-    pub fn policies(&self) -> RateLimitPolicies {
-        self.policies
+    pub fn refund_mutations(&self) -> Vec<RateLimitMutation> {
+        self.deltas
+            .iter()
+            .copied()
+            .map(RateLimitMutation::refund_from_delta)
+            .collect()
+    }
+
+    pub async fn rollback_pending(&self) {
+        for delta in &self.deltas {
+            self.limiter
+                .rollback_pending(
+                    ClientKey {
+                        subject: delta.subject,
+                        id: delta.id,
+                    },
+                    delta.add_hour,
+                    delta.add_day,
+                    (delta.hour_epoch, delta.day_epoch),
+                )
+                .await;
+        }
     }
 }
 
@@ -89,13 +94,43 @@ fn decimal_ip_from_req(req: &mut Request) -> Option<Arc<str>> {
     }
 }
 
-fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
-    if let Ok(ctx) = depot.obtain::<RateLimitContext>()
-        && let Some(ip) = ctx.decimal_ip.as_ref()
-    {
-        return Some(Arc::clone(ip));
+fn source_addr_from_req(req: &mut Request) -> Option<Arc<str>> {
+    match req.remote_addr() {
+        salvo::conn::SocketAddr::IPv4(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
+        salvo::conn::SocketAddr::IPv6(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
+        _ => Some(Arc::<str>::from(req.remote_addr().to_string())),
     }
-    decimal_ip_from_req(req)
+}
+
+fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
+    if let Ok(ctx) = depot.obtain::<RateLimitContext>() {
+        if let Some(ip) = ctx.decimal_ip.as_ref() {
+            return Some(Arc::clone(ip));
+        }
+        if let Some(addr) = ctx.source_addr.as_ref() {
+            return Some(Arc::clone(addr));
+        }
+    }
+    decimal_ip_from_req(req).or_else(|| source_addr_from_req(req))
+}
+
+const GENERIC_GLOBAL_SUBJECT_ID: u128 = 0;
+
+fn generic_ip_subject_id(ctx: &RateLimitContext) -> u128 {
+    if let Some(ip) = ctx.decimal_ip.as_ref()
+        && let Ok(id) = ip.parse::<u128>()
+    {
+        return id;
+    }
+
+    if let Some(addr) = ctx.source_addr.as_ref() {
+        let digest = blake3::hash(addr.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        return u128::from_le_bytes(bytes);
+    }
+
+    0
 }
 
 impl RateLimitContext {
@@ -160,6 +195,9 @@ pub async fn prepare_rate_limit_context(
         ..RateLimitContext::default()
     };
     context.decimal_ip = decimal_ip_from_req(req);
+    if context.decimal_ip.is_none() {
+        context.source_addr = source_addr_from_req(req);
+    }
 
     if let Some(key_str) = req.headers().get("x-api-key").and_then(|v| v.to_str().ok())
         && key_str.len() == uuid::fmt::Hyphenated::LENGTH
@@ -193,49 +231,12 @@ pub type PerIPRateLimiter = RateLimiter<
     BasicQuota,
 >;
 
-pub type GenericKeyPerIpRateLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<GenericKeyPerIpIssuer as RateIssuer>::Key, FixedGuard>,
-    GenericKeyPerIpIssuer,
-    BasicQuota,
->;
-
-pub type GlobalGenericKeyRateLimiter = RateLimiter<
-    FixedGuard,
-    MokaStore<<GlobalGenericKeyIssuer as RateIssuer>::Key, FixedGuard>,
-    GlobalGenericKeyIssuer,
-    BasicQuota,
->;
-
 pub type UnauthorizedOnlyRateLimiter = RateLimiter<
     FixedGuard,
     MokaStore<<UnauthorizedOnlyIssuer as RateIssuer>::Key, FixedGuard>,
     UnauthorizedOnlyIssuer,
     BasicQuota,
 >;
-
-pub struct GenericKeyPerIpIssuer;
-
-impl RateIssuer for GenericKeyPerIpIssuer {
-    type Key = String;
-
-    async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        let ip_dec = cached_decimal_ip(req, depot)?;
-        let mut key = String::with_capacity(2 + ip_dec.len());
-        key.push_str("g_");
-        key.push_str(ip_dec.as_ref());
-        Some(key)
-    }
-}
-
-pub struct GlobalGenericKeyIssuer;
-impl RateIssuer for GlobalGenericKeyIssuer {
-    type Key = String;
-
-    async fn issue(&self, _req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
-        Some("g_gk".to_string())
-    }
-}
 
 pub struct UnauthorizedOnlyIssuer;
 
@@ -263,10 +264,6 @@ pub struct RateLimiters {
     // /add_task only: applies before auth check and only for unauthorized attempts.
     // It is strictly per source IP; there is no unauthorized global bucket.
     pub unauthorized_only_limiter: UnauthorizedOnlyRateLimiter,
-    // /add_task only: one shared bucket for generic-key requests from all IPs.
-    pub generic_global_limiter: GlobalGenericKeyRateLimiter,
-    // /add_task only: generic-key bucket scoped by source IP.
-    pub generic_per_ip_limiter: GenericKeyPerIpRateLimiter,
     pub read_limiter: PerIPRateLimiter,
     pub result_limiter: PerIPRateLimiter,
     pub load_limiter: PerIPRateLimiter,
@@ -293,31 +290,6 @@ impl RateLimiters {
                 .map(|ctx| ctx.is_whitelisted_ip || ctx.has_authorized_key())
                 .unwrap_or(false)
         });
-        let generic_global_limiter = GlobalGenericKeyRateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            GlobalGenericKeyIssuer,
-            // One key ("g_gk"), so this quota is aggregated across all source IPs.
-            BasicQuota::per_hour(http_config.add_task_generic_key_global_hourly_rate_limit),
-        )
-        .with_skipper(|_: &mut Request, depot: &Depot| {
-            depot
-                .obtain::<RateLimitContext>()
-                .map(|ctx| ctx.is_whitelisted_ip || !ctx.is_generic_key)
-                .unwrap_or(false)
-        });
-        let generic_per_ip_limiter = GenericKeyPerIpRateLimiter::new(
-            FixedGuard::new(),
-            MokaStore::new(),
-            GenericKeyPerIpIssuer,
-            BasicQuota::per_hour(http_config.add_task_generic_key_per_ip_hourly_rate_limit),
-        )
-        .with_skipper(|_: &mut Request, depot: &Depot| {
-            depot
-                .obtain::<RateLimitContext>()
-                .map(|ctx| ctx.is_whitelisted_ip || !ctx.is_generic_key)
-                .unwrap_or(false)
-        });
 
         let result_limiter =
             Self::create_ip_rate_limiter_with_whitelist_skip(http_config.add_result_rate_limit);
@@ -336,8 +308,6 @@ impl RateLimiters {
             basic_limiter,
             update_limiter,
             unauthorized_only_limiter,
-            generic_global_limiter,
-            generic_per_ip_limiter,
             read_limiter,
             result_limiter,
             load_limiter,
@@ -421,41 +391,6 @@ pub async fn unauthorized_only_rate_limit(
     Ok(())
 }
 
-#[handler]
-pub async fn generic_global_rate_limit(
-    depot: &mut Depot,
-    req: &mut Request,
-    res: &mut Response,
-    ctrl: &mut FlowCtrl,
-) -> Result<(), ServerError> {
-    let state = depot.require::<HttpState>()?.clone();
-    let cfg = state.config();
-    cfg.ip_rate_limiters()
-        .generic_global_limiter
-        .handle(req, depot, res, ctrl)
-        .await;
-    maybe_record_local_violation(&state, depot, res);
-    Ok(())
-}
-
-#[handler]
-pub async fn generic_per_ip_rate_limit(
-    depot: &mut Depot,
-    req: &mut Request,
-    res: &mut Response,
-    ctrl: &mut FlowCtrl,
-) -> Result<(), ServerError> {
-    let state = depot.require::<HttpState>()?.clone();
-    let cfg = state.config();
-    cfg.ip_rate_limiters()
-        .generic_per_ip_limiter
-        .handle(req, depot, res, ctrl)
-        .await;
-    maybe_record_local_violation(&state, depot, res);
-    Ok(())
-}
-
-#[handler]
 pub async fn read_rate_limit(
     depot: &mut Depot,
     req: &mut Request,
@@ -562,26 +497,46 @@ struct SubjectParams<'a> {
     id: u128,
     hourly_limit: u64,
     daily_limit: u64,
-    add_day: u16,
     error_msg: &'a str,
     require_day_match: bool,
 }
 
-async fn enforce_subject(
+fn pending_increments(params: &SubjectParams<'_>) -> (u32, u32) {
+    (
+        u32::from(params.hourly_limit > 0),
+        u32::from(params.daily_limit > 0),
+    )
+}
+
+fn subject_delta(epochs: (u64, u64), params: &SubjectParams<'_>) -> Option<RateLimitDelta> {
+    let (add_hour, add_day) = pending_increments(params);
+    let has_limits = add_hour > 0 || add_day > 0;
+    if !has_limits {
+        return None;
+    }
+
+    Some(RateLimitDelta {
+        subject: params.subject,
+        id: params.id,
+        hour_epoch: epochs.0,
+        day_epoch: epochs.1,
+        add_hour,
+        add_day,
+    })
+}
+
+async fn check_subject_limit(
     limiter: &DistributedRateLimiter,
     gs: &GatewayState,
     epochs: (u64, u64),
-    params: SubjectParams<'_>,
+    params: &SubjectParams<'_>,
 ) -> Result<(), ServerError> {
-    let SubjectParams {
-        subject,
-        id,
-        hourly_limit,
-        daily_limit,
-        add_day,
-        error_msg,
-        require_day_match,
-    } = params;
+    let subject = params.subject;
+    let id = params.id;
+    let hourly_limit = params.hourly_limit;
+    let daily_limit = params.daily_limit;
+    let error_msg = params.error_msg;
+    let require_day_match = params.require_day_match;
 
     let (hour_epoch, day_epoch) = epochs;
     let has_limits = hourly_limit > 0 || daily_limit > 0;
@@ -589,7 +544,7 @@ async fn enforce_subject(
         limiter
             .cluster_usage(
                 gs,
-                crate::http3::distributed_rate_limiter::ClusterUsageParams {
+                ClusterUsageParams {
                     subject,
                     id,
                     hourly_limit,
@@ -605,7 +560,7 @@ async fn enforce_subject(
 
     if !limiter
         .check_and_incr(
-            crate::http3::distributed_rate_limiter::ClientKey { subject, id },
+            ClientKey { subject, id },
             hourly_limit,
             daily_limit,
             cluster_hour,
@@ -618,78 +573,180 @@ async fn enforce_subject(
         return Err(ServerError::TooManyRequests(error_msg.to_string()));
     }
 
-    if has_limits {
-        let delta = RateLimitDelta {
-            subject,
-            id,
-            hour_epoch,
-            day_epoch,
-            add_hour: 1,
-            add_day: add_day as u32,
-        };
-        gs.enqueue_rate_limit_delta(delta);
-    }
-
     Ok(())
 }
 
-#[handler]
-pub async fn enforce_rate_limit(depot: &mut Depot, _req: &mut Request) -> Result<(), ServerError> {
+pub async fn reserve_add_task_rate_limit(
+    depot: &mut Depot,
+) -> Result<Option<RateLimitReservation>, ServerError> {
     let ctx = depot
         .obtain::<RateLimitContext>()
         .map_err(|e| ServerError::Internal(format!("RateLimitContext missing: {:?}", e)))?;
 
     if ctx.is_whitelisted_ip {
-        return Ok(());
+        return Ok(None);
     }
 
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
     let rate_limits = cfg.rate_limits();
-    let limiter = rate_limits.distributed();
+    let limiter = rate_limits.distributed().clone();
     let gs = state.gateway_state().clone();
     let policies = rate_limits.policies();
 
     let epochs = limiter.epochs();
+    let mut subjects = Vec::with_capacity(3);
+
+    if ctx.is_generic_key {
+        subjects.push(SubjectParams {
+            subject: Subject::GenericGlobal,
+            id: GENERIC_GLOBAL_SUBJECT_ID,
+            hourly_limit: policies.generic_global_hourly_limit,
+            daily_limit: 0,
+            error_msg: "Generic key global rate limit exceeded",
+            require_day_match: false,
+        });
+        subjects.push(SubjectParams {
+            subject: Subject::GenericIp,
+            id: generic_ip_subject_id(ctx),
+            hourly_limit: policies.generic_per_ip_hourly_limit,
+            daily_limit: 0,
+            error_msg: "Generic key per-IP rate limit exceeded",
+            require_day_match: false,
+        });
+    }
 
     // Company keys first, enforce their limits if present
     if let Some(company) = ctx.company.as_ref() {
-        enforce_subject(
-            limiter,
-            &gs,
-            epochs,
-            SubjectParams {
-                subject: Subject::Company,
-                id: company.id.as_u128(),
-                hourly_limit: company.hourly_limit,
-                daily_limit: company.daily_limit,
-                add_day: 1,
-                error_msg: "Company rate limit exceeded",
-                require_day_match: true,
-            },
-        )
-        .await?;
-        return Ok(());
+        subjects.push(SubjectParams {
+            subject: Subject::Company,
+            id: company.id.as_u128(),
+            hourly_limit: company.hourly_limit,
+            daily_limit: company.daily_limit,
+            error_msg: "Company rate limit exceeded",
+            require_day_match: company.daily_limit > 0,
+        });
+    } else if let Some(user_id) = ctx.user_id {
+        // Otherwise fall back to per-user quota when we have a user id
+        subjects.push(SubjectParams {
+            subject: Subject::User,
+            id: user_id.as_u128(),
+            hourly_limit: policies.user_hourly_limit,
+            daily_limit: 0,
+            error_msg: "User rate limit exceeded",
+            require_day_match: false,
+        });
     }
 
-    // Otherwise fall back to per-user quota when we have a user id
-    if let Some(user_id) = ctx.user_id {
-        enforce_subject(
-            limiter,
-            &gs,
-            epochs,
-            SubjectParams {
-                subject: Subject::User,
-                id: user_id.as_u128(),
-                hourly_limit: policies.user_hourly_limit,
-                daily_limit: 0,
+    let mut succeeded = Vec::with_capacity(subjects.len());
+    for params in &subjects {
+        if let Err(err) = check_subject_limit(&limiter, &gs, epochs, params).await {
+            for (key, (hour_decrement, day_decrement)) in succeeded.into_iter().rev() {
+                limiter
+                    .rollback_pending(key, hour_decrement, day_decrement, epochs)
+                    .await;
+            }
+            return Err(err);
+        }
+        succeeded.push((
+            ClientKey {
+                subject: params.subject,
+                id: params.id,
+            },
+            pending_increments(params),
+        ));
+    }
+
+    let mut deltas = Vec::with_capacity(subjects.len());
+    for params in &subjects {
+        if let Some(delta) = subject_delta(epochs, params) {
+            deltas.push(delta);
+        }
+    }
+    if deltas.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(RateLimitReservation::new(limiter, deltas)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reservation_rollback_uses_bound_limiter_instance() {
+        let bound_limiter = DistributedRateLimiter::new(64);
+        let other_limiter = DistributedRateLimiter::new(64);
+        let key = ClientKey {
+            subject: Subject::User,
+            id: 55u128,
+        };
+        let epochs = (700u64, 70u64);
+
+        assert!(bound_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(!bound_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(other_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(!other_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+
+        let reservation = RateLimitReservation::new(
+            bound_limiter.clone(),
+            vec![RateLimitDelta {
+                subject: key.subject,
+                id: key.id,
+                hour_epoch: epochs.0,
+                day_epoch: epochs.1,
+                add_hour: 1,
                 add_day: 0,
-                error_msg: "User rate limit exceeded",
-                require_day_match: false,
-            },
-        )
-        .await?;
+            }],
+        );
+
+        reservation.rollback_pending().await;
+
+        assert!(bound_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(
+            !other_limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+            "rollback must not touch unrelated limiter instances"
+        );
     }
 
-    Ok(())
+    #[test]
+    fn subject_delta_uses_same_pending_shape_as_local_increment() {
+        let params = SubjectParams {
+            subject: Subject::Company,
+            id: 123u128,
+            hourly_limit: 0,
+            daily_limit: 10,
+            error_msg: "Company rate limit exceeded",
+            require_day_match: true,
+        };
+
+        let (hour_pending, day_pending) = pending_increments(&params);
+        assert_eq!(hour_pending, 0);
+        assert_eq!(day_pending, 1);
+
+        let delta = subject_delta((10, 2), &params).expect("delta should exist");
+        assert_eq!(delta.add_hour, hour_pending);
+        assert_eq!(delta.add_day, day_pending);
+    }
+
+    #[test]
+    fn subject_delta_disables_day_increment_when_daily_limit_is_zero() {
+        let params = SubjectParams {
+            subject: Subject::Company,
+            id: 321u128,
+            hourly_limit: 10,
+            daily_limit: 0,
+            error_msg: "Company rate limit exceeded",
+            require_day_match: false,
+        };
+
+        let (hour_pending, day_pending) = pending_increments(&params);
+        assert_eq!(hour_pending, 1);
+        assert_eq!(day_pending, 0);
+
+        let delta = subject_delta((11, 3), &params).expect("delta should exist");
+        assert_eq!(delta.add_hour, hour_pending);
+        assert_eq!(delta.add_day, day_pending);
+    }
 }

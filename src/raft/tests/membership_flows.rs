@@ -6,34 +6,22 @@ use std::collections::BTreeSet;
 async fn test_add_node_to_three_node_cluster() -> Result<()> {
     init_tracing();
 
-    // Set up a three-node cluster.
-    let initial_configs = vec![
-        (1, "127.0.0.1:27001"),
-        (2, "127.0.0.1:27002"),
-        (3, "127.0.0.1:27003"),
-    ];
+    let node_configs = reserve_node_configs(4)?;
+    let initial_configs = node_configs[..3].to_vec();
+    let new_node_id = node_configs[3].0;
+    let new_node_addr = node_configs[3].1.as_str();
     let node_clients = make_node_clients(initial_configs.len());
 
     let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
-        setup_cluster(&initial_configs, node_clients.clone(), None).await?;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    connect_clients(&initial_configs, &node_clients, &pcfg, |i, _| {
-        format!("127.0.0.1:{}", 28001 + i as u16)
-    })
-    .await?;
+        setup_connected_cluster(&initial_configs, node_clients.clone(), None).await?;
 
     // Initialize the cluster membership with all three nodes as voters.
-    let initial_members = membership_from(&initial_configs);
-    raft_nodes[0].initialize(initial_members).await?;
+    initialize_first_node_membership(&raft_nodes, &initial_configs).await?;
 
     // Wait for the leader to be elected.
-    let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
-    let leader_index = initial_configs
-        .iter()
-        .position(|(id, _)| *id == leader_id)
-        .expect("Leader must be one of the initial nodes");
+    let (_leader_id, leader_index) =
+        wait_for_consistent_leader_index(&raft_nodes, &initial_configs, Duration::from_secs(10))
+            .await?;
 
     // Issue a client write to set a key/value pair.
     client_write_and_wait(
@@ -47,8 +35,6 @@ async fn test_add_node_to_three_node_cluster() -> Result<()> {
     assert_state_machine_value(&state_machines, "test_key", "test_value").await;
 
     // Now, add a new node (node 4) to the existing three-node cluster.
-    let new_node_id = 4;
-    let new_node_addr = "127.0.0.1:27004";
     let (new_raft, new_sm, new_server) = setup_node(
         new_node_id,
         new_node_addr,
@@ -62,7 +48,7 @@ async fn test_add_node_to_three_node_cluster() -> Result<()> {
     server_handles.push(new_server);
 
     // Create a client connection for the new node.
-    let new_client_addr = "127.0.0.1:28004";
+    let new_client_addr = "127.0.0.1:0";
     let new_client = create_rclient(new_node_addr, new_client_addr, &pcfg).await?;
     node_clients
         .insert_sync(new_node_addr.to_string(), new_client)
@@ -91,41 +77,25 @@ async fn test_add_node_to_three_node_cluster() -> Result<()> {
 async fn test_add_voter_node_to_three_node_cluster_change_membership() -> Result<()> {
     init_tracing();
 
-    // Set up an initial three-node cluster.
-    let initial_configs = vec![
-        (1, "127.0.0.1:29001"),
-        (2, "127.0.0.1:29002"),
-        (3, "127.0.0.1:29003"),
-    ];
+    let node_configs = reserve_node_configs(4)?;
+    let initial_configs = node_configs[..3].to_vec();
+    let new_node_id = node_configs[3].0;
+    let new_node_addr = node_configs[3].1.as_str();
 
     let node_clients = make_node_clients(initial_configs.len());
 
     let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
-        setup_cluster(&initial_configs, node_clients.clone(), None).await?;
-
-    // Allow the servers time to start up.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Establish client connections for the initial nodes.
-    connect_clients(&initial_configs, &node_clients, &pcfg, |i, _| {
-        format!("127.0.0.1:{}", 30001 + i as u16)
-    })
-    .await?;
+        setup_connected_cluster(&initial_configs, node_clients.clone(), None).await?;
 
     // Initialize the cluster membership for the initial three nodes.
-    let initial_members = membership_from(&initial_configs);
-    raft_nodes[0].initialize(initial_members).await?;
+    initialize_first_node_membership(&raft_nodes, &initial_configs).await?;
 
     // Wait until a leader is elected.
-    let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
-    let leader_index = initial_configs
-        .iter()
-        .position(|(id, _)| *id == leader_id)
-        .expect("Leader must be one of the nodes");
+    let (_leader_id, leader_index) =
+        wait_for_consistent_leader_index(&raft_nodes, &initial_configs, Duration::from_secs(10))
+            .await?;
 
     // Bring up a new node (node 4) that will be added as a voter.
-    let new_node_id = 4;
-    let new_node_addr = "127.0.0.1:29004";
     let (new_raft, new_sm, new_server) = setup_node(
         new_node_id,
         new_node_addr,
@@ -139,7 +109,7 @@ async fn test_add_voter_node_to_three_node_cluster_change_membership() -> Result
     server_handles.push(new_server);
 
     // Create a client connection for the new node.
-    let new_client_addr = "127.0.0.1:30004";
+    let new_client_addr = "127.0.0.1:0";
     let new_client = create_rclient(new_node_addr, new_client_addr, &pcfg).await?;
 
     node_clients

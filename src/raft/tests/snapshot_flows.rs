@@ -1,16 +1,13 @@
 use super::*;
 
-use std::time::Instant;
+use crate::raft::store::{RateLimitDelta, Subject, rate_limit_key};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
 async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
     init_tracing();
 
-    let node_configs = vec![
-        (1, "127.0.0.1:31001"),
-        (2, "127.0.0.1:31002"),
-        (3, "127.0.0.1:31003"),
-    ];
+    let node_configs = reserve_node_configs(3)?;
 
     let storage_paths: Vec<NodeStoragePaths> = node_configs
         .iter()
@@ -20,23 +17,12 @@ async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
     let node_clients = make_node_clients(node_configs.len());
 
     let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
-        setup_cluster(&node_configs, node_clients.clone(), Some(&storage_paths)).await?;
+        setup_connected_cluster(&node_configs, node_clients.clone(), Some(&storage_paths)).await?;
+    initialize_first_node_membership(&raft_nodes, &node_configs).await?;
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    connect_clients(&node_configs, &node_clients, &pcfg, |_, _| {
-        "127.0.0.1:0".to_string()
-    })
-    .await?;
-
-    let initial_members = membership_from(&node_configs);
-    raft_nodes[0].initialize(initial_members).await?;
-
-    let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
-    let leader_index = node_configs
-        .iter()
-        .position(|(id, _)| *id == leader_id)
-        .expect("Leader must be part of node configs");
+    let (leader_id, leader_index) =
+        wait_for_consistent_leader_index(&raft_nodes, &node_configs, Duration::from_secs(10))
+            .await?;
 
     for (idx, (node_id, _)) in node_configs.iter().enumerate() {
         wait_for_node_to_be_voter(&raft_nodes[idx], *node_id, Duration::from_secs(10)).await?;
@@ -69,7 +55,7 @@ async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
 
     let (restarted_raft, restarted_sm, restarted_server) = setup_node(
         leader_id,
-        node_configs[leader_index].1,
+        node_configs[leader_index].1.as_str(),
         Arc::clone(&config),
         node_clients.clone(),
         Some(&storage_paths[leader_index]),
@@ -80,7 +66,7 @@ async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
     state_machines.insert(leader_index, restarted_sm.clone());
     server_handles.insert(leader_index, restarted_server);
 
-    let server_addr = node_configs[leader_index].1;
+    let server_addr = node_configs[leader_index].1.as_str();
     let server_key = server_addr.to_string();
     let replacement_client = RClientBuilder::new()
         .remote_addr(server_addr)
@@ -123,11 +109,10 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
 
     // Set up an initial three-node cluster with persistent storage so snapshots
     // produce on-disk artifacts and purge earlier log entries.
-    let initial_configs = vec![
-        (1, "127.0.0.1:33001"),
-        (2, "127.0.0.1:33002"),
-        (3, "127.0.0.1:33003"),
-    ];
+    let node_configs = reserve_node_configs(4)?;
+    let initial_configs = node_configs[..3].to_vec();
+    let new_node_id = node_configs[3].0;
+    let new_node_addr = node_configs[3].1.as_str();
 
     let mut storage_paths: Vec<NodeStoragePaths> = initial_configs
         .iter()
@@ -137,34 +122,70 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
     let node_clients = make_node_clients(initial_configs.len() + 1);
 
     let (config, pcfg, mut raft_nodes, mut state_machines, mut server_handles) =
-        setup_cluster(&initial_configs, node_clients.clone(), Some(&storage_paths)).await?;
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    connect_clients(&initial_configs, &node_clients, &pcfg, |i, _| {
-        format!("127.0.0.1:{}", 34001 + i as u16)
-    })
-    .await?;
-
-    // Initialize the cluster membership for the initial three nodes.
-    let initial_members = membership_from(&initial_configs);
-    raft_nodes[0].initialize(initial_members).await?;
+        setup_connected_cluster(&initial_configs, node_clients.clone(), Some(&storage_paths))
+            .await?;
+    initialize_first_node_membership(&raft_nodes, &initial_configs).await?;
 
     // Wait until a leader is elected.
-    let leader_id = wait_for_leader_consistent(&raft_nodes, Duration::from_secs(10)).await?;
-    let leader_index = initial_configs
-        .iter()
-        .position(|(id, _)| *id == leader_id)
-        .expect("Leader must be one of the nodes");
+    let (_leader_id, leader_index) =
+        wait_for_consistent_leader_index(&raft_nodes, &initial_configs, Duration::from_secs(10))
+            .await?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let hour_epoch = now / 3600;
+    let day_epoch = now / 86400;
+    let global_key = rate_limit_key(Subject::GenericGlobal, 0u128);
+    let company_key = rate_limit_key(Subject::Company, 404u128);
 
     // Issue a client write that will later be recovered via snapshot installation.
     let pre_snapshot_write = raft_nodes[leader_index]
         .client_write(set_request("pre_snapshot_key", "pre_snapshot_value"))
         .await?;
-    let pre_snapshot_log_id = pre_snapshot_write.log_id;
+    wait_for_log_commit(&raft_nodes, pre_snapshot_write.log_id).await?;
+
+    let pre_snapshot_rl_write = raft_nodes[leader_index]
+        .client_write(Request::RateLimitDeltas {
+            request_id: Uuid::new_v4().as_u128(),
+            deltas: vec![
+                RateLimitDelta {
+                    subject: Subject::GenericGlobal,
+                    id: 0u128,
+                    hour_epoch,
+                    day_epoch,
+                    add_hour: 5,
+                    add_day: 0,
+                },
+                RateLimitDelta {
+                    subject: Subject::Company,
+                    id: 404u128,
+                    hour_epoch,
+                    day_epoch,
+                    add_hour: 2,
+                    add_day: 1,
+                },
+            ],
+        })
+        .await?;
+    let pre_snapshot_log_id = pre_snapshot_rl_write.log_id;
     wait_for_log_commit(&raft_nodes, pre_snapshot_log_id).await?;
 
     assert_state_machine_value(&state_machines, "pre_snapshot_key", "pre_snapshot_value").await;
+    for sm in &state_machines {
+        let (global_hour, global_day) = sm
+            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
+            .await;
+        assert_eq!(global_hour, 5);
+        assert_eq!(global_day, 0);
+
+        let (company_hour, company_day) = sm
+            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
+            .await;
+        assert_eq!(company_hour, 2);
+        assert_eq!(company_day, 1);
+    }
 
     // Trigger a snapshot to compact the log and remove earlier entries from the log store.
     raft_nodes[leader_index].trigger().snapshot().await?;
@@ -182,10 +203,14 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
     let purge_timeout = Duration::from_secs(10);
     let purge_start = Instant::now();
     loop {
-        let mut log_store = get_log_store_handle(initial_configs[leader_index].1)?;
+        let mut log_store = get_log_store_handle(initial_configs[leader_index].1.as_str())?;
         let log_state = log_store.get_log_state().await?;
 
-        if log_state.last_purged_log_id == Some(pre_snapshot_log_id) {
+        let purged_reached_target = log_state
+            .last_purged_log_id
+            .as_ref()
+            .is_some_and(|purged| purged.index >= pre_snapshot_log_id.index);
+        if purged_reached_target {
             break;
         }
 
@@ -201,8 +226,6 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
     }
 
     // Bring up a new node that will be added as a voter after compaction.
-    let new_node_id = 4;
-    let new_node_addr = "127.0.0.1:33004";
     let new_node_paths = NodeStoragePaths::for_node(new_node_id, 3)?;
     let new_snapshot_dir = new_node_paths.snapshot_dir.clone();
     let (new_raft, new_sm, new_server) = setup_node(
@@ -219,7 +242,7 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
     server_handles.push(new_server);
 
     // Create a client connection for the new node.
-    let new_client_addr = "127.0.0.1:34004";
+    let new_client_addr = "127.0.0.1:0";
     let new_client = create_rclient(new_node_addr, new_client_addr, &pcfg).await?;
     node_clients
         .insert_sync(new_node_addr.to_string(), new_client)
@@ -269,6 +292,33 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    let start_rl = Instant::now();
+    let timeout_rl = Duration::from_secs(10);
+    loop {
+        let new_node = state_machines
+            .last()
+            .expect("new node state machine should be present");
+        let (global_hour, global_day) = new_node
+            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
+            .await;
+        let (company_hour, company_day) = new_node
+            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
+            .await;
+
+        if global_hour == 5 && global_day == 0 && company_hour == 2 && company_day == 1 {
+            break;
+        }
+
+        if start_rl.elapsed() > timeout_rl {
+            bail!(
+                "New node did not receive expected rate-limit snapshot data within {:?}",
+                timeout_rl
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     // Promote the new node to a voter via membership change.
     let new_members: std::collections::BTreeSet<u64> = initial_configs
         .iter()
@@ -292,6 +342,19 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
 
     assert_state_machine_value(&state_machines, "pre_snapshot_key", "pre_snapshot_value").await;
     assert_state_machine_value(&state_machines, "post_snapshot_key", "post_snapshot_value").await;
+    for sm in &state_machines {
+        let (global_hour, global_day) = sm
+            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
+            .await;
+        assert_eq!(global_hour, 5);
+        assert_eq!(global_day, 0);
+
+        let (company_hour, company_day) = sm
+            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
+            .await;
+        assert_eq!(company_hour, 2);
+        assert_eq!(company_day, 1);
+    }
 
     Ok(())
 }

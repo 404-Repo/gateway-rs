@@ -16,11 +16,12 @@ use tracing::{info, warn};
 use crate::config::{
     HTTPConfig, ImageConfig, ModelParamsConfig, NodeConfig, PromptConfig, read_config_from_path,
 };
-use crate::http3::rate_limits::{RateLimitService, RateLimiters};
+use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
 use crate::http3::whitelist::{
     RateLimitWhitelist, resolve_cluster_peer_ips, resolve_rate_limit_whitelist,
 };
+use crate::raft::rate_limit::RateLimitService;
 
 pub struct RuntimeConfigSnapshot {
     pub raw: NodeConfig,
@@ -316,7 +317,8 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
     let cluster_ips =
         resolve_cluster_peer_ips(&config.network.domain, &config.network.node_dns_names).await;
 
-    let (rate_limit_service, rate_limiters) = RateLimitService::new(&config.http);
+    let rate_limit_service = RateLimitService::new(&config.http);
+    let rate_limiters = RateLimiters::new(&config.http);
     let image_upload_limiter = ImageUploadLimiter::new(config.http.max_concurrent_image_uploads);
 
     Ok(RuntimeConfigSnapshot {
@@ -416,12 +418,28 @@ mod tests {
         let before = store.snapshot();
         assert_eq!(before.http().request_size_limit, 4096);
         assert_eq!(before.rate_limits().policies().user_hourly_limit, 5);
+        assert_eq!(
+            before.rate_limits().policies().generic_global_hourly_limit,
+            40
+        );
+        assert_eq!(
+            before.rate_limits().policies().generic_per_ip_hourly_limit,
+            5
+        );
 
         let updated = BASE_CONFIG
             .replace("request_size_limit = 4096", "request_size_limit = 8192")
             .replace(
                 "add_task_authenticated_per_user_hourly_rate_limit = 5",
                 "add_task_authenticated_per_user_hourly_rate_limit = 11",
+            )
+            .replace(
+                "add_task_generic_key_global_hourly_rate_limit = 40",
+                "add_task_generic_key_global_hourly_rate_limit = 77",
+            )
+            .replace(
+                "add_task_generic_key_per_ip_hourly_rate_limit = 5",
+                "add_task_generic_key_per_ip_hourly_rate_limit = 9",
             );
         std::fs::write(file.path(), updated)?;
 
@@ -430,6 +448,14 @@ mod tests {
         let after = store.snapshot();
         assert_eq!(after.http().request_size_limit, 8192);
         assert_eq!(after.rate_limits().policies().user_hourly_limit, 11);
+        assert_eq!(
+            after.rate_limits().policies().generic_global_hourly_limit,
+            77
+        );
+        assert_eq!(
+            after.rate_limits().policies().generic_per_ip_hourly_limit,
+            9
+        );
 
         Ok(())
     }

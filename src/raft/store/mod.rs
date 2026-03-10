@@ -52,6 +52,8 @@ pub struct RateLimitSnapshot {
 pub enum Subject {
     User,
     Company,
+    GenericGlobal,
+    GenericIp,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
@@ -86,6 +88,82 @@ impl RateLimitDelta {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct RateLimitMutation {
+    pub subject: Subject,
+    pub id: u128,
+    pub hour_epoch: u64,
+    pub day_epoch: u64,
+    pub hour_delta: i64,
+    pub day_delta: i64,
+}
+
+impl RateLimitMutation {
+    pub const fn key(&self) -> RateLimitKey {
+        rate_limit_key(self.subject, self.id)
+    }
+
+    pub const fn from_delta(delta: RateLimitDelta) -> Self {
+        Self {
+            subject: delta.subject,
+            id: delta.id,
+            hour_epoch: delta.hour_epoch,
+            day_epoch: delta.day_epoch,
+            hour_delta: delta.add_hour as i64,
+            day_delta: delta.add_day as i64,
+        }
+    }
+
+    pub const fn from_refund(refund: RateLimitRefund) -> Self {
+        Self {
+            subject: refund.subject,
+            id: refund.id,
+            hour_epoch: refund.hour_epoch,
+            day_epoch: refund.day_epoch,
+            hour_delta: -(refund.sub_hour as i64),
+            day_delta: -(refund.sub_day as i64),
+        }
+    }
+
+    pub const fn refund_from_delta(delta: RateLimitDelta) -> Self {
+        Self {
+            subject: delta.subject,
+            id: delta.id,
+            hour_epoch: delta.hour_epoch,
+            day_epoch: delta.day_epoch,
+            hour_delta: -(delta.add_hour as i64),
+            day_delta: -(delta.add_day as i64),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct RateLimitRefund {
+    pub subject: Subject,
+    pub id: u128,
+    pub hour_epoch: u64,
+    pub day_epoch: u64,
+    pub sub_hour: u32,
+    pub sub_day: u32,
+}
+
+impl RateLimitRefund {
+    pub const fn key(&self) -> RateLimitKey {
+        rate_limit_key(self.subject, self.id)
+    }
+
+    pub const fn from_delta(delta: RateLimitDelta) -> Self {
+        Self {
+            subject: delta.subject,
+            id: delta.id,
+            hour_epoch: delta.hour_epoch,
+            day_epoch: delta.day_epoch,
+            sub_hour: delta.add_hour,
+            sub_day: delta.add_day,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
     Set {
@@ -93,9 +171,17 @@ pub enum Request {
         key: String,
         value: Vec<u8>,
     },
+    RateLimitMutations {
+        request_id: u128,
+        mutations: Vec<RateLimitMutation>,
+    },
     RateLimitDeltas {
         request_id: u128,
         deltas: Vec<RateLimitDelta>,
+    },
+    RateLimitRefunds {
+        request_id: u128,
+        refunds: Vec<RateLimitRefund>,
     },
 }
 
@@ -103,7 +189,9 @@ impl Request {
     pub fn request_id(&self) -> u128 {
         match self {
             Request::Set { request_id, .. } => *request_id,
+            Request::RateLimitMutations { request_id, .. } => *request_id,
             Request::RateLimitDeltas { request_id, .. } => *request_id,
+            Request::RateLimitRefunds { request_id, .. } => *request_id,
         }
     }
 }
@@ -400,6 +488,111 @@ impl StateMachineStore {
         sm.last_membership = StoredMembership::new(Some(log_id), mem);
     }
 
+    async fn apply_rate_limit_mutations_entry(
+        &self,
+        log_id: LogId<NodeId>,
+        mutations: Vec<RateLimitMutation>,
+        is_dup: bool,
+    ) {
+        if !is_dup {
+            let guard = Guard::new();
+            let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (i64, i64)> =
+                FoldHashMap::with_capacity_and_hasher(mutations.len(), RandomState::default());
+            for mutation in mutations {
+                let key = (
+                    mutation.subject,
+                    mutation.id,
+                    mutation.hour_epoch,
+                    mutation.day_epoch,
+                );
+                aggregated
+                    .entry(key)
+                    .and_modify(|acc| {
+                        acc.0 = acc.0.saturating_add(mutation.hour_delta);
+                        acc.1 = acc.1.saturating_add(mutation.day_delta);
+                    })
+                    .or_insert((mutation.hour_delta, mutation.day_delta));
+            }
+
+            let mut hour_updates = Vec::with_capacity(aggregated.len());
+            let mut day_updates = Vec::with_capacity(aggregated.len());
+            for ((subject, id, hour_epoch, day_epoch), (hour_delta, day_delta)) in aggregated {
+                if hour_delta != 0 {
+                    hour_updates.push((hour_epoch, subject, id, hour_delta));
+                }
+                if day_delta != 0 {
+                    day_updates.push((day_epoch, subject, id, day_delta));
+                }
+            }
+
+            hour_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+            day_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+
+            let mut current_hour_epoch = self.hour_epoch.load(Ordering::Relaxed);
+            for (hour_epoch, subject, id, hour_delta) in hour_updates {
+                if hour_epoch > current_hour_epoch {
+                    let new_map = HashMap::with_capacity_and_hasher(4096, RandomState::default());
+                    let _ = self
+                        .rate_limits_hour
+                        .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
+                    self.hour_epoch.store(hour_epoch, Ordering::Release);
+                    current_hour_epoch = hour_epoch;
+                }
+                if hour_epoch == current_hour_epoch
+                    && let Some(map) = self.current_rate_limits_hour(&guard)
+                {
+                    let key = rate_limit_key(subject, id);
+                    if hour_delta > 0 {
+                        let add = hour_delta as u64;
+                        map.entry_sync(key)
+                            .and_modify(|v| {
+                                *v = v.saturating_add(add);
+                            })
+                            .or_insert(add);
+                    } else {
+                        let sub = hour_delta.unsigned_abs();
+                        let _ = map.entry_sync(key).and_modify(|v| {
+                            *v = v.saturating_sub(sub);
+                        });
+                    }
+                }
+            }
+
+            let mut current_day_epoch = self.day_epoch.load(Ordering::Relaxed);
+            for (day_epoch, subject, id, day_delta) in day_updates {
+                if day_epoch > current_day_epoch {
+                    let new_map = HashMap::with_capacity_and_hasher(4096, RandomState::default());
+                    let _ = self
+                        .rate_limits_day
+                        .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
+                    self.day_epoch.store(day_epoch, Ordering::Release);
+                    current_day_epoch = day_epoch;
+                }
+                if day_epoch == current_day_epoch
+                    && let Some(map) = self.current_rate_limits_day(&guard)
+                {
+                    let key = rate_limit_key(subject, id);
+                    if day_delta > 0 {
+                        let add = day_delta as u64;
+                        map.entry_sync(key)
+                            .and_modify(|v| {
+                                *v = v.saturating_add(add);
+                            })
+                            .or_insert(add);
+                    } else {
+                        let sub = day_delta.unsigned_abs();
+                        let _ = map.entry_sync(key).and_modify(|v| {
+                            *v = v.saturating_sub(sub);
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut sm = self.state_machine.write().await;
+        sm.last_applied_log = Some(log_id);
+    }
+
     async fn apply_request(&self, log_id: LogId<NodeId>, request: Request, is_dup: bool) {
         let _sg = self.snapshot_guard.lock().await;
         match request {
@@ -410,85 +603,25 @@ impl StateMachineStore {
                 }
                 sm.last_applied_log = Some(log_id);
             }
+            Request::RateLimitMutations { mutations, .. } => {
+                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
+                    .await;
+            }
             Request::RateLimitDeltas { deltas, .. } => {
-                if !is_dup {
-                    let guard = Guard::new();
-                    let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (u64, u64)> =
-                        FoldHashMap::with_capacity_and_hasher(deltas.len(), RandomState::default());
-                    for d in deltas {
-                        let key = (d.subject, d.id, d.hour_epoch, d.day_epoch);
-                        aggregated
-                            .entry(key)
-                            .and_modify(|acc| {
-                                acc.0 = acc.0.saturating_add(d.add_hour as u64);
-                                acc.1 = acc.1.saturating_add(d.add_day as u64);
-                            })
-                            .or_insert((d.add_hour as u64, d.add_day as u64));
-                    }
-
-                    let mut hour_updates = Vec::with_capacity(aggregated.len());
-                    let mut day_updates = Vec::with_capacity(aggregated.len());
-                    for ((subject, id, hour_epoch, day_epoch), (add_hour, add_day)) in aggregated {
-                        if add_hour > 0 {
-                            hour_updates.push((hour_epoch, subject, id, add_hour));
-                        }
-                        if add_day > 0 {
-                            day_updates.push((day_epoch, subject, id, add_day));
-                        }
-                    }
-
-                    hour_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
-                    day_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
-
-                    let mut current_hour_epoch = self.hour_epoch.load(Ordering::Relaxed);
-                    for (hour_epoch, subject, id, add_hour) in hour_updates {
-                        if hour_epoch > current_hour_epoch {
-                            let new_map =
-                                HashMap::with_capacity_and_hasher(4096, RandomState::default());
-                            let _ = self
-                                .rate_limits_hour
-                                .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
-                            self.hour_epoch.store(hour_epoch, Ordering::Release);
-                            current_hour_epoch = hour_epoch;
-                        }
-                        if hour_epoch == current_hour_epoch
-                            && let Some(map) = self.current_rate_limits_hour(&guard)
-                        {
-                            let key = rate_limit_key(subject, id);
-                            map.entry_sync(key)
-                                .and_modify(|v| {
-                                    *v = v.saturating_add(add_hour);
-                                })
-                                .or_insert(add_hour);
-                        }
-                    }
-
-                    let mut current_day_epoch = self.day_epoch.load(Ordering::Relaxed);
-                    for (day_epoch, subject, id, add_day) in day_updates {
-                        if day_epoch > current_day_epoch {
-                            let new_map =
-                                HashMap::with_capacity_and_hasher(4096, RandomState::default());
-                            let _ = self
-                                .rate_limits_day
-                                .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
-                            self.day_epoch.store(day_epoch, Ordering::Release);
-                            current_day_epoch = day_epoch;
-                        }
-                        if day_epoch == current_day_epoch
-                            && let Some(map) = self.current_rate_limits_day(&guard)
-                        {
-                            let key = rate_limit_key(subject, id);
-                            map.entry_sync(key)
-                                .and_modify(|v| {
-                                    *v = v.saturating_add(add_day);
-                                })
-                                .or_insert(add_day);
-                        }
-                    }
-                }
-
-                let mut sm = self.state_machine.write().await;
-                sm.last_applied_log = Some(log_id);
+                let mutations = deltas
+                    .into_iter()
+                    .map(RateLimitMutation::from_delta)
+                    .collect();
+                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
+                    .await;
+            }
+            Request::RateLimitRefunds { refunds, .. } => {
+                let mutations = refunds
+                    .into_iter()
+                    .map(RateLimitMutation::from_refund)
+                    .collect();
+                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
+                    .await;
             }
         }
     }

@@ -3,6 +3,7 @@ pub mod client;
 pub mod gateway_state;
 pub mod memstore;
 pub mod network;
+pub mod rate_limit;
 pub mod server;
 pub mod store;
 mod tests;
@@ -63,8 +64,8 @@ use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
-use crate::raft::store::{RateLimitDelta, Subject};
-use crate::task::TaskManager;
+use crate::raft::store::{RateLimitMutation, Subject};
+use crate::task::{TaskManager, TaskManagerInit};
 use tokio_util::sync::CancellationToken;
 
 pub type NodeId = u64;
@@ -117,15 +118,96 @@ pub enum GatewayExit {
 }
 
 impl Gateway {
-    async fn flush_rate_limit_deltas(
-        gateway_state: &GatewayState,
-        deltas: Arc<Vec<RateLimitDelta>>,
-        client: Option<&Http3Client>,
+    fn collect_pending_rate_limit_mutations(
+        rate_limit_queue: &Queue<RateLimitMutation>,
+        max_mutations_in_batch: usize,
+        pending_mutations: &mut Vec<RateLimitMutation>,
+        pending_request_id: &mut Option<u128>,
     ) {
-        if deltas.is_empty() {
+        if pending_request_id.is_some() || !pending_mutations.is_empty() {
             return;
         }
-        let _ = gateway_state.submit_rate_limit_deltas(deltas, client).await;
+
+        // Drain and coalesce pending rate limit mutations only when there is no in-flight batch.
+        let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (i64, i64)> =
+            FoldHashMap::with_capacity_and_hasher(
+                max_mutations_in_batch.min(1024),
+                RandomState::default(),
+            );
+        let mut raw_count = 0usize;
+        while let Some(entry) = rate_limit_queue.pop() {
+            let mutation = **entry;
+            raw_count += 1;
+            let key = (
+                mutation.subject,
+                mutation.id,
+                mutation.hour_epoch,
+                mutation.day_epoch,
+            );
+            aggregated
+                .entry(key)
+                .and_modify(|acc| {
+                    acc.0 = acc.0.saturating_add(mutation.hour_delta);
+                    acc.1 = acc.1.saturating_add(mutation.day_delta);
+                })
+                .or_insert((mutation.hour_delta, mutation.day_delta));
+            if raw_count == max_mutations_in_batch {
+                break;
+            }
+        }
+
+        let mut mutations = Vec::with_capacity(aggregated.len());
+        for ((subject, id, hour_epoch, day_epoch), (hour_delta, day_delta)) in aggregated {
+            if hour_delta == 0 && day_delta == 0 {
+                continue;
+            }
+            mutations.push(RateLimitMutation {
+                subject,
+                id,
+                hour_epoch,
+                day_epoch,
+                hour_delta,
+                day_delta,
+            });
+        }
+
+        if !mutations.is_empty() {
+            pending_request_id.get_or_insert_with(|| Uuid::new_v4().as_u128());
+            pending_mutations.extend(mutations);
+        }
+    }
+
+    async fn flush_pending_rate_limit_mutations(
+        gateway_state: &GatewayState,
+        pending_mutations: &mut Vec<RateLimitMutation>,
+        pending_request_id: &mut Option<u128>,
+        client: Option<&Http3Client>,
+    ) {
+        if pending_mutations.is_empty() {
+            *pending_request_id = None;
+            return;
+        }
+
+        let request_id = *pending_request_id.get_or_insert_with(|| Uuid::new_v4().as_u128());
+        let batch = Arc::new(std::mem::take(pending_mutations));
+        let submit_batch = Arc::clone(&batch);
+
+        match gateway_state
+            .submit_rate_limit_mutations_with_request_id(request_id, submit_batch, client)
+            .await
+        {
+            Ok(_) => {
+                *pending_request_id = None;
+            }
+            Err(e) => {
+                warn!(
+                    "Rate limit mutation flush failed, retaining batch for retry (request_id: {}): {}",
+                    request_id, e
+                );
+                *pending_mutations =
+                    Arc::try_unwrap(batch).unwrap_or_else(|arc| arc.as_ref().clone());
+            }
+        }
     }
 
     pub async fn gateway_info_updater(
@@ -133,17 +215,19 @@ impl Gateway {
         gateway_state: GatewayState,
         task_queue: DupQueue<Task>,
         last_task_acquisition: Arc<AtomicU64>,
-        rate_limit_queue: Arc<Queue<RateLimitDelta>>,
+        rate_limit_queue: Arc<Queue<RateLimitMutation>>,
         shutdown: CancellationToken,
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
+        let mut pending_mutations: Vec<RateLimitMutation> = Vec::new();
+        let mut pending_request_id: Option<u128> = None;
 
         loop {
             let cfg = config.snapshot();
             let node_cfg = cfg.node();
             let update_interval = Duration::from_millis(node_cfg.basic.update_gateway_info_ms);
-            let max_deltas_in_batch = node_cfg.basic.max_rate_limit_deltas_per_batch.max(1);
+            let max_mutations_in_batch = node_cfg.basic.max_rate_limit_deltas_per_batch.max(1);
 
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -158,45 +242,12 @@ impl Gateway {
                 }
             };
 
-            // Drain and coalesce any pending rate limit deltas
-            let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (u64, u64)> =
-                FoldHashMap::with_capacity_and_hasher(
-                    max_deltas_in_batch.min(1024),
-                    RandomState::default(),
-                );
-            let mut raw_count = 0usize;
-            while let Some(entry) = rate_limit_queue.pop() {
-                let delta = **entry;
-                raw_count += 1;
-                let key = (delta.subject, delta.id, delta.hour_epoch, delta.day_epoch);
-                aggregated
-                    .entry(key)
-                    .and_modify(|acc| {
-                        acc.0 = acc.0.saturating_add(delta.add_hour as u64);
-                        acc.1 = acc.1.saturating_add(delta.add_day as u64);
-                    })
-                    .or_insert((delta.add_hour as u64, delta.add_day as u64));
-                if raw_count == max_deltas_in_batch {
-                    break;
-                }
-            }
-            let mut deltas = Vec::with_capacity(aggregated.len());
-            for ((subject, id, hour_epoch, day_epoch), (mut add_hour, mut add_day)) in aggregated {
-                while add_hour > 0 || add_day > 0 {
-                    let hour_chunk = add_hour.min(u32::MAX as u64) as u32;
-                    let day_chunk = add_day.min(u32::MAX as u64) as u32;
-                    deltas.push(RateLimitDelta {
-                        subject,
-                        id,
-                        hour_epoch,
-                        day_epoch,
-                        add_hour: hour_chunk,
-                        add_day: day_chunk,
-                    });
-                    add_hour -= hour_chunk as u64;
-                    add_day -= day_chunk as u64;
-                }
-            }
+            Gateway::collect_pending_rate_limit_mutations(
+                &rate_limit_queue,
+                max_mutations_in_batch,
+                &mut pending_mutations,
+                &mut pending_request_id,
+            );
 
             let last_update = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -209,8 +260,8 @@ impl Gateway {
             let last_task_acquisition = last_task_acquisition.load(Ordering::Relaxed);
 
             if leader == node_cfg.network.node_id {
-                let _ = tokio::join!(
-                    gateway_state.set_gateway_info(GatewayInfoRef {
+                if let Err(e) = gateway_state
+                    .set_gateway_info(GatewayInfoRef {
                         node_id: node_cfg.network.node_id,
                         domain: &node_cfg.network.domain,
                         ip: &node_cfg.network.external_ip,
@@ -219,8 +270,23 @@ impl Gateway {
                         available_tasks,
                         last_task_acquisition,
                         last_update,
-                    }),
-                    Gateway::flush_rate_limit_deltas(&gateway_state, Arc::new(deltas), None)
+                    })
+                    .await
+                {
+                    error!("Gateway info update failed (leader): {:?}", e);
+                }
+                Gateway::flush_pending_rate_limit_mutations(
+                    &gateway_state,
+                    &mut pending_mutations,
+                    &mut pending_request_id,
+                    None,
+                )
+                .await;
+                Gateway::collect_pending_rate_limit_mutations(
+                    &rate_limit_queue,
+                    max_mutations_in_batch,
+                    &mut pending_mutations,
+                    &mut pending_request_id,
                 );
                 last_leader = Some(leader);
                 client = None;
@@ -267,20 +333,25 @@ impl Gateway {
             };
 
             if let Some(client) = client.as_ref() {
-                let (info_res, _) = tokio::join!(
-                    gateway_state.submit_gateway_info_ext(info_ext, Some(client)),
-                    Gateway::flush_rate_limit_deltas(
-                        &gateway_state,
-                        Arc::new(deltas),
-                        Some(client)
-                    )
-                );
-                match info_res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Gateway info update failed: {:?}", e);
-                    }
+                if let Err(e) = gateway_state
+                    .submit_gateway_info_ext(info_ext, Some(client))
+                    .await
+                {
+                    error!("Gateway info update failed: {:?}", e);
                 }
+                Gateway::flush_pending_rate_limit_mutations(
+                    &gateway_state,
+                    &mut pending_mutations,
+                    &mut pending_request_id,
+                    Some(client),
+                )
+                .await;
+                Gateway::collect_pending_rate_limit_mutations(
+                    &rate_limit_queue,
+                    max_mutations_in_batch,
+                    &mut pending_mutations,
+                    &mut pending_request_id,
+                );
             }
         }
     }
@@ -316,13 +387,18 @@ impl Gateway {
             if current_leader != last_leader {
                 if let Some(leader_id) = current_leader {
                     info!("Leader changed to node {}", leader_id);
-                    if leader_id == current_node_id {
-                        let _ = Gateway::gateway_generic_key_update(
+                    if leader_id == current_node_id
+                        && let Err(err) = Gateway::gateway_generic_key_update(
                             &gateway_state,
                             current_node_id,
                             gateway_state.preconfigured_generic_key(),
                         )
-                        .await;
+                        .await
+                    {
+                        warn!(
+                            "Failed to update generic key after leader change: {:?}",
+                            err
+                        );
                     }
                 } else {
                     info!("Leadership changed, but no leader is elected yet");
@@ -366,18 +442,6 @@ impl Gateway {
                 result: res,
             },
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
-        self.task_manager.abort();
-
-        self.server.abort();
-        self.gateway_info_updater.abort();
-        self.gateway_leader_change.abort();
-        self.api_key_validator_updater.abort();
-        self.http_server.abort();
     }
 }
 
@@ -738,17 +802,17 @@ pub async fn start_gateway(
     ));
     let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
 
-    let task_manager = TaskManager::new(
-        cfg.basic.taskmanager_initial_capacity,
-        cfg.basic.unique_workers_per_task,
-        Duration::from_secs(cfg.basic.taskmanager_cleanup_interval),
-        Duration::from_secs(cfg.basic.taskmanager_result_lifetime),
-        metrics.clone(),
-        Some(event_recorder.clone()),
-    )
+    let rate_limit_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: cfg.basic.taskmanager_initial_capacity,
+        expected_results: cfg.basic.unique_workers_per_task,
+        cleanup_interval: Duration::from_secs(cfg.basic.taskmanager_cleanup_interval),
+        result_lifetime: Duration::from_secs(cfg.basic.taskmanager_result_lifetime),
+        rate_limit_mutation_queue: rate_limit_queue.clone(),
+        metrics: metrics.clone(),
+        worker_event_recorder: Some(event_recorder.clone()),
+    })
     .await;
-
-    let rate_limit_queue = Arc::new(Queue::<RateLimitDelta>::default());
 
     let gateway_state = GatewayState::new(GatewayStateInit {
         state: state_machine_store,

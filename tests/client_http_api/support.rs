@@ -22,12 +22,11 @@ use gateway::crypto::hotkey::Hotkey;
 use gateway::db::{EventRecorder, EventSinkHandle};
 use gateway::task::TaskManager;
 use gateway::test_support::{
-    MultipartFilePart, add_task_handler, api_or_generic_key_check, build_multipart_form,
-    build_shared_harness_core, current_timestamp_secs, custom_response,
-    dynamic_add_task_size_limit, dynamic_request_size_limit, enforce_rate_limit,
-    ensure_test_crypto_provider, get_load_handler, get_result_handler, get_status_handler,
-    get_tasks_handler, id_handler, load_test_single_node_config, prepare_rate_limit_context,
-    version_handler,
+    MultipartFilePart, add_task_handler, api_or_generic_key_check, basic_rate_limit,
+    build_multipart_form, build_shared_harness_core, current_timestamp_secs, custom_response,
+    dynamic_add_task_size_limit, dynamic_request_size_limit, ensure_test_crypto_provider,
+    get_load_handler, get_result_handler, get_status_handler, get_tasks_handler, id_handler,
+    load_test_single_node_config, prepare_rate_limit_context, version_handler,
 };
 
 pub(crate) use crate::common::{read_response, tiny_png_bytes};
@@ -215,8 +214,8 @@ async fn build_harness_inner(
         .push(
             Router::with_path("/add_task")
                 .hoop(dynamic_add_task_size_limit)
+                .hoop(basic_rate_limit)
                 .hoop(api_or_generic_key_check)
-                .hoop(enforce_rate_limit)
                 .post(add_task_handler),
         )
         .push(

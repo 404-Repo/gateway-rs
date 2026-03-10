@@ -212,16 +212,19 @@ async fn add_result_not_assigned_returns_unauthorized() {
     let h = build_harness(default_rate_ctx(), None).await;
     let task_id = Uuid::new_v4();
     h.task_manager
-        .add_task(gateway::api::Task {
-            id: task_id,
-            prompt: Some(std::sync::Arc::new("robot".to_string())),
-            image: None,
-            model: None,
-            seed: 0,
-            model_params: Some(
-                serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
-            ),
-        })
+        .add_task_with_rate_limit_reservation(
+            gateway::api::Task {
+                id: task_id,
+                prompt: Some(std::sync::Arc::new("robot".to_string())),
+                image: None,
+                model: None,
+                seed: 0,
+                model_params: Some(
+                    serde_json::from_str(r#"{"preset":"default"}"#).expect("model params object"),
+                ),
+            },
+            None,
+        )
         .await;
 
     let (worker_hotkey, timestamp, signature) = sign_worker([1u8; 32]);
