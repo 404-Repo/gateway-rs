@@ -55,6 +55,16 @@ pub struct WorkerEventRow {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+pub struct RateLimitViolationBatchRow {
+    pub gateway_name: String,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+    pub total_count: i64,
+    pub details: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct DatabaseBuilder {
     sslcert_path: Option<String>,
     sslkey_path: Option<String>,
@@ -71,6 +81,10 @@ pub struct DatabaseBuilder {
 pub trait EventSink: Send + Sync {
     async fn record_activity_events_batch(&self, rows: &[ActivityEventRow]) -> Result<()>;
     async fn record_worker_events_batch(&self, rows: &[WorkerEventRow]) -> Result<()>;
+    async fn record_rate_limit_violation_batches(
+        &self,
+        rows: &[RateLimitViolationBatchRow],
+    ) -> Result<()>;
 }
 
 #[cfg(feature = "test-support")]
@@ -78,6 +92,7 @@ pub trait EventSink: Send + Sync {
 pub struct InMemoryEventSink {
     activity: Arc<Mutex<Vec<ActivityEventRow>>>,
     worker: Arc<Mutex<Vec<WorkerEventRow>>>,
+    rate_limit: Arc<Mutex<Vec<RateLimitViolationBatchRow>>>,
 }
 
 #[cfg(feature = "test-support")]
@@ -90,6 +105,11 @@ impl InMemoryEventSink {
     #[allow(dead_code)]
     pub async fn worker_rows(&self) -> Vec<WorkerEventRow> {
         self.worker.lock().await.clone()
+    }
+
+    #[allow(dead_code)]
+    pub async fn rate_limit_rows(&self) -> Vec<RateLimitViolationBatchRow> {
+        self.rate_limit.lock().await.clone()
     }
 }
 
@@ -104,6 +124,15 @@ impl EventSink for InMemoryEventSink {
 
     async fn record_worker_events_batch(&self, rows: &[WorkerEventRow]) -> Result<()> {
         let mut guard = self.worker.lock().await;
+        guard.extend(rows.iter().cloned());
+        Ok(())
+    }
+
+    async fn record_rate_limit_violation_batches(
+        &self,
+        rows: &[RateLimitViolationBatchRow],
+    ) -> Result<()> {
+        let mut guard = self.rate_limit.lock().await;
         guard.extend(rows.iter().cloned());
         Ok(())
     }
@@ -137,6 +166,18 @@ impl EventSink for EventSinkHandle {
             EventSinkHandle::Noop => Ok(()),
         }
     }
+
+    async fn record_rate_limit_violation_batches(
+        &self,
+        rows: &[RateLimitViolationBatchRow],
+    ) -> Result<()> {
+        match self {
+            EventSinkHandle::Database(db) => db.record_rate_limit_violation_batches(rows).await,
+            #[cfg(feature = "test-support")]
+            EventSinkHandle::InMemory(sink) => sink.record_rate_limit_violation_batches(rows).await,
+            EventSinkHandle::Noop => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -147,5 +188,12 @@ impl EventSink for Database {
 
     async fn record_worker_events_batch(&self, rows: &[WorkerEventRow]) -> Result<()> {
         Database::record_worker_events_batch(self, rows).await
+    }
+
+    async fn record_rate_limit_violation_batches(
+        &self,
+        rows: &[RateLimitViolationBatchRow],
+    ) -> Result<()> {
+        Database::record_rate_limit_violation_batches(self, rows).await
     }
 }

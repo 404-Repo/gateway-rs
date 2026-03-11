@@ -5,7 +5,7 @@ use futures_util::SinkExt;
 use tokio_postgres::types::ToSql;
 
 use super::connection::StmtKey;
-use super::{ActivityEventRow, Database, WorkerEventRow};
+use super::{ActivityEventRow, Database, RateLimitViolationBatchRow, WorkerEventRow};
 
 impl Database {
     pub(super) const Q_SERVER_TIME_UTC: &'static str = r#"
@@ -125,6 +125,16 @@ action, \
 task_kind, \
 reason, \
 gateway_name, \
+created_at\
+) FROM STDIN WITH (FORMAT text)";
+
+    pub(super) const COPY_RATE_LIMIT_VIOLATIONS: &'static str = "\
+COPY rate_limit_violations (\
+gateway_name, \
+window_start, \
+window_end, \
+total_count, \
+details, \
 created_at\
 ) FROM STDIN WITH (FORMAT text)";
 
@@ -363,6 +373,69 @@ created_at\
                     buf.push(b'\n');
                 }
                 let sink = client.copy_in(Self::COPY_WORKER_EVENTS).await?;
+                let mut sink = std::pin::pin!(sink);
+                sink.as_mut().send(Bytes::from(buf)).await?;
+                sink.as_mut().finish().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                client.batch_execute("COMMIT").await?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(err)
+            }
+        }
+    }
+
+    pub async fn record_rate_limit_violation_batches(
+        &self,
+        rows: &[RateLimitViolationBatchRow],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let client = self.load_client().await?;
+        client.batch_execute("BEGIN").await?;
+        let result = async {
+            for chunk in rows.chunks(self.events_copy_batch_size) {
+                let mut buf = Vec::with_capacity(chunk.len() * 256);
+                for row in chunk {
+                    append_copy_field(&mut buf, Some(row.gateway_name.as_str()));
+                    buf.push(b'\t');
+                    let window_start = row
+                        .window_start
+                        .naive_utc()
+                        .format("%Y-%m-%d %H:%M:%S%.f")
+                        .to_string();
+                    append_copy_field(&mut buf, Some(window_start.as_str()));
+                    buf.push(b'\t');
+                    let window_end = row
+                        .window_end
+                        .naive_utc()
+                        .format("%Y-%m-%d %H:%M:%S%.f")
+                        .to_string();
+                    append_copy_field(&mut buf, Some(window_end.as_str()));
+                    buf.push(b'\t');
+                    append_copy_field(&mut buf, Some(row.total_count.to_string().as_str()));
+                    buf.push(b'\t');
+                    let details = serde_json::to_string(&row.details)?;
+                    append_copy_field(&mut buf, Some(details.as_str()));
+                    buf.push(b'\t');
+                    let created_at = row
+                        .created_at
+                        .naive_utc()
+                        .format("%Y-%m-%d %H:%M:%S%.f")
+                        .to_string();
+                    append_copy_field(&mut buf, Some(created_at.as_str()));
+                    buf.push(b'\n');
+                }
+                let sink = client.copy_in(Self::COPY_RATE_LIMIT_VIOLATIONS).await?;
                 let mut sink = std::pin::pin!(sink);
                 sink.as_mut().send(Bytes::from(buf)).await?;
                 sink.as_mut().finish().await?;
