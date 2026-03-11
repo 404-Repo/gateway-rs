@@ -16,7 +16,8 @@ use gateway::common::queue::DupQueue;
 use gateway::config::NodeConfig;
 use gateway::crypto::hotkey::Hotkey;
 use gateway::db::{
-    ActivityEventRow, EventRecorder, EventSinkHandle, InMemoryEventSink, WorkerEventRow,
+    ActivityEventRow, EventRecorder, EventSinkHandle, InMemoryEventSink, ViolationSinkHandle,
+    WorkerEventRow,
 };
 use gateway::task::TaskManager;
 use gateway::test_support::{
@@ -189,6 +190,7 @@ pub(crate) async fn build_harness(
         config_path,
         event_recorder.clone(),
         true,
+        ViolationSinkHandle::Noop,
     )
     .await;
 

@@ -1,9 +1,11 @@
+use http::StatusCode;
 use salvo::prelude::*;
 use salvo::rate_limiter::{BasicQuota, FixedGuard, MokaStore, RateIssuer, RateLimiter};
 use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::config::HTTPConfig;
+use crate::db::RateLimitViolationTracker;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
@@ -300,6 +302,25 @@ impl RateLimiters {
     }
 }
 
+/// Records a per-IP violation when the Salvo rate-limiter produced a 429 response.
+fn record_ip_violation_if_limited(
+    res: &Response,
+    req: &mut Request,
+    depot: &Depot,
+    state: &HttpState,
+    limiter_name: &str,
+) {
+    let is_429 = res
+        .status_code
+        .map(|s| s == StatusCode::TOO_MANY_REQUESTS)
+        .unwrap_or(false);
+    if !is_429 {
+        return;
+    }
+    let ip = cached_decimal_ip(req, depot).unwrap_or_else(|| Arc::from("unknown"));
+    state.violation_tracker().record(limiter_name, &ip);
+}
+
 #[handler]
 pub async fn basic_rate_limit(
     depot: &mut Depot,
@@ -313,6 +334,7 @@ pub async fn basic_rate_limit(
         .basic_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "basic");
     Ok(())
 }
 
@@ -329,6 +351,7 @@ pub async fn update_key_rate_limit(
         .update_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "update_key");
     Ok(())
 }
 
@@ -345,6 +368,7 @@ pub async fn unauthorized_only_rate_limit(
         .unauthorized_only_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "unauthorized_only");
     Ok(())
 }
 
@@ -361,6 +385,7 @@ pub async fn read_rate_limit(
         .read_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "read");
     Ok(())
 }
 
@@ -377,6 +402,7 @@ pub async fn result_rate_limit(
         .result_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "add_result");
     Ok(())
 }
 
@@ -393,6 +419,7 @@ pub async fn load_rate_limit(
         .load_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "load");
     Ok(())
 }
 
@@ -409,6 +436,7 @@ pub async fn leader_rate_limit(
         .leader_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "leader");
     Ok(())
 }
 
@@ -425,6 +453,7 @@ pub async fn metric_rate_limit(
         .metric_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "metric");
     Ok(())
 }
 
@@ -441,6 +470,7 @@ pub async fn status_rate_limit(
         .status_limiter
         .handle(req, depot, res, ctrl)
         .await;
+    record_ip_violation_if_limited(res, req, depot, &state, "status");
     Ok(())
 }
 
@@ -482,6 +512,7 @@ async fn check_subject_limit(
     gs: &GatewayState,
     epochs: (u64, u64),
     params: &SubjectParams<'_>,
+    violation_tracker: &RateLimitViolationTracker,
 ) -> Result<(), ServerError> {
     let subject = params.subject;
     let id = params.id;
@@ -521,6 +552,9 @@ async fn check_subject_limit(
         )
         .await
     {
+        let client_id = format!("{:?}:{}", subject, id);
+        let limiter_name = format!("distributed:{:?}", subject);
+        violation_tracker.record(&limiter_name, &client_id);
         return Err(ServerError::TooManyRequests(error_msg.to_string()));
     }
 
@@ -544,6 +578,7 @@ pub async fn reserve_add_task_rate_limit(
     let limiter = rate_limits.distributed().clone();
     let gs = state.gateway_state().clone();
     let policies = rate_limits.policies();
+    let violation_tracker = state.violation_tracker().clone();
 
     let epochs = limiter.epochs();
     let mut subjects = Vec::with_capacity(3);
@@ -567,7 +602,6 @@ pub async fn reserve_add_task_rate_limit(
         });
     }
 
-    // Company keys first, enforce their limits if present
     if let Some(company) = ctx.company.as_ref() {
         subjects.push(SubjectParams {
             subject: Subject::Company,
@@ -578,7 +612,6 @@ pub async fn reserve_add_task_rate_limit(
             require_day_match: company.daily_limit > 0,
         });
     } else if let Some(user_id) = ctx.user_id {
-        // Otherwise fall back to per-user quota when we have a user id
         subjects.push(SubjectParams {
             subject: Subject::User,
             id: user_id.as_u128(),
@@ -591,7 +624,9 @@ pub async fn reserve_add_task_rate_limit(
 
     let mut succeeded = Vec::with_capacity(subjects.len());
     for params in &subjects {
-        if let Err(err) = check_subject_limit(&limiter, &gs, epochs, params).await {
+        if let Err(err) =
+            check_subject_limit(&limiter, &gs, epochs, params, &violation_tracker).await
+        {
             for (key, (hour_decrement, day_decrement)) in succeeded.into_iter().rev() {
                 limiter
                     .rollback_pending(key, hour_decrement, day_decrement, epochs)

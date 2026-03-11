@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::api::Task;
 use crate::common::queue::DupQueue;
 use crate::config_runtime::{RuntimeConfigStore, RuntimeConfigView};
+use crate::db::RateLimitViolationTracker;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 
@@ -13,6 +14,7 @@ pub struct HttpState {
     gateway_state: GatewayState,
     task_queue: DupQueue<Task>,
     metrics: Metrics,
+    violation_tracker: RateLimitViolationTracker,
 }
 
 pub struct HttpStateInit {
@@ -20,6 +22,7 @@ pub struct HttpStateInit {
     pub gateway_state: GatewayState,
     pub task_queue: DupQueue<Task>,
     pub metrics: Metrics,
+    pub violation_tracker: RateLimitViolationTracker,
 }
 
 impl HttpState {
@@ -29,12 +32,14 @@ impl HttpState {
             gateway_state,
             task_queue,
             metrics,
+            violation_tracker,
         } = init;
         Self {
             config,
             gateway_state,
             task_queue,
             metrics,
+            violation_tracker,
         }
     }
 
@@ -56,6 +61,10 @@ impl HttpState {
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    pub fn violation_tracker(&self) -> &RateLimitViolationTracker {
+        &self.violation_tracker
     }
 
     pub fn is_cluster_ip(&self, ip: &IpAddr) -> bool {

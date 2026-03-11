@@ -33,7 +33,9 @@ use crate::common::queue::DupQueue;
 use crate::config::NodeConfig;
 use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
-use crate::db::{ApiKeyValidator, Database, EventRecorder};
+use crate::db::{
+    ApiKeyValidator, Database, EventRecorder, RateLimitViolationTracker, ViolationSinkHandle,
+};
 use crate::metrics::Metrics;
 use crate::raft::store::RateLimitMutation;
 use crate::raft::{LogStore, StateMachineStore};
@@ -79,6 +81,7 @@ pub struct SharedHarnessCore {
     pub state: HttpState,
     pub runtime_config: Arc<RuntimeConfigStore>,
     pub config_path: PathBuf,
+    pub violation_tracker: RateLimitViolationTracker,
 }
 
 pub async fn build_shared_harness_core(
@@ -86,6 +89,7 @@ pub async fn build_shared_harness_core(
     config_path: PathBuf,
     event_recorder: EventRecorder,
     include_gateway_info: bool,
+    violation_sink: ViolationSinkHandle,
 ) -> SharedHarnessCore {
     let generic_key = config.http.generic_key.unwrap_or_else(Uuid::new_v4);
     let runtime_config = Arc::new(
@@ -200,11 +204,20 @@ pub async fn build_shared_harness_core(
         event_recorder,
     });
 
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let violation_tracker = RateLimitViolationTracker::new(
+        Arc::new(violation_sink),
+        Arc::from(config.network.name.as_str()),
+        Duration::from_secs(3600),
+        shutdown,
+    );
+
     let state = HttpState::new(HttpStateInit {
         config: Arc::clone(&runtime_config),
         gateway_state,
         task_queue: task_queue.clone(),
         metrics,
+        violation_tracker: violation_tracker.clone(),
     });
 
     SharedHarnessCore {
@@ -215,6 +228,7 @@ pub async fn build_shared_harness_core(
         state,
         runtime_config,
         config_path,
+        violation_tracker,
     }
 }
 
