@@ -63,6 +63,7 @@ services:
     container_name: node-1
     environment:
       - GATEWAY_CONFIG=/usr/local/bin/config.toml
+      - GATEWAY_ALLOW_DANGEROUS_SKIP_VERIFICATION=1
     volumes:
       - ./config/config-single.toml:/usr/local/bin/config.toml
       - certs:/certs

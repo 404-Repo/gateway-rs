@@ -13,12 +13,14 @@ use openraft::StorageIOError;
 use openraft::StoredMembership;
 use openraft::storage::RaftStateMachine;
 use openraft::storage::Snapshot;
+use portable_atomic::AtomicU128;
 use sdd::{AtomicOwned, Guard, Owned, Tag};
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::{Cursor, Error as IoError};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +44,9 @@ pub type LogStore = crate::raft::memstore::log_store::LogStore<TypeConfig>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct RateLimitSnapshot {
-    pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub hour_limits: Vec<(RateLimitKey, u64)>,
+    #[serde(default)]
+    pub active_limits: Vec<(RateLimitKey, u64)>,
     pub day_limits: Vec<(RateLimitKey, u64)>,
 }
 
@@ -76,9 +78,9 @@ pub const fn rate_limit_key(subject: Subject, id: u128) -> RateLimitKey {
 pub struct RateLimitDelta {
     pub subject: Subject,
     pub id: u128,
-    pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub add_hour: u32,
+    #[serde(default)]
+    pub add_active: u32,
     pub add_day: u32,
 }
 
@@ -88,13 +90,13 @@ impl RateLimitDelta {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimitMutation {
     pub subject: Subject,
     pub id: u128,
-    pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub hour_delta: i64,
+    #[serde(default)]
+    pub active_delta: i64,
     pub day_delta: i64,
 }
 
@@ -107,9 +109,8 @@ impl RateLimitMutation {
         Self {
             subject: delta.subject,
             id: delta.id,
-            hour_epoch: delta.hour_epoch,
             day_epoch: delta.day_epoch,
-            hour_delta: delta.add_hour as i64,
+            active_delta: delta.add_active as i64,
             day_delta: delta.add_day as i64,
         }
     }
@@ -118,9 +119,8 @@ impl RateLimitMutation {
         Self {
             subject: refund.subject,
             id: refund.id,
-            hour_epoch: refund.hour_epoch,
             day_epoch: refund.day_epoch,
-            hour_delta: -(refund.sub_hour as i64),
+            active_delta: -(refund.sub_active as i64),
             day_delta: -(refund.sub_day as i64),
         }
     }
@@ -129,11 +129,33 @@ impl RateLimitMutation {
         Self {
             subject: delta.subject,
             id: delta.id,
-            hour_epoch: delta.hour_epoch,
             day_epoch: delta.day_epoch,
-            hour_delta: -(delta.add_hour as i64),
+            active_delta: -(delta.add_active as i64),
             day_delta: -(delta.add_day as i64),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RateLimitMutationBatch {
+    pub request_id: u128,
+    pub mutations: Vec<RateLimitMutation>,
+}
+
+impl RateLimitMutationBatch {
+    pub const fn new(request_id: u128, mutations: Vec<RateLimitMutation>) -> Self {
+        Self {
+            request_id,
+            mutations,
+        }
+    }
+
+    pub fn with_generated_request_id(mutations: Vec<RateLimitMutation>) -> Option<Self> {
+        (!mutations.is_empty()).then(|| Self::new(Uuid::new_v4().as_u128(), mutations))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mutations.is_empty()
     }
 }
 
@@ -141,9 +163,9 @@ impl RateLimitMutation {
 pub struct RateLimitRefund {
     pub subject: Subject,
     pub id: u128,
-    pub hour_epoch: u64,
     pub day_epoch: u64,
-    pub sub_hour: u32,
+    #[serde(default)]
+    pub sub_active: u32,
     pub sub_day: u32,
 }
 
@@ -156,9 +178,8 @@ impl RateLimitRefund {
         Self {
             subject: delta.subject,
             id: delta.id,
-            hour_epoch: delta.hour_epoch,
             day_epoch: delta.day_epoch,
-            sub_hour: delta.add_hour,
+            sub_active: delta.add_active,
             sub_day: delta.add_day,
         }
     }
@@ -194,6 +215,33 @@ impl Request {
             Request::RateLimitRefunds { request_id, .. } => *request_id,
         }
     }
+
+    pub fn into_rate_limit_batch(self) -> Result<RateLimitMutationBatch, Self> {
+        match self {
+            Request::RateLimitMutations {
+                request_id,
+                mutations,
+            } => Ok(RateLimitMutationBatch::new(request_id, mutations)),
+            Request::RateLimitDeltas { request_id, deltas } => Ok(RateLimitMutationBatch::new(
+                request_id,
+                deltas
+                    .into_iter()
+                    .map(RateLimitMutation::from_delta)
+                    .collect(),
+            )),
+            Request::RateLimitRefunds {
+                request_id,
+                refunds,
+            } => Ok(RateLimitMutationBatch::new(
+                request_id,
+                refunds
+                    .into_iter()
+                    .map(RateLimitMutation::from_refund)
+                    .collect(),
+            )),
+            other => Err(other),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -213,32 +261,61 @@ struct CurrentSnapshotRef {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub(super) struct SnapshotPayload {
+pub(crate) struct SnapshotPayload {
     pub data: BTreeMap<String, Vec<u8>>,
     pub rate_limits: RateLimitSnapshot,
 }
 
-#[derive(Serialize)]
-struct SnapshotPayloadRef<'a> {
-    data: &'a BTreeMap<String, Vec<u8>>,
-    rate_limits: &'a RateLimitSnapshot,
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotKv(Arc<BTreeMap<String, Arc<[u8]>>>);
+
+impl SnapshotKv {
+    pub(super) fn from_owned_map(data: BTreeMap<String, Vec<u8>>) -> Self {
+        let data = data
+            .into_iter()
+            .map(|(key, value)| (key, Arc::<[u8]>::from(value)))
+            .collect();
+        Self(Arc::new(data))
+    }
+
+    pub(super) fn to_owned_map(&self) -> BTreeMap<String, Vec<u8>> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_ref().to_vec()))
+            .collect()
+    }
+
+    pub(crate) fn insert(&mut self, key: String, value: impl Into<Arc<[u8]>>) -> Option<Arc<[u8]>> {
+        let mut next = (*self.0).clone();
+        let prev = next.insert(key, value.into());
+        self.0 = Arc::new(next);
+        prev
+    }
+}
+
+impl Deref for SnapshotKv {
+    type Target = BTreeMap<String, Arc<[u8]>>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
 }
 
 impl SnapshotPayload {
-    fn decode(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, rmp_serde::decode::Error> {
         rmp_serde::from_slice(bytes)
     }
 }
 
 /// Data contained in the Raft state machine.
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct StateMachineData {
     pub last_applied_log: Option<LogId<NodeId>>,
 
     pub last_membership: StoredMembership<NodeId, BasicNode>,
 
     /// Application data.
-    pub data: BTreeMap<String, Vec<u8>>,
+    pub data: SnapshotKv,
 }
 
 /// Defines a state machine for the Raft cluster. This state machine represents a copy of the
@@ -266,13 +343,17 @@ pub struct StateMachineStore {
     request_dedupe: HashCache<u128, Instant, RandomState>,
 
     /// Concurrent hash maps for rate limits, swapped atomically during snapshot installs.
-    rate_limits_hour: AtomicOwned<HashMap<RateLimitKey, u64, RandomState>>,
+    rate_limits_active: AtomicOwned<HashMap<RateLimitKey, u64, RandomState>>,
     rate_limits_day: AtomicOwned<HashMap<RateLimitKey, u64, RandomState>>,
-    hour_epoch: AtomicU64,
     day_epoch: AtomicU64,
 
     /// Guard to synchronize apply and snapshot building for consistent cuts.
     snapshot_guard: tokio::sync::Mutex<()>,
+
+    /// Cached generic-key UUID as u128 (0 = absent). Updated only on
+    /// Set{"generic_key"} applies and snapshot installs — avoids acquiring the state_machine
+    /// RwLock on every request.
+    cached_generic_key: AtomicU128,
 }
 
 #[cfg(test)]
@@ -292,7 +373,7 @@ impl Default for StateMachineStore {
             )),
             persistence: None,
             request_dedupe: HashCache::with_capacity_and_hasher(512, 1024, RandomState::default()),
-            rate_limits_hour: AtomicOwned::new(HashMap::with_capacity_and_hasher(
+            rate_limits_active: AtomicOwned::new(HashMap::with_capacity_and_hasher(
                 4096,
                 RandomState::default(),
             )),
@@ -300,9 +381,9 @@ impl Default for StateMachineStore {
                 4096,
                 RandomState::default(),
             )),
-            hour_epoch: AtomicU64::new(0),
             day_epoch: AtomicU64::new(0),
             snapshot_guard: tokio::sync::Mutex::new(()),
+            cached_generic_key: AtomicU128::new(0),
         }
     }
 }
@@ -319,15 +400,6 @@ impl StateMachineStore {
         map
     }
 
-    fn current_rate_limits_hour<'guard>(
-        &self,
-        guard: &'guard Guard,
-    ) -> Option<&'guard HashMap<RateLimitKey, u64, RandomState>> {
-        self.rate_limits_hour
-            .load(Ordering::Acquire, guard)
-            .as_ref()
-    }
-
     fn current_rate_limits_day<'guard>(
         &self,
         guard: &'guard Guard,
@@ -335,17 +407,24 @@ impl StateMachineStore {
         self.rate_limits_day.load(Ordering::Acquire, guard).as_ref()
     }
 
+    fn current_rate_limits_active<'guard>(
+        &self,
+        guard: &'guard Guard,
+    ) -> Option<&'guard HashMap<RateLimitKey, u64, RandomState>> {
+        self.rate_limits_active
+            .load(Ordering::Acquire, guard)
+            .as_ref()
+    }
+
     fn sync_rate_limits(&self, snapshot: RateLimitSnapshot) {
-        let hour_map = Self::build_rate_limit_map(snapshot.hour_limits);
+        let active_map = Self::build_rate_limit_map(snapshot.active_limits);
         let day_map = Self::build_rate_limit_map(snapshot.day_limits);
         let _ = self
-            .rate_limits_hour
-            .swap((Some(Owned::new(hour_map)), Tag::None), Ordering::AcqRel);
+            .rate_limits_active
+            .swap((Some(Owned::new(active_map)), Tag::None), Ordering::AcqRel);
         let _ = self
             .rate_limits_day
             .swap((Some(Owned::new(day_map)), Tag::None), Ordering::AcqRel);
-        self.hour_epoch
-            .store(snapshot.hour_epoch, Ordering::Release);
         self.day_epoch.store(snapshot.day_epoch, Ordering::Release);
     }
 
@@ -358,14 +437,15 @@ impl StateMachineStore {
         let (state_machine_data, rate_limits_data, snapshot_idx, current_snapshot) =
             persistence.load_latest()?;
 
-        let hour_epoch = rate_limits_data.hour_epoch;
         let day_epoch = rate_limits_data.day_epoch;
-        let rate_limits_hour = Self::build_rate_limit_map(rate_limits_data.hour_limits);
+        let rate_limits_active = Self::build_rate_limit_map(rate_limits_data.active_limits);
         let rate_limits_day = Self::build_rate_limit_map(rate_limits_data.day_limits);
         let snapshot_data_path = persistence.dir.join("current_snapshot_payload.bin");
         if let Some(snapshot) = current_snapshot.as_ref() {
             write_atomic(&snapshot_data_path, &snapshot.data)?;
         }
+
+        let generic_key_u128 = Self::extract_generic_key_u128(&state_machine_data.data);
 
         Ok(Self {
             state_machine: RwLock::new(state_machine_data),
@@ -379,12 +459,46 @@ impl StateMachineStore {
             current_snapshot_data_path: snapshot_data_path,
             persistence: Some(persistence),
             request_dedupe: HashCache::with_capacity_and_hasher(256, 1024, RandomState::default()),
-            rate_limits_hour: AtomicOwned::new(rate_limits_hour),
+            rate_limits_active: AtomicOwned::new(rate_limits_active),
             rate_limits_day: AtomicOwned::new(rate_limits_day),
-            hour_epoch: AtomicU64::new(hour_epoch),
             day_epoch: AtomicU64::new(day_epoch),
             snapshot_guard: tokio::sync::Mutex::new(()),
+            cached_generic_key: AtomicU128::new(generic_key_u128),
         })
+    }
+
+    fn extract_generic_key_u128(data: &SnapshotKv) -> u128 {
+        data.get("generic_key")
+            .and_then(|v| rmp_serde::from_slice::<Uuid>(v.as_ref()).ok())
+            .map_or(0, |uuid| uuid.as_u128())
+    }
+
+    fn store_cached_generic_key(&self, raw: u128) {
+        self.cached_generic_key.store(raw, Ordering::Release);
+    }
+
+    /// Returns the cached generic-key without acquiring any locks.
+    pub fn get_cached_generic_key(&self) -> Option<Uuid> {
+        let raw = self.cached_generic_key.load(Ordering::Acquire);
+        (raw != 0).then(|| Uuid::from_u128(raw))
+    }
+
+    async fn with_snapshot_state_machine_read<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&StateMachineData) -> T,
+    {
+        let _snapshot_guard = self.snapshot_guard.lock().await;
+        let state_machine = self.state_machine.read().await;
+        f(&state_machine)
+    }
+
+    async fn with_snapshot_state_machine_write<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce(&mut StateMachineData) -> T,
+    {
+        let _snapshot_guard = self.snapshot_guard.lock().await;
+        let mut state_machine = self.state_machine.write().await;
+        f(&mut state_machine)
     }
 
     async fn is_duplicate_request(&self, request_id: u128) -> bool {
@@ -405,32 +519,15 @@ impl StateMachineStore {
 
     pub async fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
         let sm = self.state_machine.read().await;
-        sm.data.get(key).cloned()
+        sm.data.get(key).map(|value| value.as_ref().to_vec())
     }
 
-    pub async fn get_rate_limit_usage(
-        &self,
-        key: &RateLimitKey,
-        hour_epoch: u64,
-        day_epoch: u64,
-    ) -> (u64, u64) {
+    pub async fn get_rate_limit_usage(&self, key: &RateLimitKey, day_epoch: u64) -> (u64, u64) {
         let guard = Guard::new();
-        let hour = {
-            let current = self.hour_epoch.load(Ordering::Acquire);
-            if current != hour_epoch {
-                0
-            } else {
-                let value = self
-                    .current_rate_limits_hour(&guard)
-                    .and_then(|map| map.read_sync(key, |_, v| *v))
-                    .unwrap_or(0);
-                if self.hour_epoch.load(Ordering::Acquire) != current {
-                    0
-                } else {
-                    value
-                }
-            }
-        };
+        let active = self
+            .current_rate_limits_active(&guard)
+            .and_then(|map| map.read_sync(key, |_, v| *v))
+            .unwrap_or(0);
 
         let day = {
             let current = self.day_epoch.load(Ordering::Acquire);
@@ -449,7 +546,7 @@ impl StateMachineStore {
             }
         };
 
-        (hour, day)
+        (active, day)
     }
 
     async fn persist_snapshot(
@@ -476,152 +573,110 @@ impl StateMachineStore {
     }
 
     async fn apply_blank(&self, log_id: LogId<NodeId>) {
-        let _sg = self.snapshot_guard.lock().await;
-        let mut sm = self.state_machine.write().await;
-        sm.last_applied_log = Some(log_id);
+        self.with_snapshot_state_machine_write(|sm| {
+            sm.last_applied_log = Some(log_id);
+        })
+        .await;
     }
 
     async fn apply_membership(&self, log_id: LogId<NodeId>, mem: Membership<NodeId, BasicNode>) {
-        let _sg = self.snapshot_guard.lock().await;
-        let mut sm = self.state_machine.write().await;
-        sm.last_applied_log = Some(log_id);
-        sm.last_membership = StoredMembership::new(Some(log_id), mem);
+        self.with_snapshot_state_machine_write(|sm| {
+            sm.last_applied_log = Some(log_id);
+            sm.last_membership = StoredMembership::new(Some(log_id), mem);
+        })
+        .await;
     }
 
-    async fn apply_rate_limit_mutations_entry(
-        &self,
-        log_id: LogId<NodeId>,
-        mutations: Vec<RateLimitMutation>,
-        is_dup: bool,
-    ) {
-        if !is_dup {
-            let guard = Guard::new();
-            let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (i64, i64)> =
-                FoldHashMap::with_capacity_and_hasher(mutations.len(), RandomState::default());
-            for mutation in mutations {
-                let key = (
-                    mutation.subject,
-                    mutation.id,
-                    mutation.hour_epoch,
-                    mutation.day_epoch,
-                );
-                aggregated
+    /// Apply rate-limit mutations to the concurrent maps. Caller must hold `snapshot_guard`.
+    fn apply_rate_limit_mutations_maps(&self, mutations: Vec<RateLimitMutation>) {
+        let guard = Guard::new();
+        let mut day_aggregated: FoldHashMap<(Subject, u128, u64), i64> =
+            FoldHashMap::with_capacity_and_hasher(mutations.len(), RandomState::default());
+        let mut active_aggregated: FoldHashMap<(Subject, u128), i64> =
+            FoldHashMap::with_capacity_and_hasher(mutations.len(), RandomState::default());
+        let mut min_day_epoch = u64::MAX;
+        let mut max_day_epoch = 0u64;
+        for mutation in mutations {
+            if mutation.active_delta != 0 {
+                active_aggregated
+                    .entry((mutation.subject, mutation.id))
+                    .and_modify(|acc| {
+                        *acc = acc.saturating_add(mutation.active_delta);
+                    })
+                    .or_insert(mutation.active_delta);
+            }
+            if mutation.day_delta != 0 {
+                let key = (mutation.subject, mutation.id, mutation.day_epoch);
+                day_aggregated
                     .entry(key)
                     .and_modify(|acc| {
-                        acc.0 = acc.0.saturating_add(mutation.hour_delta);
-                        acc.1 = acc.1.saturating_add(mutation.day_delta);
+                        *acc = acc.saturating_add(mutation.day_delta);
                     })
-                    .or_insert((mutation.hour_delta, mutation.day_delta));
+                    .or_insert(mutation.day_delta);
+                min_day_epoch = min_day_epoch.min(mutation.day_epoch);
+                max_day_epoch = max_day_epoch.max(mutation.day_epoch);
             }
+        }
 
-            let mut hour_updates = Vec::with_capacity(aggregated.len());
-            let mut day_updates = Vec::with_capacity(aggregated.len());
-            for ((subject, id, hour_epoch, day_epoch), (hour_delta, day_delta)) in aggregated {
-                if hour_delta != 0 {
-                    hour_updates.push((hour_epoch, subject, id, hour_delta));
-                }
-                if day_delta != 0 {
-                    day_updates.push((day_epoch, subject, id, day_delta));
-                }
-            }
+        let mut day_updates: Vec<_> = day_aggregated
+            .into_iter()
+            .filter(|(_, delta)| *delta != 0)
+            .map(|((subject, id, day_epoch), day_delta)| (day_epoch, subject, id, day_delta))
+            .collect();
 
-            hour_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+        if min_day_epoch != max_day_epoch {
             day_updates.sort_by_key(|(epoch, _, _, _)| *epoch);
+        }
 
-            let mut current_hour_epoch = self.hour_epoch.load(Ordering::Relaxed);
-            for (hour_epoch, subject, id, hour_delta) in hour_updates {
-                if hour_epoch > current_hour_epoch {
-                    let new_map = HashMap::with_capacity_and_hasher(4096, RandomState::default());
-                    let _ = self
-                        .rate_limits_hour
-                        .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
-                    self.hour_epoch.store(hour_epoch, Ordering::Release);
-                    current_hour_epoch = hour_epoch;
-                }
-                if hour_epoch == current_hour_epoch
-                    && let Some(map) = self.current_rate_limits_hour(&guard)
-                {
-                    let key = rate_limit_key(subject, id);
-                    if hour_delta > 0 {
-                        let add = hour_delta as u64;
-                        map.entry_sync(key)
-                            .and_modify(|v| {
-                                *v = v.saturating_add(add);
-                            })
-                            .or_insert(add);
-                    } else {
-                        let sub = hour_delta.unsigned_abs();
-                        let _ = map.entry_sync(key).and_modify(|v| {
-                            *v = v.saturating_sub(sub);
-                        });
-                    }
-                }
+        for ((subject, id), active_delta) in active_aggregated {
+            if active_delta == 0 {
+                continue;
             }
-
-            let mut current_day_epoch = self.day_epoch.load(Ordering::Relaxed);
-            for (day_epoch, subject, id, day_delta) in day_updates {
-                if day_epoch > current_day_epoch {
-                    let new_map = HashMap::with_capacity_and_hasher(4096, RandomState::default());
-                    let _ = self
-                        .rate_limits_day
-                        .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
-                    self.day_epoch.store(day_epoch, Ordering::Release);
-                    current_day_epoch = day_epoch;
-                }
-                if day_epoch == current_day_epoch
-                    && let Some(map) = self.current_rate_limits_day(&guard)
-                {
-                    let key = rate_limit_key(subject, id);
-                    if day_delta > 0 {
-                        let add = day_delta as u64;
-                        map.entry_sync(key)
-                            .and_modify(|v| {
-                                *v = v.saturating_add(add);
-                            })
-                            .or_insert(add);
-                    } else {
-                        let sub = day_delta.unsigned_abs();
-                        let _ = map.entry_sync(key).and_modify(|v| {
-                            *v = v.saturating_sub(sub);
-                        });
-                    }
+            if let Some(map) = self.current_rate_limits_active(&guard) {
+                let key = rate_limit_key(subject, id);
+                if active_delta > 0 {
+                    let add = active_delta as u64;
+                    map.entry_sync(key)
+                        .and_modify(|v| {
+                            *v = v.saturating_add(add);
+                        })
+                        .or_insert(add);
+                } else {
+                    let sub = active_delta.unsigned_abs();
+                    let _ = map.entry_sync(key).and_modify(|v| {
+                        *v = v.saturating_sub(sub);
+                    });
                 }
             }
         }
 
-        let mut sm = self.state_machine.write().await;
-        sm.last_applied_log = Some(log_id);
-    }
-
-    async fn apply_request(&self, log_id: LogId<NodeId>, request: Request, is_dup: bool) {
-        let _sg = self.snapshot_guard.lock().await;
-        match request {
-            Request::Set { key, value, .. } => {
-                let mut sm = self.state_machine.write().await;
-                if !is_dup {
-                    sm.data.insert(key, value);
+        let mut current_day_epoch = self.day_epoch.load(Ordering::Relaxed);
+        for (day_epoch, subject, id, day_delta) in day_updates {
+            if day_epoch > current_day_epoch {
+                let new_map = HashMap::with_capacity_and_hasher(4096, RandomState::default());
+                let _ = self
+                    .rate_limits_day
+                    .swap((Some(Owned::new(new_map)), Tag::None), Ordering::AcqRel);
+                self.day_epoch.store(day_epoch, Ordering::Release);
+                current_day_epoch = day_epoch;
+            }
+            if day_epoch == current_day_epoch
+                && let Some(map) = self.current_rate_limits_day(&guard)
+            {
+                let key = rate_limit_key(subject, id);
+                if day_delta > 0 {
+                    let add = day_delta as u64;
+                    map.entry_sync(key)
+                        .and_modify(|v| {
+                            *v = v.saturating_add(add);
+                        })
+                        .or_insert(add);
+                } else {
+                    let sub = day_delta.unsigned_abs();
+                    let _ = map.entry_sync(key).and_modify(|v| {
+                        *v = v.saturating_sub(sub);
+                    });
                 }
-                sm.last_applied_log = Some(log_id);
-            }
-            Request::RateLimitMutations { mutations, .. } => {
-                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
-                    .await;
-            }
-            Request::RateLimitDeltas { deltas, .. } => {
-                let mutations = deltas
-                    .into_iter()
-                    .map(RateLimitMutation::from_delta)
-                    .collect();
-                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
-                    .await;
-            }
-            Request::RateLimitRefunds { refunds, .. } => {
-                let mutations = refunds
-                    .into_iter()
-                    .map(RateLimitMutation::from_refund)
-                    .collect();
-                self.apply_rate_limit_mutations_entry(log_id, mutations, is_dup)
-                    .await;
             }
         }
     }
@@ -629,45 +684,44 @@ impl StateMachineStore {
 
 impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let (snapshot_bytes, last_applied_log, last_membership) = {
-            // Ensure a consistent cut between state_machine and rate_limits
-            let _sg = self.snapshot_guard.lock().await;
-            let state_machine = self.state_machine.read().await;
+        // Collect Arc-backed data under locks and serialize outside to minimize critical section.
+        let (data, rate_limits, last_applied_log, last_membership) = self
+            .with_snapshot_state_machine_read(|state_machine| {
+                let guard = Guard::new();
+                let mut active_limits = Vec::new();
+                if let Some(map) = self.current_rate_limits_active(&guard) {
+                    map.iter_sync(|k, v| {
+                        active_limits.push((*k, *v));
+                        true
+                    });
+                }
+                let mut day_limits = Vec::new();
+                if let Some(map) = self.current_rate_limits_day(&guard) {
+                    map.iter_sync(|k, v| {
+                        day_limits.push((*k, *v));
+                        true
+                    });
+                }
+                let rate_limits = RateLimitSnapshot {
+                    day_epoch: self.day_epoch.load(Ordering::Acquire),
+                    active_limits,
+                    day_limits,
+                };
+                (
+                    state_machine.data.clone(),
+                    rate_limits,
+                    state_machine.last_applied_log,
+                    state_machine.last_membership.clone(),
+                )
+            })
+            .await;
 
-            // Collect rate limits from the concurrent HashMap
-            let guard = Guard::new();
-            let mut hour_limits = Vec::new();
-            if let Some(map) = self.current_rate_limits_hour(&guard) {
-                map.iter_sync(|k, v| {
-                    hour_limits.push((*k, *v));
-                    true
-                });
-            }
-            let mut day_limits = Vec::new();
-            if let Some(map) = self.current_rate_limits_day(&guard) {
-                map.iter_sync(|k, v| {
-                    day_limits.push((*k, *v));
-                    true
-                });
-            }
-            let rate_limits = RateLimitSnapshot {
-                hour_epoch: self.hour_epoch.load(Ordering::Acquire),
-                day_epoch: self.day_epoch.load(Ordering::Acquire),
-                hour_limits,
-                day_limits,
-            };
-            let payload = SnapshotPayloadRef {
-                data: &state_machine.data,
-                rate_limits: &rate_limits,
-            };
-            let snapshot_bytes =
-                rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
-            (
-                snapshot_bytes,
-                state_machine.last_applied_log,
-                state_machine.last_membership.clone(),
-            )
+        let payload = SnapshotPayload {
+            data: data.to_owned_map(),
+            rate_limits,
         };
+        let snapshot_bytes =
+            rmp_serde::to_vec(&payload).map_err(|e| StorageIOError::read_state_machine(&e))?;
 
         let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = if let Some(last) = last_applied_log {
@@ -684,11 +738,11 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
 
         let snapshot = Arc::new(StoredSnapshot {
             meta: meta.clone(),
-            data: snapshot_bytes.clone(),
+            data: snapshot_bytes,
         });
 
         self.persist_snapshot(Arc::clone(&snapshot)).await?;
-        write_atomic(&self.current_snapshot_data_path, &snapshot_bytes)
+        write_atomic(&self.current_snapshot_data_path, &snapshot.data)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
         let _ = self.current_snapshot.swap(
@@ -703,7 +757,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<StateMachineStore> {
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(snapshot_bytes)),
+            snapshot: Box::new(Cursor::new(snapshot.data.clone())),
         })
     }
 }
@@ -726,21 +780,114 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
-        let mut res = Vec::new();
+        enum Classified {
+            Blank(LogId<NodeId>),
+            Membership(LogId<NodeId>, Membership<NodeId, BasicNode>),
+            Set(LogId<NodeId>, Request),
+            RateLimit(LogId<NodeId>, Request),
+        }
 
-        for entry in entries {
-            let log_id = entry.log_id;
-
-            match entry.payload {
-                EntryPayload::Blank => self.apply_blank(log_id).await,
+        let classified: Vec<Classified> = entries
+            .into_iter()
+            .map(|entry| match entry.payload {
+                EntryPayload::Blank => Classified::Blank(entry.log_id),
+                EntryPayload::Membership(mem) => Classified::Membership(entry.log_id, mem),
                 EntryPayload::Normal(request) => {
+                    if matches!(&request, Request::Set { .. }) {
+                        Classified::Set(entry.log_id, request)
+                    } else {
+                        Classified::RateLimit(entry.log_id, request)
+                    }
+                }
+            })
+            .collect();
+
+        let count = classified.len();
+        let mut res = Vec::with_capacity(count);
+
+        // Pre-scan to find batch boundaries (indices where rate-limit runs start/end).
+        // Then process in a single owned pass using drain or indexed removal.
+        // Simplest correct approach: convert to VecDeque and pop from front.
+        let mut queue = std::collections::VecDeque::from(classified);
+
+        while let Some(item) = queue.pop_front() {
+            match item {
+                Classified::Blank(log_id) => {
+                    self.apply_blank(log_id).await;
+                    res.push(Response);
+                }
+                Classified::Membership(log_id, mem) => {
+                    self.apply_membership(log_id, mem).await;
+                    res.push(Response);
+                }
+                Classified::Set(log_id, request) => {
                     let request_id = request.request_id();
                     let is_dup = self.is_duplicate_request(request_id).await;
-                    self.apply_request(log_id, request, is_dup).await;
+                    self.with_snapshot_state_machine_write(|sm| {
+                        if !is_dup
+                            && let Request::Set {
+                                ref key, ref value, ..
+                            } = request
+                        {
+                            if key == "generic_key" {
+                                let cached = rmp_serde::from_slice::<Uuid>(value)
+                                    .ok()
+                                    .map_or(0, |uuid| uuid.as_u128());
+                                self.store_cached_generic_key(cached);
+                            }
+                            sm.data.insert(key.clone(), value.clone());
+                        }
+                        sm.last_applied_log = Some(log_id);
+                    })
+                    .await;
+                    res.push(Response);
                 }
-                EntryPayload::Membership(mem) => self.apply_membership(log_id, mem).await,
+                Classified::RateLimit(log_id, request) => {
+                    // Batch this entry with any consecutive rate-limit entries.
+                    // Collect all mutations into a single Vec to aggregate across the
+                    // whole batch — one set of FoldHashMap allocations, one apply pass.
+                    let mut all_mutations = Vec::new();
+                    let mut last_log_id = log_id;
+
+                    // Finish any async dedupe work before entering the snapshot critical section.
+                    let request_id = request.request_id();
+                    let is_dup = self.is_duplicate_request(request_id).await;
+                    if !is_dup {
+                        let batch = request
+                            .into_rate_limit_batch()
+                            .expect("rate-limit request should convert");
+                        all_mutations.extend(batch.mutations);
+                    }
+                    res.push(Response);
+
+                    // Drain consecutive rate-limit entries.
+                    while let Some(Classified::RateLimit(..)) = queue.front() {
+                        if let Some(Classified::RateLimit(lid, req)) = queue.pop_front() {
+                            last_log_id = lid;
+                            let rid = req.request_id();
+                            let is_dup = self.is_duplicate_request(rid).await;
+                            if !is_dup {
+                                let batch = req
+                                    .into_rate_limit_batch()
+                                    .expect("rate-limit request should convert");
+                                all_mutations.extend(batch.mutations);
+                            }
+                            res.push(Response);
+                        }
+                    }
+
+                    self.with_snapshot_state_machine_write(|sm| {
+                        // Apply all mutations in one pass.
+                        if !all_mutations.is_empty() {
+                            self.apply_rate_limit_mutations_maps(all_mutations);
+                        }
+
+                        // Single state_machine write for the entire batch.
+                        sm.last_applied_log = Some(last_log_id);
+                    })
+                    .await;
+                }
             }
-            res.push(Response);
         }
         Ok(res)
     }
@@ -774,9 +921,7 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             .map_err(|e| StorageIOError::write_snapshot(Some(new_snapshot.meta.signature()), &e))?;
 
         // Update the state machine and rate limits under the snapshot guard.
-        {
-            let _sg = self.snapshot_guard.lock().await;
-
+        self.with_snapshot_state_machine_write(|state_machine| {
             let SnapshotPayload {
                 data,
                 rate_limits: new_rate_limits,
@@ -785,16 +930,17 @@ impl RaftStateMachine<TypeConfig> for Arc<StateMachineStore> {
             let updated_state_machine = StateMachineData {
                 last_applied_log: meta.last_log_id,
                 last_membership: meta.last_membership.clone(),
-                data,
+                data: SnapshotKv::from_owned_map(data),
             };
 
-            {
-                let mut state_machine = self.state_machine.write().await;
-                *state_machine = updated_state_machine;
-            }
+            self.store_cached_generic_key(StateMachineStore::extract_generic_key_u128(
+                &updated_state_machine.data,
+            ));
 
+            *state_machine = updated_state_machine;
             self.sync_rate_limits(new_rate_limits);
-        }
+        })
+        .await;
 
         // Update current snapshot atomically
         let _ = self.current_snapshot.swap(

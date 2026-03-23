@@ -34,6 +34,12 @@ pub(crate) fn init_tracing() {
     });
 }
 
+pub(crate) fn ensure_crypto_provider_for_tests() {
+    CRYPTO_PROVIDER_INIT.call_once(|| {
+        crate::raft::init_crypto_provider().expect("crypto provider init must succeed");
+    });
+}
+
 pub(crate) fn membership_from(
     node_configs: &[(u64, &str)],
 ) -> std::collections::BTreeMap<NodeId, BasicNode> {
@@ -173,9 +179,7 @@ pub(crate) fn reserve_udp_addresses(
 pub(crate) async fn setup_standalone_raft_node(
     node_id: u64,
 ) -> Result<(openraft::Raft<TypeConfig>, Arc<StateMachineStore>)> {
-    CRYPTO_PROVIDER_INIT.call_once(|| {
-        crate::raft::init_crypto_provider().expect("crypto provider init must succeed");
-    });
+    ensure_crypto_provider_for_tests();
 
     let log_store = LogStore::default();
     let state_machine_store = Arc::new(StateMachineStore::default());

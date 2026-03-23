@@ -61,7 +61,6 @@ async fn persists_and_recovers_log_store() -> anyhow::Result<()> {
         let mut guard = log_store.inner.lock().await;
         guard
             .append(vec![entry.clone()])
-            .await
             .map_err(|e| anyhow::anyhow!(e))?;
         guard.committed = Some(log_id);
         guard.last_purged_log_id = Some(LogId::new(LeaderId::new(1, 1), 0));
@@ -70,7 +69,7 @@ async fn persists_and_recovers_log_store() -> anyhow::Result<()> {
     // Persist each change as diff ops
     log_store
         .persist_if_needed(
-            log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![entry]))),
+            log_store.persist_op_if_needed(Some(super::PersistOp::Append(Arc::new(vec![entry])))),
         )
         .await?;
     log_store
@@ -138,9 +137,9 @@ async fn truncate_removes_boundary_entry() -> anyhow::Result<()> {
     let leader = LeaderId::new(1, 1);
     let entry1 = blank_entry(leader, 5);
     let entry2 = blank_entry(leader, 6);
-    inner.append(vec![entry1.clone(), entry2]).await?;
+    inner.append(vec![entry1.clone(), entry2])?;
 
-    inner.truncate(entry1.log_id).await?;
+    inner.truncate(entry1.log_id)?;
 
     assert!(!log_has_index(&inner, entry1.log_id.index));
     assert!(!log_has_index(&inner, entry1.log_id.index + 1));
@@ -163,16 +162,15 @@ async fn purge_rewrites_persistent_log_store() -> anyhow::Result<()> {
         let mut guard = log_store.inner.lock().await;
         guard
             .append(vec![entry1.clone(), entry2.clone()])
-            .await
             .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     log_store
         .persist_if_needed(
-            log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![
+            log_store.persist_op_if_needed(Some(super::PersistOp::Append(Arc::new(vec![
                 entry1.clone(),
                 entry2.clone(),
-            ]))),
+            ])))),
         )
         .await?;
 
@@ -181,7 +179,7 @@ async fn purge_rewrites_persistent_log_store() -> anyhow::Result<()> {
     let purge_id = entry1.log_id;
     {
         let mut guard = log_store.inner.lock().await;
-        guard.purge(purge_id).await?;
+        guard.purge(purge_id)?;
     }
     log_store
         .persist_if_needed(
@@ -246,7 +244,9 @@ async fn append_is_immediately_recoverable_without_background_flush() -> anyhow:
     let log_store = LogStore::with_persistence(&log_path)?;
     log_store
         .persist_if_needed(
-            log_store.persist_op_if_needed(Some(super::PersistOp::Append(vec![entry.clone()]))),
+            log_store.persist_op_if_needed(Some(super::PersistOp::Append(Arc::new(vec![
+                entry.clone(),
+            ])))),
         )
         .await?;
 
@@ -291,9 +291,18 @@ async fn process_batch_merges_adjacent_append_ops() -> anyhow::Result<()> {
     let (tx2, rx2) = oneshot::channel::<Result<(), Box<StorageError<NodeId>>>>();
     let (tx3, rx3) = oneshot::channel::<Result<(), Box<StorageError<NodeId>>>>();
     let batch = vec![
-        (PersistOp::Append(vec![blank_entry(leader, 1)]), tx1),
-        (PersistOp::Append(vec![blank_entry(leader, 2)]), tx2),
-        (PersistOp::Append(vec![blank_entry(leader, 3)]), tx3),
+        (
+            PersistOp::Append(Arc::new(vec![blank_entry(leader, 1)])),
+            tx1,
+        ),
+        (
+            PersistOp::Append(Arc::new(vec![blank_entry(leader, 2)])),
+            tx2,
+        ),
+        (
+            PersistOp::Append(Arc::new(vec![blank_entry(leader, 3)])),
+            tx3,
+        ),
     ];
 
     LogStore::<TypeConfig>::process_persist_batch(&persistence, batch);
@@ -332,9 +341,15 @@ async fn process_batch_preserves_non_append_boundaries() -> anyhow::Result<()> {
     let (tx2, rx2) = oneshot::channel::<Result<(), Box<StorageError<NodeId>>>>();
     let (tx3, rx3) = oneshot::channel::<Result<(), Box<StorageError<NodeId>>>>();
     let batch = vec![
-        (PersistOp::Append(vec![blank_entry(leader, 1)]), tx1),
+        (
+            PersistOp::Append(Arc::new(vec![blank_entry(leader, 1)])),
+            tx1,
+        ),
         (PersistOp::VoteSet(Some(Vote::new(1, 1))), tx2),
-        (PersistOp::Append(vec![blank_entry(leader, 2)]), tx3),
+        (
+            PersistOp::Append(Arc::new(vec![blank_entry(leader, 2)])),
+            tx3,
+        ),
     ];
 
     LogStore::<TypeConfig>::process_persist_batch(&persistence, batch);

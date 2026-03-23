@@ -4,15 +4,17 @@ use http::{HeaderValue, StatusCode, header::CONTENT_TYPE};
 use salvo::{Depot, Request, Response, Writer, async_trait};
 use serde_json::Value;
 use std::convert::Infallible;
+use tracing::error;
 
 #[derive(Debug)]
 pub enum ServerError {
     BadRequest(String),
     BadRequestJson(Value),
+    Json(StatusCode, Value),
     Internal(String),
     Unauthorized(String),
     NotFound(String),
-    TooManyRequests(String),
+    ServiceUnavailable(String),
 }
 
 impl ServerError {
@@ -20,10 +22,11 @@ impl ServerError {
         match self {
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::BadRequestJson(_) => StatusCode::BAD_REQUEST,
+            ServerError::Json(status, _) => *status,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
-            ServerError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            ServerError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -40,27 +43,27 @@ impl Writer for ServerError {
                 "application/json; charset=utf-8",
                 serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
             ),
+            ServerError::Json(_, payload) => (
+                "application/json; charset=utf-8",
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()),
+            ),
             ServerError::Internal(details) => {
-                if details.is_empty() {
-                    (
-                        "text/plain; charset=utf-8",
-                        "Internal Server Error".to_string(),
-                    )
-                } else {
-                    (
-                        "text/plain; charset=utf-8",
-                        format!("Internal Server Error: {}", details),
-                    )
+                if !details.is_empty() {
+                    error!(details = %details, "Internal server error");
                 }
+                (
+                    "text/plain; charset=utf-8",
+                    "Internal Server Error".to_string(),
+                )
             }
             ServerError::Unauthorized(msg) => (
                 "text/plain; charset=utf-8",
                 format!("Unauthorized request: {}", msg),
             ),
             ServerError::NotFound(msg) => ("text/plain; charset=utf-8", msg),
-            ServerError::TooManyRequests(msg) => (
+            ServerError::ServiceUnavailable(msg) => (
                 "text/plain; charset=utf-8",
-                format!("Too many requests: {}", msg),
+                format!("Service unavailable: {}", msg),
             ),
         };
 

@@ -16,10 +16,17 @@ pub struct GenericKeyResponse {
     pub generic_key: Uuid,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AssignedTask {
+    #[serde(flatten)]
+    pub task: Task,
+    pub assignment_token: Uuid,
+}
+
 // It provides a vector of tasks, as well as number of tasks available per gateway
 #[derive(Debug, Clone, Serialize)]
 pub struct GetTasksResponse {
-    pub tasks: Vec<Task>,
+    pub tasks: Vec<AssignedTask>,
     pub gateways: Vec<GatewayInfo>,
 }
 
@@ -129,14 +136,17 @@ mod tests {
         };
 
         let resp = GetTasksResponse {
-            tasks: vec![task],
+            tasks: vec![AssignedTask {
+                task,
+                assignment_token: Uuid::parse_str("123e4567-e89b-12d3-a456-426614174999").unwrap(),
+            }],
             gateways: vec![],
         };
 
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"prompt\":\"mechanic robot\",\"model\":\"404-3dgs\",\"seed\":0}],\"gateways\":[]}"
+            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174000\",\"prompt\":\"mechanic robot\",\"model\":\"404-3dgs\",\"seed\":0,\"assignment_token\":\"123e4567-e89b-12d3-a456-426614174999\"}],\"gateways\":[]}"
         );
     }
 
@@ -156,14 +166,17 @@ mod tests {
         };
 
         let resp = GetTasksResponse {
-            tasks: vec![task],
+            tasks: vec![AssignedTask {
+                task,
+                assignment_token: Uuid::parse_str("123e4567-e89b-12d3-a456-426614174998").unwrap(),
+            }],
             gateways: vec![],
         };
 
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(
             json,
-            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174001\",\"image\":\"AQID\",\"model\":\"404-mesh\",\"seed\":0}],\"gateways\":[]}"
+            "{\"tasks\":[{\"id\":\"123e4567-e89b-12d3-a456-426614174001\",\"image\":\"AQID\",\"model\":\"404-mesh\",\"seed\":0,\"assignment_token\":\"123e4567-e89b-12d3-a456-426614174998\"}],\"gateways\":[]}"
         );
     }
 }

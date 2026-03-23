@@ -3,4 +3,4 @@ pub mod hotkey;
 
 mod signature;
 
-pub use signature::{ss58_decode, ss58_encode, verify_hotkey};
+pub use signature::{GATEWAY_TIMESTAMP_PREFIX, ss58_decode, ss58_encode, verify_hotkey};

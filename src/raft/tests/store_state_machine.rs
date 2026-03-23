@@ -50,6 +50,23 @@ async fn write_snapshot_with_state(
     Ok(())
 }
 
+#[tokio::test]
+async fn build_snapshot_preserves_wire_payload_shape() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    {
+        let mut sm = store.state_machine.write().await;
+        sm.data.insert("key".to_string(), vec![1, 2, 3]);
+        sm.last_applied_log = Some(LogId::new(LeaderId::new(1, 1), 7));
+    }
+
+    let mut builder = Arc::clone(&store);
+    let snapshot = builder.build_snapshot().await?;
+    let payload = SnapshotPayload::decode(snapshot.snapshot.get_ref())?;
+
+    assert_eq!(payload.data.get("key"), Some(&vec![1, 2, 3]));
+    Ok(())
+}
+
 fn collect_sorted_snapshots(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
     let mut snapshots: Vec<(PathBuf, u64)> = fs::read_dir(dir)?
         .filter_map(|entry| {
@@ -123,7 +140,10 @@ async fn persists_and_recovers_state_machine() -> Result<()> {
 
     let restored = StateMachineStore::with_persistence(dir_path, 2, Some(log_store_path.clone()))?;
     let sm = restored.state_machine.read().await;
-    assert_eq!(sm.data.get("key"), Some(&vec![1, 2, 3]));
+    assert_eq!(
+        sm.data.get("key").map(|value| value.as_ref()),
+        Some(&[1, 2, 3][..])
+    );
     assert_eq!(
         sm.last_applied_log,
         Some(LogId::new(LeaderId::new(1, 1), 42))
@@ -172,7 +192,10 @@ async fn loads_first_valid_snapshot_when_newer_corrupted() -> Result<()> {
 
     let restored = StateMachineStore::with_persistence(dir_path, 5, Some(log_store_path.clone()))?;
     let sm = restored.state_machine.read().await;
-    assert_eq!(sm.data.get("key"), Some(&vec![1, 2, 3]));
+    assert_eq!(
+        sm.data.get("key").map(|value| value.as_ref()),
+        Some(&[1, 2, 3][..])
+    );
     assert_eq!(
         sm.last_applied_log,
         Some(LogId::new(LeaderId::new(1, 1), 10))
@@ -369,7 +392,7 @@ async fn log_store_archive_contains_full_state() -> Result<()> {
 }
 
 #[tokio::test]
-async fn rate_limit_resets_on_hour_and_day_rollover() -> Result<()> {
+async fn rate_limit_resets_on_day_rollover() -> Result<()> {
     let store = Arc::new(StateMachineStore::default());
     let key = rate_limit_key(Subject::User, 999u128);
     let leader = LeaderId::new(1, 1);
@@ -382,16 +405,15 @@ async fn rate_limit_resets_on_hour_and_day_rollover() -> Result<()> {
         vec![RateLimitDelta {
             subject: Subject::User,
             id: 999u128,
-            hour_epoch: 100,
             day_epoch: 10,
-            add_hour: 3,
+            add_active: 0,
             add_day: 4,
         }],
     )])
     .await?;
 
-    let (hour, day) = store.get_rate_limit_usage(&key, 100, 10).await;
-    assert_eq!(hour, 3);
+    let (active, day) = store.get_rate_limit_usage(&key, 10).await;
+    assert_eq!(active, 0);
     assert_eq!(day, 4);
 
     sm.apply(vec![rate_limit_entry(
@@ -401,18 +423,16 @@ async fn rate_limit_resets_on_hour_and_day_rollover() -> Result<()> {
         vec![RateLimitDelta {
             subject: Subject::User,
             id: 999u128,
-            hour_epoch: 101,
             day_epoch: 10,
-            add_hour: 2,
+            add_active: 0,
             add_day: 1,
         }],
     )])
     .await?;
 
-    let (hour_after_hour_rollover, day_same_window) =
-        store.get_rate_limit_usage(&key, 101, 10).await;
-    assert_eq!(hour_after_hour_rollover, 2);
-    assert_eq!(day_same_window, 5);
+    let (active_same, day_same) = store.get_rate_limit_usage(&key, 10).await;
+    assert_eq!(active_same, 0);
+    assert_eq!(day_same, 5);
 
     sm.apply(vec![rate_limit_entry(
         leader,
@@ -421,21 +441,19 @@ async fn rate_limit_resets_on_hour_and_day_rollover() -> Result<()> {
         vec![RateLimitDelta {
             subject: Subject::User,
             id: 999u128,
-            hour_epoch: 101,
             day_epoch: 11,
-            add_hour: 1,
+            add_active: 0,
             add_day: 2,
         }],
     )])
     .await?;
 
-    let (hour_same_window, day_after_day_rollover) =
-        store.get_rate_limit_usage(&key, 101, 11).await;
-    assert_eq!(hour_same_window, 3);
-    assert_eq!(day_after_day_rollover, 2);
+    let (active_new, day_after_rollover) = store.get_rate_limit_usage(&key, 11).await;
+    assert_eq!(active_new, 0);
+    assert_eq!(day_after_rollover, 2);
 
-    let (old_hour, old_day) = store.get_rate_limit_usage(&key, 100, 10).await;
-    assert_eq!(old_hour, 0);
+    let (old_active, old_day) = store.get_rate_limit_usage(&key, 10).await;
+    assert_eq!(old_active, 0);
     assert_eq!(old_day, 0);
 
     Ok(())
@@ -456,29 +474,27 @@ async fn rate_limit_ignores_stale_epoch_updates_even_in_mixed_batch() -> Result<
             RateLimitDelta {
                 subject: Subject::Company,
                 id: 777u128,
-                hour_epoch: 50,
                 day_epoch: 5,
-                add_hour: 9,
+                add_active: 0,
                 add_day: 9,
             },
             RateLimitDelta {
                 subject: Subject::Company,
                 id: 777u128,
-                hour_epoch: 51,
                 day_epoch: 6,
-                add_hour: 1,
+                add_active: 0,
                 add_day: 1,
             },
         ],
     )])
     .await?;
 
-    let (new_hour, new_day) = store.get_rate_limit_usage(&key, 51, 6).await;
-    assert_eq!(new_hour, 1);
+    let (new_active, new_day) = store.get_rate_limit_usage(&key, 6).await;
+    assert_eq!(new_active, 0);
     assert_eq!(new_day, 1);
 
-    let (old_hour, old_day) = store.get_rate_limit_usage(&key, 50, 5).await;
-    assert_eq!(old_hour, 0);
+    let (old_active, old_day) = store.get_rate_limit_usage(&key, 5).await;
+    assert_eq!(old_active, 0);
     assert_eq!(old_day, 0);
 
     sm.apply(vec![rate_limit_entry(
@@ -488,16 +504,15 @@ async fn rate_limit_ignores_stale_epoch_updates_even_in_mixed_batch() -> Result<
         vec![RateLimitDelta {
             subject: Subject::Company,
             id: 777u128,
-            hour_epoch: 49,
             day_epoch: 4,
-            add_hour: 50,
+            add_active: 0,
             add_day: 50,
         }],
     )])
     .await?;
 
-    let (hour_after_stale, day_after_stale) = store.get_rate_limit_usage(&key, 51, 6).await;
-    assert_eq!(hour_after_stale, 1);
+    let (active_after_stale, day_after_stale) = store.get_rate_limit_usage(&key, 6).await;
+    assert_eq!(active_after_stale, 0);
     assert_eq!(day_after_stale, 1);
 
     Ok(())
@@ -519,10 +534,9 @@ async fn duplicate_rate_limit_request_ids_are_deduplicated() -> Result<()> {
             vec![RateLimitDelta {
                 subject: Subject::GenericIp,
                 id: 12345u128,
-                hour_epoch: 200,
                 day_epoch: 20,
-                add_hour: 2,
-                add_day: 0,
+                add_active: 0,
+                add_day: 2,
             }],
         ),
         rate_limit_entry(
@@ -532,18 +546,17 @@ async fn duplicate_rate_limit_request_ids_are_deduplicated() -> Result<()> {
             vec![RateLimitDelta {
                 subject: Subject::GenericIp,
                 id: 12345u128,
-                hour_epoch: 200,
                 day_epoch: 20,
-                add_hour: 2,
-                add_day: 0,
+                add_active: 0,
+                add_day: 2,
             }],
         ),
     ])
     .await?;
 
-    let (hour, day) = store.get_rate_limit_usage(&key, 200, 20).await;
-    assert_eq!(hour, 2);
-    assert_eq!(day, 0);
+    let (active, day) = store.get_rate_limit_usage(&key, 20).await;
+    assert_eq!(active, 0);
+    assert_eq!(day, 2);
 
     Ok(())
 }
@@ -562,10 +575,9 @@ async fn rate_limit_refunds_decrement_counters_and_saturate() -> Result<()> {
         vec![RateLimitDelta {
             subject: Subject::GenericGlobal,
             id: 0u128,
-            hour_epoch: 400,
             day_epoch: 40,
-            add_hour: 3,
-            add_day: 0,
+            add_active: 0,
+            add_day: 3,
         }],
     )])
     .await?;
@@ -577,17 +589,16 @@ async fn rate_limit_refunds_decrement_counters_and_saturate() -> Result<()> {
         vec![RateLimitRefund {
             subject: Subject::GenericGlobal,
             id: 0u128,
-            hour_epoch: 400,
             day_epoch: 40,
-            sub_hour: 1,
-            sub_day: 0,
+            sub_active: 0,
+            sub_day: 1,
         }],
     )])
     .await?;
 
-    let (hour_after_refund, day_after_refund) = store.get_rate_limit_usage(&key, 400, 40).await;
-    assert_eq!(hour_after_refund, 2);
-    assert_eq!(day_after_refund, 0);
+    let (active_after_refund, day_after_refund) = store.get_rate_limit_usage(&key, 40).await;
+    assert_eq!(active_after_refund, 0);
+    assert_eq!(day_after_refund, 2);
 
     sm.apply(vec![rate_limit_refund_entry(
         leader,
@@ -596,17 +607,16 @@ async fn rate_limit_refunds_decrement_counters_and_saturate() -> Result<()> {
         vec![RateLimitRefund {
             subject: Subject::GenericGlobal,
             id: 0u128,
-            hour_epoch: 400,
             day_epoch: 40,
-            sub_hour: 999,
-            sub_day: 0,
+            sub_active: 0,
+            sub_day: 999,
         }],
     )])
     .await?;
 
-    let (hour_after_saturating_refund, day_after_saturating_refund) =
-        store.get_rate_limit_usage(&key, 400, 40).await;
-    assert_eq!(hour_after_saturating_refund, 0);
+    let (active_after_saturating_refund, day_after_saturating_refund) =
+        store.get_rate_limit_usage(&key, 40).await;
+    assert_eq!(active_after_saturating_refund, 0);
     assert_eq!(day_after_saturating_refund, 0);
 
     Ok(())
@@ -633,17 +643,15 @@ async fn persists_and_recovers_rate_limit_counters() -> Result<()> {
                 RateLimitDelta {
                     subject: Subject::GenericGlobal,
                     id: 0u128,
-                    hour_epoch: 300,
                     day_epoch: 30,
-                    add_hour: 7,
-                    add_day: 0,
+                    add_active: 0,
+                    add_day: 7,
                 },
                 RateLimitDelta {
                     subject: Subject::Company,
                     id: 333u128,
-                    hour_epoch: 300,
                     day_epoch: 30,
-                    add_hour: 3,
+                    add_active: 0,
                     add_day: 2,
                 },
             ],
@@ -662,12 +670,12 @@ async fn persists_and_recovers_rate_limit_counters() -> Result<()> {
     let global_key = rate_limit_key(Subject::GenericGlobal, 0u128);
     let company_key = rate_limit_key(Subject::Company, 333u128);
 
-    let (global_hour, global_day) = restored.get_rate_limit_usage(&global_key, 300, 30).await;
-    assert_eq!(global_hour, 7);
-    assert_eq!(global_day, 0);
+    let (global_active, global_day) = restored.get_rate_limit_usage(&global_key, 30).await;
+    assert_eq!(global_active, 0);
+    assert_eq!(global_day, 7);
 
-    let (company_hour, company_day) = restored.get_rate_limit_usage(&company_key, 300, 30).await;
-    assert_eq!(company_hour, 3);
+    let (company_active, company_day) = restored.get_rate_limit_usage(&company_key, 30).await;
+    assert_eq!(company_active, 0);
     assert_eq!(company_day, 2);
 
     Ok(())
@@ -696,6 +704,45 @@ async fn request_dedupe_expires_after_ttl() -> Result<()> {
     tokio::time::sleep(REQUEST_DEDUPE_TTL + Duration::from_millis(10)).await;
 
     assert!(!store.is_duplicate_request(request_id).await);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_apply_waits_on_dedupe_before_locking_snapshot_guard() -> Result<()> {
+    let store = Arc::new(StateMachineStore::default());
+    let request_id = 4243u128;
+
+    assert!(!store.is_duplicate_request(request_id).await);
+    let held_entry = store.request_dedupe.entry_async(request_id).await;
+
+    let mut state_machine = Arc::clone(&store);
+    let apply_task = tokio::spawn(async move {
+        state_machine
+            .apply([rate_limit_entry(
+                LeaderId::new(1, 1),
+                1,
+                request_id,
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 9u128,
+                    day_epoch: 1,
+                    add_active: 1,
+                    add_day: 1,
+                }],
+            )])
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let snapshot_guard =
+        tokio::time::timeout(Duration::from_millis(200), store.snapshot_guard.lock())
+            .await
+            .expect("snapshot_guard should stay unlocked while dedupe is pending");
+    drop(snapshot_guard);
+
+    drop(held_entry);
+    apply_task.await.expect("apply task should join")?;
 
     Ok(())
 }

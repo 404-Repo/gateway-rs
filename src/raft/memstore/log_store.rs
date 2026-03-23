@@ -34,7 +34,7 @@ pub enum PersistOp<C: RaftTypeConfig> {
     CommittedSet(Option<LogId<C::NodeId>>),
     PurgeTo(LogId<C::NodeId>),
     TruncateFrom(u64),
-    Append(Vec<C::Entry>),
+    Append(Arc<Vec<C::Entry>>),
 }
 
 enum PersistMsg<C: RaftTypeConfig> {
@@ -48,6 +48,7 @@ enum PersistMsg<C: RaftTypeConfig> {
 type PersistOpResult = Result<(), Box<StorageError<NodeId>>>;
 type PersistResultTx = oneshot::Sender<PersistOpResult>;
 type PersistBatchItem = (PersistOp<TypeConfig>, PersistResultTx);
+type BoxedStorageError<C> = Box<StorageError<<C as RaftTypeConfig>::NodeId>>;
 
 struct PersistenceWorker<C: RaftTypeConfig> {
     tx: std::sync::mpsc::Sender<PersistMsg<C>>,
@@ -72,9 +73,8 @@ impl<C: RaftTypeConfig> PersistenceWorker<C> {
 impl<C: RaftTypeConfig> Drop for PersistenceWorker<C> {
     fn drop(&mut self) {
         let _ = self.tx.send(PersistMsg::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Do not block the caller's thread while the persistence worker flushes and exits.
+        let _ = self.handle.take();
     }
 }
 
@@ -131,7 +131,7 @@ impl<C: RaftTypeConfig> Default for LogStoreInner<C> {
 }
 
 impl<C: RaftTypeConfig> LogStoreInner<C> {
-    fn ensure_not_compacted(&self, index: u64) -> Result<(), Box<StorageError<C::NodeId>>> {
+    fn ensure_not_compacted(&self, index: u64) -> Result<(), BoxedStorageError<C>> {
         if let Some(last_purged) = &self.last_purged_log_id
             && index <= last_purged.index
         {
@@ -169,10 +169,10 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         StorageIOError::read_logs(&io_err).into()
     }
 
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
+    fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>>
+    ) -> Result<Vec<C::Entry>, BoxedStorageError<C>>
     where
         C::Entry: Clone,
     {
@@ -194,14 +194,16 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         };
 
         if let Some(start) = start_index {
-            self.ensure_not_compacted(start).map_err(|e| *e)?;
+            self.ensure_not_compacted(start)?;
         }
 
         if self.log.is_empty() {
             if let (Some(start), Some(len)) = (start_index, expected_len)
                 && len > 0
             {
-                return Err(self.missing_log_error(format!("missing log entry at index {start}")));
+                return Err(Box::new(
+                    self.missing_log_error(format!("missing log entry at index {start}")),
+                ));
             }
             return Ok(Vec::new());
         }
@@ -212,10 +214,14 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
 
         if let Some(start) = start_index {
             if start < base {
-                return Err(self.missing_log_error(format!("missing log entry at index {start}")));
+                return Err(Box::new(
+                    self.missing_log_error(format!("missing log entry at index {start}")),
+                ));
             }
             if start >= last_exclusive {
-                return Err(self.missing_log_error(format!("missing log entry at index {start}")));
+                return Err(Box::new(
+                    self.missing_log_error(format!("missing log entry at index {start}")),
+                ));
             }
         }
 
@@ -224,11 +230,13 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         {
             let start = start_index.unwrap_or(base);
             if start < last_exclusive {
-                return Err(self.missing_log_error(format!(
+                return Err(Box::new(self.missing_log_error(format!(
                     "missing log entries in range [{start}, {end}) starting at index {last_exclusive}"
-                )));
+                ))));
             }
-            return Err(self.missing_log_error(format!("missing log entry at index {start}")));
+            return Err(Box::new(
+                self.missing_log_error(format!("missing log entry at index {start}")),
+            ));
         }
 
         let slice_start = start_index.unwrap_or(base);
@@ -248,7 +256,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         Ok(response)
     }
 
-    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
+    fn get_log_state(&mut self) -> Result<LogState<C>, BoxedStorageError<C>> {
         let last = self.log.back().map(|ent| ent.get_log_id());
 
         let last_purged = &self.last_purged_log_id;
@@ -264,33 +272,28 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         })
     }
 
-    async fn save_committed(
+    fn save_committed(
         &mut self,
         committed: Option<LogId<C::NodeId>>,
-    ) -> Result<(), StorageError<C::NodeId>> {
+    ) -> Result<(), BoxedStorageError<C>> {
         self.committed = committed;
         Ok(())
     }
 
-    async fn read_committed(
-        &mut self,
-    ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
+    fn read_committed(&mut self) -> Result<Option<LogId<C::NodeId>>, BoxedStorageError<C>> {
         Ok(self.committed.clone())
     }
 
-    async fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn save_vote(&mut self, vote: &Vote<C::NodeId>) -> Result<(), BoxedStorageError<C>> {
         self.vote = Some(vote.clone());
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
+    fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, BoxedStorageError<C>> {
         Ok(self.vote.clone())
     }
 
-    fn validate_append_batch(
-        &self,
-        entries: &[C::Entry],
-    ) -> Result<(), Box<StorageError<C::NodeId>>> {
+    fn validate_append_batch(&self, entries: &[C::Entry]) -> Result<(), BoxedStorageError<C>> {
         let mut base = self.base_index;
         let mut len = self.log.len() as u64;
         let mut has_data = !self.log.is_empty();
@@ -324,7 +327,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         Ok(())
     }
 
-    async fn append<I>(&mut self, entries: I) -> Result<(), StorageError<C::NodeId>>
+    fn append<I>(&mut self, entries: I) -> Result<(), BoxedStorageError<C>>
     where
         I: IntoIterator<Item = C::Entry>,
     {
@@ -351,19 +354,19 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
                     let io_err = IoError::other(format!(
                         "log index {idx} maps outside of log window [{base}, {next_index})"
                     ));
-                    return Err(StorageIOError::write_logs(&io_err).into());
+                    return Err(Box::new(StorageIOError::write_logs(&io_err).into()));
                 }
             } else {
                 let io_err = IoError::other(format!(
                     "log gap detected while appending index {idx} (window [{base}, {next_index}))"
                 ));
-                return Err(StorageIOError::write_logs(&io_err).into());
+                return Err(Box::new(StorageIOError::write_logs(&io_err).into()));
             }
         }
         Ok(())
     }
 
-    async fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn truncate(&mut self, log_id: LogId<C::NodeId>) -> Result<(), BoxedStorageError<C>> {
         if self.log.is_empty() {
             self.base_index = log_id.index;
             return Ok(());
@@ -382,7 +385,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
         Ok(())
     }
 
-    async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
+    fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), BoxedStorageError<C>> {
         {
             let ld = &mut self.last_purged_log_id;
             if let Some(current) = ld.as_ref()
@@ -392,7 +395,7 @@ impl<C: RaftTypeConfig> LogStoreInner<C> {
                     "purge log id {:?} is older than last purged {:?}",
                     log_id, current
                 ));
-                return Err(StorageIOError::write_logs(&io_err).into());
+                return Err(Box::new(StorageIOError::write_logs(&io_err).into()));
             }
             *ld = Some(log_id.clone());
         }
@@ -476,11 +479,13 @@ impl<C: RaftTypeConfig> LogStore<C> {
             inner.validate_append_batch(&batch).map_err(|e| *e)?;
         }
 
-        let op = self.persist_op_if_needed(Some(PersistOp::Append(batch.clone())));
+        let batch = Arc::new(batch);
+        let op = self.persist_op_if_needed(Some(PersistOp::Append(Arc::clone(&batch))));
         self.persist_if_needed(op).await?;
 
+        let batch = Arc::try_unwrap(batch).unwrap_or_else(|entries| (*entries).clone());
         let mut inner = self.inner.lock().await;
-        inner.append(batch).await
+        inner.append(batch).map_err(|err| *err)
     }
 }
 
@@ -554,20 +559,23 @@ impl LogStore<TypeConfig> {
 
         while let Some((op, tx)) = iter.next() {
             match op {
-                PersistOp::Append(mut merged_entries) => {
+                PersistOp::Append(merged_entries) => {
                     let mut responders = vec![tx];
+                    let mut merged_entries = Arc::unwrap_or_clone(merged_entries);
 
                     while let Some((PersistOp::Append(_), _)) = iter.peek() {
                         if let Some((PersistOp::Append(next_entries), next_tx)) = iter.next() {
-                            merged_entries.extend(next_entries);
+                            merged_entries.extend(next_entries.iter().cloned());
                             responders.push(next_tx);
                         } else {
                             break;
                         }
                     }
 
-                    let persist_result =
-                        Self::persist_single_op(persistence, PersistOp::Append(merged_entries));
+                    let persist_result = Self::persist_single_op(
+                        persistence,
+                        PersistOp::Append(Arc::new(merged_entries)),
+                    );
                     match persist_result {
                         Ok(()) => {
                             for responder in responders {
@@ -724,7 +732,7 @@ mod impl_log_store {
             range: RB,
         ) -> Result<Vec<C::Entry>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.try_get_log_entries(range).await
+            inner.try_get_log_entries(range).map_err(|err| *err)
         }
     }
 
@@ -736,7 +744,7 @@ mod impl_log_store {
 
         async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.get_log_state().await
+            inner.get_log_state().map_err(|err| *err)
         }
 
         async fn save_committed(
@@ -748,14 +756,14 @@ mod impl_log_store {
                 self.persist_op_if_needed(Some(super::PersistOp::CommittedSet(committed.clone())));
             self.persist_if_needed(op).await?;
             let mut inner = self.inner.lock().await;
-            inner.save_committed(committed).await
+            inner.save_committed(committed).map_err(|err| *err)
         }
 
         async fn read_committed(
             &mut self,
         ) -> Result<Option<LogId<C::NodeId>>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.read_committed().await
+            inner.read_committed().map_err(|err| *err)
         }
 
         async fn save_vote(
@@ -765,12 +773,12 @@ mod impl_log_store {
             let op = self.persist_op_if_needed(Some(super::PersistOp::VoteSet(Some(vote.clone()))));
             self.persist_if_needed(op).await?;
             let mut inner = self.inner.lock().await;
-            inner.save_vote(vote).await
+            inner.save_vote(vote).map_err(|err| *err)
         }
 
         async fn read_vote(&mut self) -> Result<Option<Vote<C::NodeId>>, StorageError<C::NodeId>> {
             let mut inner = self.inner.lock().await;
-            inner.read_vote().await
+            inner.read_vote().map_err(|err| *err)
         }
 
         async fn append<I>(
@@ -802,14 +810,14 @@ mod impl_log_store {
             let op = self.persist_op_if_needed(Some(super::PersistOp::TruncateFrom(log_id.index)));
             self.persist_if_needed(op).await?;
             let mut inner = self.inner.lock().await;
-            inner.truncate(log_id).await
+            inner.truncate(log_id).map_err(|err| *err)
         }
 
         async fn purge(&mut self, log_id: LogId<C::NodeId>) -> Result<(), StorageError<C::NodeId>> {
             let op = self.persist_op_if_needed(Some(super::PersistOp::PurgeTo(log_id.clone())));
             self.persist_if_needed(op).await?;
             let mut inner = self.inner.lock().await;
-            inner.purge(log_id).await
+            inner.purge(log_id).map_err(|err| *err)
         }
 
         async fn get_log_reader(&mut self) -> Self::LogReader {

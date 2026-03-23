@@ -22,36 +22,35 @@ compression_lvl = 3
 port = 4443
 tls_versions = ["1.2", "1.3"]
 basic_rate_limit = 30
-update_key_rate_limit = 10
 # 1) Missing/invalid/unknown API key on /add_task:
-#    add_task_unauthorized_per_ip_hourly_rate_limit (per source IP, hourly)
+#    add_task_unauthorized_per_ip_daily_rate_limit (per source IP, daily)
 # 2) Valid generic key (http.generic_key):
-#    both add_task_generic_key_global_hourly_rate_limit
-#    (global hourly, aggregated across all source IPs)
-#    and add_task_generic_key_per_ip_hourly_rate_limit (per source IP hourly)
+#    uses SQL-backed guest rolling-window limits from gen's app_settings row
 # 3) Valid non-company user key:
-#    add_task_authenticated_per_user_hourly_rate_limit (per user id, hourly)
+#    uses DB-configured per-user concurrent and daily limits
 # There is no separate unauthorized-global cap; unauthorized traffic is per-IP only.
-# Company API keys use DB-configured company hourly/daily limits instead.
-# rate_limit_whitelist skips rate limiting only; API-key validation still applies.
-add_task_unauthorized_per_ip_hourly_rate_limit = 50
-add_task_generic_key_global_hourly_rate_limit = 40
-add_task_generic_key_per_ip_hourly_rate_limit = 5
-add_task_authenticated_per_user_hourly_rate_limit = 5
-load_rate_limit = 60
-leader_rate_limit = 10
-metric_rate_limit = 100
+# Company API keys use DB-configured company concurrent/daily limits.
+# rate_limit_whitelist skips all /add_task rate limits, including distributed quotas.
+# API-key validation still applies. Use only for fully trusted IPs.
+add_task_unauthorized_per_ip_daily_rate_limit = 1200
+# Shared per-IP per-minute limiter for worker-facing endpoints:
+# /add_result, /get_load, /get_leader
+worker_per_minute_rate_limit = 120
 get_status_rate_limit = 1000
 add_task_size_limit = 2097152
 request_size_limit = 4096
-request_file_size_limit = 31457280
+request_file_size_limit = 104857600
 raft_write_size_limit = 2097152
-add_result_rate_limit = 300
 signature_freshness_threshold = 30
 max_task_queue_len = 500
 admin_key = "b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
-generic_key = "518d5860-589f-4625-be7c-285d5b669ee2"
+generic_key = "6eca4068-3be6-4d30-b828-f63cda3bc35b"
 api_key_secret = "CHANGE_ME_IN_PRODUCTION_58392047"
+invalid_api_key_negative_cache_ttl_sec = 300
+invalid_api_key_ip_miss_ttl_sec = 600
+invalid_api_key_ip_cooldown_ttl_sec = 300
+invalid_api_key_ip_cache_capacity = 200000
+invalid_api_key_ip_miss_limit = 50
 post_timeout_sec = 2
 forward_timeout_sec = 3
 get_timeout_sec = 2
@@ -71,7 +70,7 @@ db = "api_keys_db"
 sslcert = "/certs/client.crt"
 sslkey = "/certs/client.key"
 sslrootcert = "/certs/ca.crt"
-api_keys_update_interval = 120
+api_keys_update_interval = 20
 keys_cache_ttl_sec = 43200
 keys_cache_initial_capacity = 16000
 keys_cache_max_capacity = 32000
@@ -94,6 +93,7 @@ taskmanager_cleanup_interval = 30
 taskmanager_result_lifetime = 2000
 taskqueue_cleanup_interval = 1
 taskqueue_task_ttl = 1800
+generation_task_retention_sec = 86400
 
 [log]
 path = "./logs/gateway.log"

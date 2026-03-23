@@ -1,25 +1,11 @@
-mod api;
-mod common;
-mod config;
-mod config_model;
-mod config_runtime;
-mod crypto;
-mod db;
-mod http3;
-mod metrics;
-mod protocol;
-mod raft;
-mod task;
-
 use anyhow::Error;
 use clap::Parser;
 use clap::ValueEnum;
-use common::log::{init_tracing, log_app_config, log_build_information};
+use gateway::common::log::{init_tracing, log_app_config, log_build_information};
+use gateway::config::{read_config, resolve_config_path};
+use gateway::config_runtime::RuntimeConfigStore;
+use gateway::raft::{GatewayExit, GatewayMode, start_gateway};
 use std::{env, sync::Arc, time::Duration};
-
-use config::{read_config, resolve_config_path};
-use config_runtime::RuntimeConfigStore;
-use raft::{GatewayExit, GatewayMode, start_gateway};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 

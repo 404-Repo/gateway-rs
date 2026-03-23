@@ -3,48 +3,20 @@ use salvo::prelude::*;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::api::request::UpdateGenericKeyRequest;
 use crate::api::response::GenericKeyResponse;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
-use crate::raft::gateway_state::UpdateGenericKeyError;
 
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/update_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b" -H "content-type: application/json" -d '{"generic_key": "6f3a2de1-f25d-4413-b0ad-4631eabbbb79"}'
 #[handler]
 pub async fn generic_key_update_handler(
-    depot: &mut Depot,
-    req: &mut Request,
-    res: &mut Response,
+    _depot: &mut Depot,
+    _req: &mut Request,
+    _res: &mut Response,
 ) -> Result<(), ServerError> {
-    let state = depot.require::<HttpState>()?.clone();
-    let ugk = req
-        .parse_json::<UpdateGenericKeyRequest>()
-        .await
-        .map_err(|e| ServerError::BadRequest(e.to_string()))?;
-
-    let gateway_state = state.gateway_state().clone();
-    let current_node_id = state.node_id() as u64;
-    let admin_key = req
-        .headers()
-        .get("x-admin-key")
-        .and_then(|v| v.to_str().ok());
-
-    gateway_state
-        .update_gateway_generic_key(current_node_id, Some(ugk.generic_key), admin_key)
-        .await
-        .map_err(|e| match e.downcast::<UpdateGenericKeyError>() {
-            Ok(UpdateGenericKeyError::OverlapsExistingApiKey) => ServerError::BadRequest(
-                "Generic key overlaps with an existing user/company API key".to_string(),
-            ),
-            Err(err) => {
-                ServerError::Internal(format!("Failed to update gateway generic key: {:?}", err))
-            }
-        })?;
-
-    res.status_code(StatusCode::OK);
-    res.render(Text::Plain("Ok"));
-    Ok(())
+    Err(ServerError::BadRequest(
+        "Generic key is managed through gen admin settings and synced from PostgreSQL.".to_string(),
+    ))
 }
 
 // curl --http3 -X GET "https://gateway-eu.404.xyz:4443/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
@@ -57,7 +29,7 @@ pub async fn generic_key_read_handler(
     let state = depot.require::<HttpState>()?.clone();
     let gateway_state = state.gateway_state().clone();
 
-    if let Some(uuid) = gateway_state.generic_key().await {
+    if let Some(uuid) = gateway_state.generic_key() {
         let response = GenericKeyResponse { generic_key: uuid };
         res.render(Json(response));
         Ok(())

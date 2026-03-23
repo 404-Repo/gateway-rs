@@ -1,43 +1,102 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use base64_simd::STANDARD;
 use foldhash::HashSet;
-use salvo::http::request::SecureMaxSize;
-use salvo::prelude::*;
 use schnorrkel::{ExpansionMode, MiniSecretKey, context::signing_context};
-use tokio_util::sync::CancellationToken;
+use serde_json::Value;
 use uuid::Uuid;
 
-use gateway::api::Task;
 use gateway::api::request::AddTaskResultRequest;
-use gateway::common::queue::DupQueue;
-use gateway::config::NodeConfig;
+use gateway::crypto::crypto_provider::ApiKeyHasher;
 use gateway::crypto::hotkey::Hotkey;
-use gateway::db::{
-    ActivityEventRow, EventRecorder, EventSinkHandle, InMemoryEventSink, WorkerEventRow,
-};
 use gateway::task::TaskManager;
 use gateway::test_support::{
-    MultipartFilePart, RateLimitContext, add_result_handler, add_task_handler,
-    api_or_generic_key_check, build_multipart_form, build_shared_harness_core,
-    current_timestamp_secs, ensure_test_crypto_provider, get_result_handler, get_status_handler,
-    get_tasks_handler, load_test_single_node_config,
+    MultipartFilePart, RateLimitContext, build_multipart_form, current_timestamp_secs,
+    ensure_test_crypto_provider,
 };
-use gateway::test_support::{id_handler, version_handler};
 
-pub(crate) use crate::common::{read_response, tiny_png_bytes};
+use crate::common::real_harness::{
+    CompanyKeySeed, GatewayRuntimeAppSettingsUpdate, GatewayRuntimeStart, PersonalKeySeed,
+    insert_company_api_key, insert_personal_api_key, update_app_settings_gateway_runtime,
+};
+use crate::common::{GatewayHarnessOptions, GatewayRuntimeHarness};
+pub(crate) use crate::common::{TestClient, read_response, tiny_png_bytes};
 
 const SIGNING_CTX: &[u8] = b"substrate";
 const GATEWAY_PREFIX: &str = "404_GATEWAY_";
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActivityEventRecord {
+    pub(crate) user_id: Option<i64>,
+    pub(crate) company_id: Option<Uuid>,
+    pub(crate) company_name: Option<String>,
+    pub(crate) action: String,
+    pub(crate) event_family: String,
+    pub(crate) client_origin: String,
+    pub(crate) task_kind: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) task_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerEventRecord {
+    pub(crate) task_id: Option<Uuid>,
+    pub(crate) worker_id: Option<String>,
+    pub(crate) action: String,
+    pub(crate) task_kind: String,
+    pub(crate) reason: Option<String>,
+}
 
 fn ensure_crypto_provider() {
     ensure_test_crypto_provider();
 }
 
-fn load_config() -> (NodeConfig, PathBuf) {
-    load_test_single_node_config()
+fn api_key_hash_bytes(core: &GatewayRuntimeHarness, api_key: &str) -> [u8; 32] {
+    let hasher = ApiKeyHasher::new(&core.config.http.api_key_secret).expect("api key hasher");
+    hasher.compute_hash_array(api_key)
+}
+
+async fn top_up_personal_api_key_balance(
+    core: &GatewayRuntimeHarness,
+    api_key: &str,
+    amount_cents: i64,
+) {
+    let key_hash = api_key_hash_bytes(core, api_key);
+    let account_row = core
+        .db_client
+        .query_one(
+            "SELECT account_id
+             FROM api_keys
+             WHERE api_key_hash = $1
+               AND user_id IS NOT NULL
+             LIMIT 1",
+            &[&&key_hash[..]],
+        )
+        .await
+        .expect("select personal account for topup");
+    let account_id: i64 = account_row.get("account_id");
+    let now = current_timestamp() as i64 * 1000;
+    let request_id = format!("gateway-test-topup-{}", Uuid::new_v4());
+    core.db_client
+        .query_one(
+            "SELECT ledger_id
+             FROM gen_apply_account_topup($1, $2, NULL, $3, $4, $5)",
+            &[
+                &account_id,
+                &amount_cents,
+                &request_id,
+                &"gateway test topup",
+                &now,
+            ],
+        )
+        .await
+        .expect("apply personal api key topup");
+    core.gateway
+        .sync_db_caches_for_test()
+        .await
+        .expect("sync db caches");
 }
 
 pub(crate) fn sign_worker(seed: [u8; 32]) -> (Hotkey, String, String) {
@@ -65,31 +124,36 @@ pub(crate) fn current_timestamp() -> u64 {
     current_timestamp_secs()
 }
 
-pub(crate) fn multipart_add_result(
-    task_id: Uuid,
-    worker_hotkey: &Hotkey,
-    worker_id: &str,
-    timestamp: &str,
-    signature: &str,
-    status: &str,
-    asset: Option<&[u8]>,
-    reason: Option<&str>,
-) -> (String, Vec<u8>) {
-    let task_id_str = task_id.to_string();
+pub(crate) struct AddResultMultipartInput<'a> {
+    pub(crate) task_id: Uuid,
+    pub(crate) worker_hotkey: &'a Hotkey,
+    pub(crate) worker_id: &'a str,
+    pub(crate) assignment_token: Uuid,
+    pub(crate) timestamp: &'a str,
+    pub(crate) signature: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) asset: Option<&'a [u8]>,
+    pub(crate) reason: Option<&'a str>,
+}
+
+pub(crate) fn multipart_add_result(input: AddResultMultipartInput<'_>) -> (String, Vec<u8>) {
+    let task_id_str = input.task_id.to_string();
+    let assignment_token_str = input.assignment_token.to_string();
     let mut fields = vec![
         ("id", task_id_str.as_str()),
-        ("signature", signature),
-        ("timestamp", timestamp),
-        ("worker_hotkey", worker_hotkey.as_ref()),
-        ("worker_id", worker_id),
-        ("status", status),
+        ("signature", input.signature),
+        ("timestamp", input.timestamp),
+        ("worker_hotkey", input.worker_hotkey.as_ref()),
+        ("worker_id", input.worker_id),
+        ("assignment_token", assignment_token_str.as_str()),
+        ("status", input.status),
     ];
-    if let Some(reason) = reason {
+    if let Some(reason) = input.reason {
         fields.push(("reason", reason));
     }
 
     let mut files = Vec::new();
-    if let Some(asset) = asset {
+    if let Some(asset) = input.asset {
         files.push(MultipartFilePart {
             name: "asset",
             filename: "result.spz",
@@ -142,122 +206,150 @@ pub(crate) fn multipart_custom(
 }
 
 pub(crate) struct EventHarness {
-    pub(crate) service: Service,
-    pub(crate) task_queue: DupQueue<Task>,
+    pub(crate) service: crate::common::TestService,
     pub(crate) task_manager: TaskManager,
-    pub(crate) event_sink: InMemoryEventSink,
-    pub(crate) key_validator: Arc<gateway::db::ApiKeyValidator>,
-    pub(crate) event_recorder: EventRecorder,
-    pub(crate) shutdown: CancellationToken,
-    pub(crate) api_key: Uuid,
-}
-
-impl Drop for EventHarness {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
+    pub(crate) api_key: String,
+    core: GatewayRuntimeHarness,
 }
 
 pub(crate) async fn build_harness(
     rate_ctx: RateLimitContext,
     worker_whitelist: Option<HashSet<Hotkey>>,
 ) -> EventHarness {
+    build_harness_with_options(rate_ctx, worker_whitelist, GatewayHarnessOptions::default()).await
+}
+
+pub(crate) async fn build_harness_with_options(
+    rate_ctx: RateLimitContext,
+    worker_whitelist: Option<HashSet<Hotkey>>,
+    mut options: GatewayHarnessOptions,
+) -> EventHarness {
     ensure_crypto_provider();
 
-    let (config, config_path) = load_config();
-    let mut config = config;
-    if let Some(whitelist) = worker_whitelist {
-        config.http.worker_whitelist = whitelist;
-    }
-    let config = Arc::new(config);
+    options.include_gateway_info = true;
+    options.worker_whitelist = worker_whitelist;
 
-    let shutdown = CancellationToken::new();
+    let GatewayRuntimeStart {
+        harness: core,
+        runtime_config: _runtime_config,
+        config_path: _config_path,
+        generic_key,
+        admin_key: _admin_key,
+        default_user_api_key,
+        ..
+    } = GatewayRuntimeHarness::start(options).await;
 
-    let event_sink = InMemoryEventSink::default();
-    let events_flush_interval = config.db.events_flush_interval_sec.max(1);
-    let events_queue_capacity = config.db.events_queue_capacity.max(1);
-    let event_recorder = EventRecorder::new(
-        Arc::new(EventSinkHandle::InMemory(event_sink.clone())),
-        Arc::from(config.network.name.as_str()),
-        Duration::from_secs(events_flush_interval),
-        events_queue_capacity,
-        shutdown.clone(),
-    );
-
-    let core = build_shared_harness_core(
-        Arc::clone(&config),
-        config_path,
-        event_recorder.clone(),
-        true,
-    )
-    .await;
-
-    let state = core.state;
-
-    let request_size_limit = config.http.request_size_limit as usize;
-    let size_limit_handler = || SecureMaxSize(request_size_limit);
-    let add_task_size_limit = config.http.add_task_size_limit as usize;
-    let add_task_size_limit_handler = || SecureMaxSize(add_task_size_limit);
-
-    let router = Router::new()
-        .hoop(affix_state::inject(state))
-        .hoop(affix_state::inject(rate_ctx))
-        .push(
-            Router::with_path("/add_task")
-                .hoop(add_task_size_limit_handler())
-                .hoop(api_or_generic_key_check)
-                .post(add_task_handler),
+    let api_key = if rate_ctx.is_company_key {
+        let company = rate_ctx.company.as_ref().expect("company limits");
+        let api_key = Uuid::new_v4().to_string();
+        let hasher = ApiKeyHasher::new(&core.config.http.api_key_secret).expect("api key hasher");
+        insert_company_api_key(
+            &core.db_client,
+            &hasher,
+            CompanyKeySeed {
+                api_key: &api_key,
+                company_id: company.id,
+                company_name: company.name.as_ref(),
+                concurrent_limit: company.concurrent_limit.min(i32::MAX as u64) as i32,
+                daily_limit: company.daily_limit.min(i32::MAX as u64) as i32,
+                balance_cents: 100_000,
+            },
         )
-        .push(
-            Router::with_path("/get_result")
-                .hoop(size_limit_handler())
-                .hoop(api_or_generic_key_check)
-                .get(get_result_handler),
-        )
-        .push(
-            Router::with_path("/get_status")
-                .hoop(size_limit_handler())
-                .hoop(api_or_generic_key_check)
-                .get(get_status_handler),
-        )
-        .push(
-            Router::with_path("/get_tasks")
-                .hoop(size_limit_handler())
-                .post(get_tasks_handler),
-        )
-        .push(
-            Router::with_path("/add_result")
-                .hoop(size_limit_handler())
-                .post(add_result_handler),
-        )
-        .push(
-            Router::with_path("/get_version")
-                .hoop(size_limit_handler())
-                .get(version_handler),
-        )
-        .push(
-            Router::with_path("/id")
-                .hoop(size_limit_handler())
-                .get(id_handler),
-        );
-
-    let service = Service::new(router);
+        .await
+        .expect("insert company key");
+        core.gateway
+            .sync_db_caches_for_test()
+            .await
+            .expect("sync db caches");
+        api_key
+    } else if rate_ctx.is_generic_key {
+        generic_key.to_string()
+    } else if rate_ctx.key_is_uuid {
+        if rate_ctx.user_email.is_none() && rate_ctx.user_limits.is_none() {
+            top_up_personal_api_key_balance(&core, &default_user_api_key, 100_000).await;
+            default_user_api_key
+        } else {
+            let api_key = Uuid::new_v4().to_string();
+            let (concurrent_limit, daily_limit): (u64, u64) =
+                rate_ctx.user_limits.unwrap_or((1, 10));
+            let hasher =
+                ApiKeyHasher::new(&core.config.http.api_key_secret).expect("api key hasher");
+            insert_personal_api_key(
+                &core.db_client,
+                &hasher,
+                PersonalKeySeed {
+                    api_key: &api_key,
+                    user_email: rate_ctx.user_email.as_deref(),
+                    concurrent_limit: concurrent_limit.min(i32::MAX as u64) as i32,
+                    daily_limit: daily_limit.min(i32::MAX as u64) as i32,
+                    balance_cents: 100_000,
+                },
+            )
+            .await
+            .expect("insert personal key");
+            core.gateway
+                .sync_db_caches_for_test()
+                .await
+                .expect("sync db caches");
+            api_key
+        }
+    } else {
+        generic_key.to_string()
+    };
 
     EventHarness {
-        service,
-        task_queue: core.task_queue,
-        task_manager: core.task_manager,
-        event_sink,
-        key_validator: core.key_validator,
-        event_recorder,
-        shutdown,
-        api_key: core.generic_key,
+        service: core.service.clone(),
+        task_manager: core.gateway.task_manager(),
+        api_key,
+        core,
     }
+}
+
+pub(crate) async fn set_request_file_size_limit(
+    harness: &EventHarness,
+    request_file_size_limit: i64,
+) {
+    update_app_settings_gateway_runtime(
+        &harness.core.db_client,
+        GatewayRuntimeAppSettingsUpdate {
+            generic_key: harness.core.config.http.generic_key.expect("generic key"),
+            global_limit: 0,
+            per_ip_limit: 0,
+            unauthorized_per_ip_limit: harness
+                .core
+                .config
+                .http
+                .add_task_unauthorized_per_ip_daily_rate_limit
+                as i32,
+            rate_limit_whitelist: harness
+                .core
+                .config
+                .http
+                .rate_limit_whitelist
+                .iter()
+                .cloned()
+                .collect(),
+            max_task_queue_len: harness.core.config.http.max_task_queue_len as i32,
+            request_file_size_limit,
+            guest_generation_limit: 1,
+            guest_window_ms: 86_400_000,
+            registered_generation_limit: 0,
+            registered_window_ms: 86_400_000,
+        },
+    )
+    .await
+    .expect("update gateway runtime settings");
+    harness
+        .core
+        .gateway
+        .sync_db_caches_for_test()
+        .await
+        .expect("sync db caches");
 }
 
 pub(crate) fn default_rate_ctx() -> RateLimitContext {
     RateLimitContext {
-        user_id: Some(Uuid::new_v4()),
+        user_id: Some(42),
         has_valid_api_key: true,
         key_is_uuid: true,
         ..RateLimitContext::default()
@@ -265,35 +357,41 @@ pub(crate) fn default_rate_ctx() -> RateLimitContext {
 }
 
 pub(crate) async fn wait_for_activity(
-    recorder: &EventRecorder,
-    sink: &InMemoryEventSink,
+    harness: &EventHarness,
     expected: usize,
-) -> Vec<ActivityEventRow> {
+) -> Vec<ActivityEventRecord> {
     for _ in 0..50 {
-        recorder.flush_once_for_test().await;
-        let rows = sink.activity_rows().await;
+        harness.core.gateway.flush_events_for_test().await;
+        let rows = fetch_activity_events(&harness.core)
+            .await
+            .expect("fetch activity events");
         if rows.len() >= expected {
             return rows;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    sink.activity_rows().await
+    fetch_activity_events(&harness.core)
+        .await
+        .expect("fetch activity events")
 }
 
 pub(crate) async fn wait_for_worker(
-    recorder: &EventRecorder,
-    sink: &InMemoryEventSink,
+    harness: &EventHarness,
     expected: usize,
-) -> Vec<WorkerEventRow> {
+) -> Vec<WorkerEventRecord> {
     for _ in 0..50 {
-        recorder.flush_once_for_test().await;
-        let rows = sink.worker_rows().await;
+        harness.core.gateway.flush_events_for_test().await;
+        let rows = fetch_worker_events(&harness.core)
+            .await
+            .expect("fetch worker events");
         if rows.len() >= expected {
             return rows;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    sink.worker_rows().await
+    fetch_worker_events(&harness.core)
+        .await
+        .expect("fetch worker events")
 }
 
 pub(crate) async fn add_success_result(
@@ -307,8 +405,9 @@ pub(crate) async fn add_success_result(
         .await;
     let result = AddTaskResultRequest {
         worker_hotkey: worker.clone(),
-        worker_id: worker.to_string().into(),
-        asset: Some(asset),
+        worker_id: Arc::<str>::from(worker.to_string()),
+        assignment_token: Uuid::nil(),
+        asset: Some(asset.into()),
         reason: None,
         instant: std::time::Instant::now(),
     };
@@ -316,4 +415,146 @@ pub(crate) async fn add_success_result(
         .add_result(task_id, result)
         .await
         .expect("add result");
+}
+
+pub(crate) async fn record_assignment_in_memory_and_db(
+    harness: &EventHarness,
+    task_id: Uuid,
+    worker: &Hotkey,
+    worker_id: &str,
+) -> Uuid {
+    let task_ids = vec![task_id];
+    let assigned = harness
+        .core
+        .db_client
+        .query(
+            "SELECT task_id, assignment_token
+             FROM generation_record_task_assignments($1, $2, $3, $4)",
+            &[
+                &task_ids,
+                &worker.as_ref(),
+                &worker_id,
+                &(current_timestamp() as i64 * 1000),
+            ],
+        )
+        .await
+        .expect("record generation task assignment");
+    let assigned_task_ids: Vec<Uuid> = assigned.iter().map(|row| row.get("task_id")).collect();
+    assert_eq!(
+        assigned_task_ids,
+        vec![task_id],
+        "assignment should be recorded in SQL"
+    );
+    let assignment_token: Uuid = assigned[0].get("assignment_token");
+    harness
+        .task_manager
+        .record_assignment_with_token(
+            task_id,
+            worker.clone(),
+            Arc::<str>::from(worker_id.to_string()),
+            assignment_token,
+        )
+        .await;
+    assignment_token
+}
+
+pub(crate) async fn finalize_assignment_in_db_for_replay(
+    harness: &EventHarness,
+    task_id: Uuid,
+    worker: &Hotkey,
+    worker_id: &str,
+    assignment_token: Uuid,
+    success: bool,
+) {
+    let result_metadata_json = serde_json::json!({
+        "worker_hotkey": worker.as_ref(),
+        "worker_id": worker_id,
+        "assignment_token": assignment_token,
+        "success": success,
+        "gateway_name": harness.core.config.network.name.clone(),
+    })
+    .to_string();
+    let row = harness
+        .core
+        .db_client
+        .query_one(
+            "SELECT assignment_outcome
+             FROM generation_finalize_task_assignment($1, $2, $3, $4, $5, $6, $7::TEXT::jsonb, $8)",
+            &[
+                &task_id,
+                &worker.as_ref(),
+                &worker_id,
+                &assignment_token,
+                &if success { "succeeded" } else { "failed" },
+                &if success {
+                    None::<String>
+                } else {
+                    Some("worker failed".to_string())
+                },
+                &result_metadata_json,
+                &(current_timestamp() as i64 * 1000),
+            ],
+        )
+        .await
+        .expect("finalize generation task assignment for replay setup");
+    let outcome: String = row.get("assignment_outcome");
+    assert!(
+        outcome == "applied",
+        "expected replay setup finalize to apply once, got {:?}",
+        outcome
+    );
+}
+
+async fn fetch_activity_events(
+    harness: &GatewayRuntimeHarness,
+) -> Result<Vec<ActivityEventRecord>> {
+    let rows = harness
+        .db_client
+        .query(
+            "SELECT task_id, user_id, company_id, action, event_family, client_origin, task_kind, model, metadata_json::TEXT AS metadata_json FROM activity_events ORDER BY created_at ASC, id ASC",
+            &[],
+        )
+        .await
+        .context("query activity events")?;
+    rows.into_iter()
+        .map(|row| {
+            let metadata_text: String = row.get("metadata_json");
+            let metadata: Value = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
+            Ok(ActivityEventRecord {
+                task_id: row.get("task_id"),
+                user_id: row.get("user_id"),
+                company_id: row.get("company_id"),
+                company_name: metadata
+                    .get("companyName")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                action: row.get("action"),
+                event_family: row.get("event_family"),
+                client_origin: row.get("client_origin"),
+                task_kind: row.get("task_kind"),
+                model: row.get("model"),
+            })
+        })
+        .collect()
+}
+
+async fn fetch_worker_events(harness: &GatewayRuntimeHarness) -> Result<Vec<WorkerEventRecord>> {
+    let rows = harness
+        .db_client
+        .query(
+            "SELECT task_id, worker_id, action, task_kind, reason FROM worker_events ORDER BY created_at ASC, id ASC",
+            &[],
+        )
+        .await
+        .context("query worker events")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkerEventRecord {
+            task_id: row.get("task_id"),
+            worker_id: row.get("worker_id"),
+            action: row.get("action"),
+            task_kind: row.get("task_kind"),
+            reason: row.get("reason"),
+        })
+        .collect())
 }

@@ -1,11 +1,16 @@
 use super::store::Request;
-use super::store::{RateLimitDelta, RateLimitMutation, RateLimitRefund, Subject, rate_limit_key};
+use super::store::{RateLimitMutation, RateLimitMutationBatch, Subject, rate_limit_key};
 use super::{NodeId, Raft, StateMachineStore};
 use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfo;
 use crate::api::response::GatewayInfoRef;
 use crate::config_runtime::RuntimeConfigStore;
-use crate::db::{ApiKeyLookup, ApiKeyValidator, EventRecorder};
+use crate::db::{
+    ApiKeyLookup, ApiKeyValidator, CreateGenerationTaskInput, CreateGenerationTaskOutcome,
+    EventRecorder, FinalizeGenerationTaskAssignmentInput, FinalizeGenerationTaskAssignmentOutcome,
+    GatewayRuntimeSettingsStore, GenerationTaskAccessOwner, GenerationTaskStatusSnapshot,
+    RecordedGenerationTaskAssignment, TaskLifecycleStore, TaskLifecycleStoreHandle,
+};
 use crate::http3::client::{Http3Client, Http3ClientBuilder};
 use crate::task::TaskManager;
 use anyhow::Result;
@@ -13,25 +18,23 @@ use backon::{ExponentialBuilder, Retryable};
 use bytes::Bytes;
 use openraft::{BasicNode, RaftMetrics};
 use rmp_serde;
-use scc::Queue;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
-use tracing::{error, info};
+use tokio::sync::{Mutex, watch};
+use tracing::error;
 use uuid::Uuid;
 
-type RateLimitMutationBatch = Arc<Vec<RateLimitMutation>>;
-
 pub struct ActivityEventRef<'a> {
-    pub user_id: Option<Uuid>,
+    pub user_id: Option<i64>,
     pub user_email: Option<&'a str>,
     pub company_id: Option<Uuid>,
     pub company_name: Option<&'a str>,
     pub action: &'a str,
-    pub tool: &'a str,
+    pub client_origin: &'a str,
     pub task_kind: &'a str,
     pub model: Option<&'a str>,
     pub task_id: Option<Uuid>,
@@ -53,15 +56,34 @@ enum RateLimitRequestRef<'a> {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskLifecycleWriteRequest {
+    CreateGenerationTask {
+        input: Box<CreateGenerationTaskInput>,
+    },
+    RecordGenerationTaskAssignments {
+        task_ids: Vec<Uuid>,
+        worker_hotkey: String,
+        worker_id: String,
+        assigned_at_ms: i64,
+    },
+    FinalizeGenerationTaskAssignment {
+        input: Box<FinalizeGenerationTaskAssignmentInput>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskLifecycleWriteResponse {
+    Ack,
+    CreateGenerationTask(CreateGenerationTaskOutcome),
+    RecordGenerationTaskAssignments(Vec<RecordedGenerationTaskAssignment>),
+    FinalizeGenerationTaskAssignment(FinalizeGenerationTaskAssignmentOutcome),
+}
+
 #[derive(Debug)]
 pub enum GatewayStateError {
     NotFound(String),
     DeserializeError(rmp_serde::decode::Error),
-}
-
-#[derive(Debug)]
-pub enum UpdateGenericKeyError {
-    OverlapsExistingApiKey,
 }
 
 impl fmt::Display for GatewayStateError {
@@ -77,19 +99,6 @@ impl fmt::Display for GatewayStateError {
     }
 }
 
-impl fmt::Display for UpdateGenericKeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            UpdateGenericKeyError::OverlapsExistingApiKey => {
-                write!(
-                    f,
-                    "Refusing to set generic key because it overlaps with an existing API key"
-                )
-            }
-        }
-    }
-}
-
 impl std::error::Error for GatewayStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -99,42 +108,60 @@ impl std::error::Error for GatewayStateError {
     }
 }
 
-impl std::error::Error for UpdateGenericKeyError {}
-
-struct GatewayStateInner {
+struct GatewayStateInner<S = TaskLifecycleStoreHandle>
+where
+    S: TaskLifecycleStore,
+{
     state: Arc<StateMachineStore>,
     raft: Raft,
     last_task_acquisition: Arc<AtomicU64>,
+    task_lifecycle_store: S,
     key_validator: Arc<ApiKeyValidator>,
+    gateway_settings: Arc<GatewayRuntimeSettingsStore>,
     task_manager: TaskManager,
     config: Arc<RuntimeConfigStore>,
-    rate_limit_queue: Arc<Queue<RateLimitMutation>>,
     event_recorder: EventRecorder,
+    leader_client: Mutex<Option<CachedLeaderClient>>,
 }
 
 #[derive(Clone)]
-pub struct GatewayState {
-    internal: Arc<GatewayStateInner>,
+struct CachedLeaderClient {
+    leader_id: u64,
+    client: Http3Client,
 }
 
-pub struct GatewayStateInit {
+#[derive(Clone)]
+pub struct GatewayState<S = TaskLifecycleStoreHandle>
+where
+    S: TaskLifecycleStore,
+{
+    internal: Arc<GatewayStateInner<S>>,
+}
+
+pub struct GatewayStateInit<S = TaskLifecycleStoreHandle>
+where
+    S: TaskLifecycleStore,
+{
     pub state: Arc<StateMachineStore>,
     pub raft: Raft,
     pub last_task_acquisition: Arc<AtomicU64>,
-    pub key_validator_updater: Arc<ApiKeyValidator>,
+    pub task_lifecycle_store: S,
+    pub api_key_validator: Arc<ApiKeyValidator>,
     pub task_manager: TaskManager,
     pub config: Arc<RuntimeConfigStore>,
-    pub rate_limit_queue: Arc<Queue<RateLimitMutation>>,
     pub event_recorder: EventRecorder,
 }
 
-impl GatewayState {
-    fn key_prefix(key: &Uuid) -> String {
-        key.to_string().chars().take(6).collect()
-    }
-
+impl<S> GatewayState<S>
+where
+    S: TaskLifecycleStore,
+{
     pub(crate) fn admin_key(&self) -> String {
         self.internal.config.snapshot().http().admin_key.to_string()
+    }
+
+    pub fn current_node_id(&self) -> u64 {
+        self.internal.config.snapshot().node().network.node_id
     }
 
     pub(crate) fn leader_server_addr(&self, info: &GatewayInfo) -> String {
@@ -178,6 +205,36 @@ impl GatewayState {
         })
     }
 
+    async fn shared_leader_client(
+        &self,
+        leader_id: u64,
+        leader_info: &GatewayInfo,
+    ) -> anyhow::Result<Http3Client> {
+        if let Some(client) = {
+            let guard = self.internal.leader_client.lock().await;
+            guard
+                .as_ref()
+                .filter(|cached| cached.leader_id == leader_id)
+                .map(|cached| cached.client.clone())
+        } {
+            return Ok(client);
+        }
+
+        let client = self.build_leader_client(leader_info).await?;
+        let mut guard = self.internal.leader_client.lock().await;
+        if let Some(cached) = guard.as_ref()
+            && cached.leader_id == leader_id
+        {
+            return Ok(cached.client.clone());
+        }
+
+        *guard = Some(CachedLeaderClient {
+            leader_id,
+            client: client.clone(),
+        });
+        Ok(client)
+    }
+
     async fn forward_to_leader_endpoint(
         &self,
         current_node_id: u64,
@@ -203,7 +260,7 @@ impl GatewayState {
         let client = match client {
             Some(client) => client,
             None => {
-                client_storage = self.build_leader_client(&leader_info).await?;
+                client_storage = self.shared_leader_client(leader_id, &leader_info).await?;
                 &client_storage
             }
         };
@@ -228,27 +285,30 @@ impl GatewayState {
         }
     }
 
-    pub fn new(args: GatewayStateInit) -> Self {
+    pub fn new(args: GatewayStateInit<S>) -> Self {
         let GatewayStateInit {
             state,
             raft,
             last_task_acquisition,
-            key_validator_updater,
+            task_lifecycle_store,
+            api_key_validator,
             task_manager,
             config,
-            rate_limit_queue,
             event_recorder,
         } = args;
+        let gateway_settings = api_key_validator.gateway_settings();
         Self {
             internal: Arc::new(GatewayStateInner {
                 state,
                 raft,
                 last_task_acquisition,
-                key_validator: key_validator_updater,
+                task_lifecycle_store,
+                key_validator: api_key_validator,
+                gateway_settings,
                 task_manager,
                 config,
-                rate_limit_queue,
                 event_recorder,
+                leader_client: Mutex::new(None),
             }),
         }
     }
@@ -351,84 +411,294 @@ impl GatewayState {
         .await
     }
 
-    pub async fn update_gateway_generic_key(
-        &self,
-        current_node_id: u64,
-        new_key: Option<Uuid>,
-        admin_key: Option<&str>,
-    ) -> Result<()> {
-        let key_to_set = if self.generic_key().await.is_none() {
-            new_key.unwrap_or_else(Uuid::new_v4)
-        } else if let Some(key) = new_key {
-            key
-        } else {
-            return Ok(());
-        };
-
-        let key_to_set_str = key_to_set.to_string();
-        let existing = self.lookup_api_key(key_to_set_str.as_str()).await;
-        if existing.user_id.is_some() || existing.company_id.is_some() {
-            return Err(UpdateGenericKeyError::OverlapsExistingApiKey.into());
-        }
-
-        let serialized_key = rmp_serde::to_vec(&key_to_set)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize UUID to rmp: {}", e))?;
-
-        let payload = serde_json::to_vec(&serde_json::json!({ "generic_key": key_to_set }))
-            .map_err(|e| anyhow::anyhow!("Failed to serialize payload: {}", e))?;
-        let forwarded = self
-            .forward_to_leader_endpoint(
-                current_node_id,
-                "/update_key",
-                Bytes::from(payload),
-                admin_key,
-                None,
-                Duration::from_secs(self.internal.config.snapshot().http().forward_timeout_sec),
-            )
-            .await?;
-        if forwarded {
-            info!(
-                "Gateway generic key updated (forwarded), prefix: {}",
-                Self::key_prefix(&key_to_set)
-            );
-            return Ok(());
-        }
-
-        {
-            self.internal
-                .raft
-                .client_write(Request::Set {
-                    request_id: Uuid::new_v4().as_u128(),
-                    key: "generic_key".to_string(),
-                    value: serialized_key,
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))?;
-        }
-
-        info!(
-            "Gateway generic key updated (leader), prefix: {}",
-            Self::key_prefix(&key_to_set)
-        );
-        Ok(())
-    }
-
-    pub async fn generic_key(&self) -> Option<Uuid> {
+    pub fn generic_key(&self) -> Option<Uuid> {
         self.internal
-            .state
-            .get_raw("generic_key")
-            .await
-            .and_then(|v| rmp_serde::from_slice::<Uuid>(&v).ok())
+            .gateway_settings
+            .generic_key()
+            .or_else(|| self.internal.state.get_cached_generic_key())
     }
 
-    pub async fn is_generic_key(&self, api_key: &Uuid) -> bool {
-        self.generic_key()
-            .await
-            .is_some_and(|generic_key| &generic_key == api_key)
+    pub fn is_generic_key(&self, api_key: &Uuid) -> bool {
+        self.internal.gateway_settings.is_generic_key(api_key)
+            || self
+                .internal
+                .state
+                .get_cached_generic_key()
+                .is_some_and(|generic_key| &generic_key == api_key)
+    }
+
+    pub fn has_database_gateway_settings(&self) -> bool {
+        self.internal
+            .gateway_settings
+            .has_database_gateway_settings()
+    }
+
+    pub fn add_task_unauthorized_per_ip_daily_rate_limit(&self) -> u64 {
+        if self.has_database_gateway_settings() {
+            return self
+                .internal
+                .gateway_settings
+                .add_task_unauthorized_per_ip_daily_rate_limit();
+        }
+        self.internal
+            .config
+            .snapshot()
+            .http()
+            .add_task_unauthorized_per_ip_daily_rate_limit as u64
+    }
+
+    pub fn max_task_queue_len(&self) -> usize {
+        if self.has_database_gateway_settings() {
+            return usize::try_from(self.internal.gateway_settings.max_task_queue_len())
+                .unwrap_or(usize::MAX);
+        }
+        self.internal.config.snapshot().http().max_task_queue_len
+    }
+
+    pub fn request_file_size_limit(&self) -> u64 {
+        if self.has_database_gateway_settings() {
+            return self.internal.gateway_settings.request_file_size_limit();
+        }
+        self.internal
+            .config
+            .snapshot()
+            .http()
+            .request_file_size_limit
+    }
+
+    pub fn guest_generation_limit(&self) -> u64 {
+        self.internal.gateway_settings.guest_generation_limit()
+    }
+
+    pub fn guest_window_ms(&self) -> u64 {
+        self.internal.gateway_settings.guest_window_ms()
+    }
+
+    pub fn generic_global_daily_limit(&self) -> u64 {
+        self.internal.gateway_settings.generic_global_daily_limit()
+    }
+
+    pub fn generic_per_ip_daily_limit(&self) -> u64 {
+        self.internal.gateway_settings.generic_per_ip_daily_limit()
+    }
+
+    pub fn generic_window_ms(&self) -> u64 {
+        self.internal.gateway_settings.generic_window_ms()
+    }
+
+    pub fn registered_generation_limit(&self) -> u64 {
+        self.internal.gateway_settings.registered_generation_limit()
+    }
+
+    pub fn registered_window_ms(&self) -> u64 {
+        self.internal.gateway_settings.registered_window_ms()
+    }
+
+    pub fn is_rate_limit_whitelisted_ip(&self, ip: &IpAddr) -> bool {
+        if self.has_database_gateway_settings() {
+            return self
+                .internal
+                .gateway_settings
+                .is_rate_limit_whitelisted_ip(ip);
+        }
+        self.internal
+            .config
+            .snapshot()
+            .rate_limit_whitelist()
+            .ips
+            .contains(ip)
     }
 
     pub async fn lookup_api_key(&self, api_key: &str) -> ApiKeyLookup {
         self.internal.key_validator.lookup(api_key).await
+    }
+
+    pub async fn lookup_api_key_with_unknown_key_guard(
+        &self,
+        api_key: &str,
+        source_key: Option<Arc<str>>,
+    ) -> ApiKeyLookup {
+        self.internal
+            .key_validator
+            .lookup_with_unknown_key_guard(api_key, source_key)
+            .await
+    }
+
+    pub async fn apply_task_lifecycle_write(
+        &self,
+        request: TaskLifecycleWriteRequest,
+    ) -> Result<TaskLifecycleWriteResponse> {
+        match request {
+            TaskLifecycleWriteRequest::CreateGenerationTask { input } => {
+                let outcome = self
+                    .internal
+                    .task_lifecycle_store
+                    .create_generation_task(input.as_ref())
+                    .await?;
+                Ok(TaskLifecycleWriteResponse::CreateGenerationTask(outcome))
+            }
+            TaskLifecycleWriteRequest::RecordGenerationTaskAssignments {
+                task_ids,
+                worker_hotkey,
+                worker_id,
+                assigned_at_ms,
+            } => {
+                let assigned_task_ids = self
+                    .internal
+                    .task_lifecycle_store
+                    .record_generation_task_assignments(
+                        task_ids.as_slice(),
+                        worker_hotkey.as_str(),
+                        worker_id.as_str(),
+                        assigned_at_ms,
+                    )
+                    .await?;
+                Ok(TaskLifecycleWriteResponse::RecordGenerationTaskAssignments(
+                    assigned_task_ids,
+                ))
+            }
+            TaskLifecycleWriteRequest::FinalizeGenerationTaskAssignment { input } => {
+                let outcome = self
+                    .internal
+                    .task_lifecycle_store
+                    .finalize_generation_task_assignment(input.as_ref())
+                    .await?;
+                Ok(TaskLifecycleWriteResponse::FinalizeGenerationTaskAssignment(outcome))
+            }
+        }
+    }
+
+    async fn submit_task_lifecycle_write(
+        &self,
+        request: TaskLifecycleWriteRequest,
+    ) -> Result<TaskLifecycleWriteResponse> {
+        self.apply_task_lifecycle_write(request).await
+    }
+
+    pub async fn create_generation_task(
+        &self,
+        input: &CreateGenerationTaskInput,
+    ) -> Result<CreateGenerationTaskOutcome> {
+        match self
+            .submit_task_lifecycle_write(TaskLifecycleWriteRequest::CreateGenerationTask {
+                input: Box::new(input.clone()),
+            })
+            .await?
+        {
+            TaskLifecycleWriteResponse::CreateGenerationTask(outcome) => Ok(outcome),
+            TaskLifecycleWriteResponse::Ack => {
+                Err(anyhow::anyhow!("missing generation task create outcome"))
+            }
+            TaskLifecycleWriteResponse::RecordGenerationTaskAssignments(_) => Err(anyhow::anyhow!(
+                "unexpected generation task assignment outcome while creating generation task"
+            )),
+            TaskLifecycleWriteResponse::FinalizeGenerationTaskAssignment(_) => {
+                Err(anyhow::anyhow!(
+                    "unexpected generation task finalize outcome while creating generation task"
+                ))
+            }
+        }
+    }
+
+    pub async fn record_generation_task_assignments(
+        &self,
+        task_ids: &[Uuid],
+        worker_hotkey: &str,
+        worker_id: &str,
+        assigned_at_ms: i64,
+    ) -> Result<Vec<RecordedGenerationTaskAssignment>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self
+            .submit_task_lifecycle_write(
+                TaskLifecycleWriteRequest::RecordGenerationTaskAssignments {
+                    task_ids: task_ids.to_vec(),
+                    worker_hotkey: worker_hotkey.to_owned(),
+                    worker_id: worker_id.to_owned(),
+                    assigned_at_ms,
+                },
+            )
+            .await?
+        {
+            TaskLifecycleWriteResponse::RecordGenerationTaskAssignments(assigned_assignments) => {
+                Ok(assigned_assignments)
+            }
+            TaskLifecycleWriteResponse::Ack => Err(anyhow::anyhow!(
+                "missing generation task assignment outcome"
+            )),
+            TaskLifecycleWriteResponse::CreateGenerationTask(_) => Err(anyhow::anyhow!(
+                "unexpected generation task create outcome while recording task assignments"
+            )),
+            TaskLifecycleWriteResponse::FinalizeGenerationTaskAssignment(_) => {
+                Err(anyhow::anyhow!(
+                    "unexpected generation task finalize outcome while recording task assignments"
+                ))
+            }
+        }
+    }
+
+    pub async fn finalize_generation_task_assignment(
+        &self,
+        input: FinalizeGenerationTaskAssignmentInput,
+    ) -> Result<FinalizeGenerationTaskAssignmentOutcome> {
+        match self
+            .submit_task_lifecycle_write(
+                TaskLifecycleWriteRequest::FinalizeGenerationTaskAssignment {
+                    input: Box::new(input),
+                },
+            )
+            .await?
+        {
+            TaskLifecycleWriteResponse::FinalizeGenerationTaskAssignment(outcome) => Ok(outcome),
+            TaskLifecycleWriteResponse::Ack => {
+                Err(anyhow::anyhow!("missing generation task finalize outcome"))
+            }
+            TaskLifecycleWriteResponse::RecordGenerationTaskAssignments(_) => Err(anyhow::anyhow!(
+                "unexpected generation task assignment outcome while finalizing assignment"
+            )),
+            TaskLifecycleWriteResponse::CreateGenerationTask(_) => Err(anyhow::anyhow!(
+                "unexpected generation task create outcome while finalizing assignment"
+            )),
+        }
+    }
+
+    pub async fn expire_generation_tasks(&self, limit: i32, now_ms: i64) -> Result<Vec<Uuid>> {
+        self.internal
+            .task_lifecycle_store
+            .expire_generation_tasks(limit, now_ms)
+            .await
+    }
+
+    pub async fn purge_terminal_generation_tasks(
+        &self,
+        limit: i32,
+        completed_before_ms: i64,
+    ) -> Result<Vec<Uuid>> {
+        self.internal
+            .task_lifecycle_store
+            .purge_terminal_generation_tasks(limit, completed_before_ms)
+            .await
+    }
+
+    pub async fn get_generation_task_access_owner(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<GenerationTaskAccessOwner>> {
+        self.internal
+            .task_lifecycle_store
+            .get_generation_task_access_owner(task_id)
+            .await
+    }
+
+    pub async fn get_generation_task_status_snapshot(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<GenerationTaskStatusSnapshot>> {
+        self.internal
+            .task_lifecycle_store
+            .get_generation_task_status_snapshot(task_id)
+            .await
     }
 
     pub fn cluster_name_matches(&self, cluster_name: &str) -> bool {
@@ -446,14 +716,6 @@ impl GatewayState {
         self.internal.task_manager.clone()
     }
 
-    pub fn preconfigured_generic_key(&self) -> Option<Uuid> {
-        self.internal.config.snapshot().http().generic_key
-    }
-
-    pub fn enqueue_rate_limit_mutation(&self, mutation: RateLimitMutation) {
-        self.internal.rate_limit_queue.push(mutation);
-    }
-
     pub fn record_activity_event(&self, event: ActivityEventRef<'_>) {
         self.internal.event_recorder.record_activity(
             event.user_id,
@@ -461,7 +723,7 @@ impl GatewayState {
             event.company_id,
             event.company_name,
             event.action,
-            event.tool,
+            event.client_origin,
             event.task_kind,
             event.model,
             event.task_id,
@@ -478,10 +740,19 @@ impl GatewayState {
         );
     }
 
+    pub async fn submit_rate_limit_mutation_batch(
+        &self,
+        batch: &RateLimitMutationBatch,
+        client: Option<&Http3Client>,
+    ) -> Result<()> {
+        self.submit_rate_limit_mutations_with_request_id(batch.request_id, &batch.mutations, client)
+            .await
+    }
+
     pub async fn submit_rate_limit_mutations_with_request_id(
         &self,
         request_id: u128,
-        mutations: RateLimitMutationBatch,
+        mutations: &[RateLimitMutation],
         client: Option<&Http3Client>,
     ) -> Result<()> {
         let cfg = self.internal.config.snapshot();
@@ -494,7 +765,7 @@ impl GatewayState {
             {
                 let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitMutations {
                     request_id,
-                    mutations: mutations.as_slice(),
+                    mutations,
                 })
                 .map_err(|e| anyhow::anyhow!("Failed to serialize mutations: {}", e))?;
 
@@ -529,72 +800,50 @@ impl GatewayState {
         if forwarded {
             Ok(())
         } else {
-            let owned_mutations = match Arc::try_unwrap(mutations) {
-                Ok(vec) => vec,
-                Err(arc) => arc.as_ref().clone(),
-            };
-            self.apply_rate_limit_mutations(request_id, owned_mutations)
-                .await
+            self.apply_rate_limit_mutation_batch(RateLimitMutationBatch::new(
+                request_id,
+                mutations.to_vec(),
+            ))
+            .await
         }
     }
 
-    pub async fn apply_rate_limit_deltas(
+    pub async fn apply_rate_limit_mutation_batch(
         &self,
-        request_id: u128,
-        deltas: Vec<RateLimitDelta>,
-    ) -> Result<()> {
-        self.apply_rate_limit_mutations(
-            request_id,
-            deltas
-                .into_iter()
-                .map(RateLimitMutation::from_delta)
-                .collect(),
-        )
-        .await
-    }
-
-    pub async fn apply_rate_limit_mutations(
-        &self,
-        request_id: u128,
-        mutations: Vec<RateLimitMutation>,
+        batch: RateLimitMutationBatch,
     ) -> Result<()> {
         self.internal
             .raft
             .client_write(Request::RateLimitMutations {
-                request_id,
-                mutations,
+                request_id: batch.request_id,
+                mutations: batch.mutations,
             })
             .await
             .map(|_r| ())
             .map_err(|e| anyhow::anyhow!("Failed to complete client_write: {}", e))
     }
 
-    pub async fn apply_rate_limit_refunds(
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub async fn apply_rate_limit_mutations(
         &self,
         request_id: u128,
-        refunds: Vec<RateLimitRefund>,
+        mutations: Vec<RateLimitMutation>,
     ) -> Result<()> {
-        self.apply_rate_limit_mutations(
-            request_id,
-            refunds
-                .into_iter()
-                .map(RateLimitMutation::from_refund)
-                .collect(),
-        )
-        .await
+        self.apply_rate_limit_mutation_batch(RateLimitMutationBatch::new(request_id, mutations))
+            .await
     }
 
     pub async fn get_cluster_rate_usage(
         &self,
         subject: Subject,
         id: u128,
-        hour_epoch: u64,
         day_epoch: u64,
     ) -> (u64, u64) {
         let key = rate_limit_key(subject, id);
         self.internal
             .state
-            .get_rate_limit_usage(&key, hour_epoch, day_epoch)
+            .get_rate_limit_usage(&key, day_epoch)
             .await
     }
 }
@@ -602,6 +851,7 @@ impl GatewayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::store::RateLimitDelta;
 
     #[test]
     fn rate_limit_request_ref_encodes_compatibly_with_request() {
@@ -609,14 +859,12 @@ mod tests {
         let delta = RateLimitDelta {
             subject: Subject::User,
             id: 7u128,
-            hour_epoch: 10,
             day_epoch: 1,
-            add_hour: 1,
-            add_day: 0,
+            add_active: 0,
+            add_day: 1,
         };
-        let refund = RateLimitRefund::from_delta(delta);
         let mutation_delta = RateLimitMutation::from_delta(delta);
-        let mutation_refund = RateLimitMutation::from_refund(refund);
+        let mutation_refund = RateLimitMutation::refund_from_delta(delta);
 
         let payload = rmp_serde::to_vec(&RateLimitRequestRef::RateLimitMutations {
             request_id,
@@ -632,8 +880,8 @@ mod tests {
                 assert_eq!(mutations.len(), 2);
                 assert_eq!(mutations[0].subject, Subject::User);
                 assert_eq!(mutations[0].id, 7u128);
-                assert_eq!(mutations[0].hour_delta, 1);
-                assert_eq!(mutations[1].hour_delta, -1);
+                assert_eq!(mutations[0].day_delta, 1);
+                assert_eq!(mutations[1].day_delta, -1);
             }
             other => panic!("unexpected decoded variant: {:?}", other),
         }

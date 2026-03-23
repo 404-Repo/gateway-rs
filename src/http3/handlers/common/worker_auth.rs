@@ -1,7 +1,8 @@
 use crate::config::HTTPConfig;
 use crate::crypto::hotkey::Hotkey;
-use crate::crypto::verify_hotkey;
+use crate::crypto::{GATEWAY_TIMESTAMP_PREFIX, verify_hotkey};
 use crate::http3::error::ServerError;
+use tracing::warn;
 
 pub enum WorkerAuthContext {
     GetTasks,
@@ -30,6 +31,16 @@ pub fn validate_worker_request(
         ));
     }
 
+    if !timestamp.starts_with(GATEWAY_TIMESTAMP_PREFIX)
+        || timestamp[GATEWAY_TIMESTAMP_PREFIX.len()..]
+            .parse::<u64>()
+            .is_err()
+    {
+        return Err(ServerError::BadRequest(
+            "Invalid timestamp format".to_string(),
+        ));
+    }
+
     verify_hotkey(
         timestamp,
         worker_hotkey,
@@ -37,11 +48,13 @@ pub fn validate_worker_request(
         http_cfg.signature_freshness_threshold,
     )
     .map_err(|e| {
-        ServerError::Internal(format!(
-            "Failed to verify {}: {:?}",
-            context.verify_label(),
-            e
-        ))
+        warn!(
+            worker_hotkey = %worker_hotkey,
+            request = context.verify_label(),
+            error = ?e,
+            "Worker signature verification failed"
+        );
+        ServerError::Unauthorized("Invalid worker authentication".to_string())
     })?;
 
     Ok(())
