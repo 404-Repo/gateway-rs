@@ -30,7 +30,6 @@ fn pop_seed_for_task(h: &crate::support::TestHarness, task_id: Uuid) -> i32 {
     assert_eq!(task.id, task_id, "seed check popped unexpected task");
     task.seed
 }
-
 #[tokio::test]
 async fn add_task_json_success() {
     let h = build_harness().await;

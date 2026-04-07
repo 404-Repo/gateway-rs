@@ -65,6 +65,7 @@ pub(crate) fn current_timestamp() -> u64 {
     current_timestamp_secs()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn multipart_add_result(
     task_id: Uuid,
     worker_hotkey: &Hotkey,

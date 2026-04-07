@@ -478,6 +478,12 @@ impl GatewayState {
         );
     }
 
+    /// Records a single rate-limit violation for later batched persistence.
+    pub fn record_rate_limit_violation(&self, client_id: &str) {
+        self.internal
+            .event_recorder
+            .record_rate_limit_violation(client_id);
+    }
     pub async fn submit_rate_limit_mutations_with_request_id(
         &self,
         request_id: u128,

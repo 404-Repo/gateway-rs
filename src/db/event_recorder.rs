@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -7,12 +8,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::db::{ActivityEventRow, EventSink, EventSinkHandle, WorkerEventRow};
+use crate::db::{
+    ActivityEventRow, EventSink, EventSinkHandle, RateLimitViolationBatchRow, WorkerEventRow,
+};
 
 #[derive(Clone)]
 enum EventRow {
     Activity(ActivityEventRow),
     Worker(WorkerEventRow),
+    RateLimitViolation(RateLimitViolationRow),
+}
+
+#[derive(Clone)]
+struct RateLimitViolationRow {
+    gateway_name: String,
+    client_id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone)]
@@ -94,6 +105,19 @@ impl<S: EventSink + 'static> EventRecorder<S> {
         self.enqueue(EventRow::Worker(row));
     }
 
+    /// Records a single rate-limit denial event for the provided client key.
+    ///
+    /// The recorder stores these events in memory and periodically flushes them as
+    /// aggregated batch rows so we avoid writing one database row per denial.
+    pub fn record_rate_limit_violation(&self, client_id: &str) {
+        let row = RateLimitViolationRow {
+            gateway_name: self.gateway_name.to_string(),
+            client_id: client_id.to_string(),
+            created_at: Utc::now(),
+        };
+        self.enqueue(EventRow::RateLimitViolation(row));
+    }
+
     fn spawn_flusher(&self, flush_interval: Duration, shutdown: CancellationToken) {
         let sink = Arc::clone(&self.sink);
         let queue = Arc::clone(&self.queue);
@@ -148,10 +172,12 @@ impl<S: EventSink + 'static> EventRecorder<S> {
     ) -> anyhow::Result<()> {
         let mut activity_rows: Vec<ActivityEventRow> = Vec::new();
         let mut worker_rows: Vec<WorkerEventRow> = Vec::new();
+        let mut rate_limit_rows: Vec<RateLimitViolationRow> = Vec::new();
         while let Some(entry) = queue.pop() {
             match &**entry {
                 EventRow::Activity(row) => activity_rows.push(row.clone()),
                 EventRow::Worker(row) => worker_rows.push(row.clone()),
+                EventRow::RateLimitViolation(row) => rate_limit_rows.push(row.clone()),
             }
         }
 
@@ -171,6 +197,48 @@ impl<S: EventSink + 'static> EventRecorder<S> {
                 Self::enqueue_with_limit(queue, capacity, dropped, EventRow::Worker(row));
             }
         }
+
+        if !rate_limit_rows.is_empty() {
+            let mut details = BTreeMap::<String, i64>::new();
+            let mut window_start = rate_limit_rows[0].created_at;
+            let mut window_end = rate_limit_rows[0].created_at;
+            for row in &rate_limit_rows {
+                *details.entry(row.client_id.clone()).or_insert(0) += 1;
+                if row.created_at < window_start {
+                    window_start = row.created_at;
+                }
+                if row.created_at > window_end {
+                    window_end = row.created_at;
+                }
+            }
+
+            let mut details_pairs: Vec<(String, i64)> = details.into_iter().collect();
+            details_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            let details_map: serde_json::Map<String, serde_json::Value> = details_pairs
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::from(v)))
+                .collect();
+            let batch_row = RateLimitViolationBatchRow {
+                gateway_name: rate_limit_rows[0].gateway_name.clone(),
+                window_start,
+                window_end,
+                total_count: rate_limit_rows.len() as i64,
+                details: serde_json::Value::Object(details_map),
+                created_at: Utc::now(),
+            };
+            let batch_rows = vec![batch_row];
+            if let Err(e) = sink.record_rate_limit_violation_batches(&batch_rows).await {
+                error!(error = ?e, "Failed to flush rate-limit violation aggregates");
+                for row in rate_limit_rows {
+                    Self::enqueue_with_limit(
+                        queue,
+                        capacity,
+                        dropped,
+                        EventRow::RateLimitViolation(row),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -178,5 +246,45 @@ impl<S: EventSink + 'static> EventRecorder<S> {
     #[allow(dead_code)]
     pub async fn flush_once_for_test(&self) {
         let _ = Self::flush_once(&self.sink, &self.queue, self.capacity, &self.dropped).await;
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::EventRecorder;
+    use crate::db::{EventSinkHandle, InMemoryEventSink};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn rate_limit_violations_are_aggregated_per_client() {
+        let sink = InMemoryEventSink::default();
+        let shutdown = CancellationToken::new();
+        let recorder = EventRecorder::new(
+            Arc::new(EventSinkHandle::InMemory(sink.clone())),
+            Arc::from("gw-test"),
+            Duration::from_secs(60),
+            1024,
+            shutdown.clone(),
+        );
+
+        recorder.record_rate_limit_violation("user:alice");
+        recorder.record_rate_limit_violation("user:alice");
+        recorder.record_rate_limit_violation("ip:10");
+        recorder.flush_once_for_test().await;
+
+        let rows = sink.rate_limit_rows().await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.gateway_name, "gw-test");
+        assert_eq!(row.total_count, 3);
+        assert_eq!(
+            row.details,
+            serde_json::json!({
+                "ip:10": 1,
+                "user:alice": 2
+            })
+        );
     }
 }
