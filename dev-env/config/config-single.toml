@@ -79,6 +79,7 @@ keys_cache_max_capacity = 32000
 deleted_keys_ttl_minutes = 60
 events_flush_interval_sec = 5
 events_copy_batch_size = 1000
+violation_flush_interval_sec = 60
 
 [cert]
 dangerous_skip_verification = true

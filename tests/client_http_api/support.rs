@@ -19,7 +19,10 @@ use gateway::common::queue::DupQueue;
 use gateway::config::NodeConfig;
 use gateway::config_runtime::RuntimeConfigStore;
 use gateway::crypto::hotkey::Hotkey;
-use gateway::db::{EventRecorder, EventSinkHandle};
+use gateway::db::{
+    EventRecorder, EventSinkHandle, InMemoryViolationSink, RateLimitViolationTracker,
+    ViolationSinkHandle,
+};
 use gateway::task::TaskManager;
 use gateway::test_support::{
     MultipartFilePart, add_task_handler, api_or_generic_key_check, basic_rate_limit,
@@ -203,6 +206,7 @@ async fn build_harness_inner(
         config_path.clone(),
         event_recorder,
         include_gateway,
+        ViolationSinkHandle::Noop,
     )
     .await;
 
@@ -269,6 +273,95 @@ async fn build_harness_inner(
 impl Drop for TestHarness {
     fn drop(&mut self) {
         self.shutdown.cancel();
+    }
+}
+
+pub(crate) struct ViolationTestHarness {
+    pub(crate) service: Service,
+    pub(crate) api_key: Uuid,
+    pub(crate) violation_tracker: RateLimitViolationTracker,
+    pub(crate) violation_sink: InMemoryViolationSink,
+    pub(crate) shutdown: CancellationToken,
+    pub(crate) _config_file: NamedTempFile,
+}
+
+impl Drop for ViolationTestHarness {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// Builds a test harness wired with an `InMemoryViolationSink` so tests
+/// can flush and assert on recorded rate-limit violations.
+pub(crate) async fn build_harness_with_violation_tracking() -> ViolationTestHarness {
+    ensure_crypto_provider();
+
+    let (config, _config_path) = load_config();
+    let config = Arc::new(config);
+    let config_file = tempfile::Builder::new()
+        .suffix(".toml")
+        .tempfile()
+        .expect("temp config file");
+    let config_toml = toml::to_string(config.as_ref()).expect("serialize test config");
+    std::fs::write(config_file.path(), config_toml).expect("write temp config");
+    let config_path = config_file.path().to_path_buf();
+
+    let shutdown = CancellationToken::new();
+
+    let event_sink = Arc::new(EventSinkHandle::Noop);
+    let events_flush_interval = config.db.events_flush_interval_sec.max(1);
+    let events_queue_capacity = config.db.events_queue_capacity.max(1);
+
+    let event_recorder = EventRecorder::new(
+        Arc::clone(&event_sink),
+        Arc::from(config.network.name.as_str()),
+        Duration::from_secs(events_flush_interval),
+        events_queue_capacity,
+        shutdown.clone(),
+    );
+
+    let violation_sink = InMemoryViolationSink::default();
+    let core = build_shared_harness_core(
+        Arc::clone(&config),
+        config_path,
+        event_recorder,
+        true,
+        ViolationSinkHandle::InMemory(violation_sink.clone()),
+    )
+    .await;
+
+    let state = core.state;
+
+    let router = Router::new()
+        .hoop(affix_state::inject(state))
+        .hoop(prepare_rate_limit_context)
+        .push(
+            Router::with_path("/add_task")
+                .hoop(dynamic_add_task_size_limit)
+                .hoop(basic_rate_limit)
+                .hoop(api_or_generic_key_check)
+                .post(add_task_handler),
+        )
+        .push(
+            Router::with_path("/get_version")
+                .hoop(dynamic_request_size_limit)
+                .get(version_handler),
+        )
+        .push(
+            Router::with_path("/id")
+                .hoop(dynamic_request_size_limit)
+                .get(id_handler),
+        );
+
+    let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
+
+    ViolationTestHarness {
+        service,
+        api_key: core.generic_key,
+        violation_tracker: core.violation_tracker,
+        violation_sink,
+        shutdown,
+        _config_file: config_file,
     }
 }
 

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures_util::SinkExt;
+use serde_json::Value as JsonValue;
 use tokio_postgres::types::ToSql;
 
 use super::connection::StmtKey;
@@ -127,6 +128,11 @@ reason, \
 gateway_name, \
 created_at\
 ) FROM STDIN WITH (FORMAT text)";
+
+    const Q_INSERT_RATE_LIMIT_VIOLATION: &'static str = r#"
+INSERT INTO rate_limit_violations (gateway_name, total_count, details)
+VALUES ($1, $2, $3)
+"#;
 
     pub async fn fetch_all_user_key_hashes(
         &self,
@@ -381,6 +387,25 @@ created_at\
                 Err(err)
             }
         }
+    }
+
+    /// Inserts a single aggregated rate-limit violation snapshot.
+    pub async fn record_violations_batch(
+        &self,
+        gateway_name: &str,
+        total_count: u64,
+        details: &JsonValue,
+    ) -> Result<()> {
+        let client = self.load_client().await?;
+        let count = total_count as i64;
+        client
+            .execute(
+                Self::Q_INSERT_RATE_LIMIT_VIOLATION,
+                &[&gateway_name, &count, details],
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to insert rate-limit violation: {}", e))?;
+        Ok(())
     }
 }
 

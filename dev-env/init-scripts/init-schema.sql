@@ -160,3 +160,15 @@ CREATE INDEX IF NOT EXISTS idx_worker_events_worker_year ON worker_events(worker
 CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_week ON worker_events(worker_id, action, bucket_week);
 CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_month ON worker_events(worker_id, action, bucket_month);
 CREATE INDEX IF NOT EXISTS idx_worker_events_worker_action_year ON worker_events(worker_id, action, bucket_year);
+
+-- Batched rate-limit violation snapshots.
+-- Each row is one periodic flush from a single gateway instance.
+-- `details` is a JSONB object mapping "client_identifier:limiter_name" -> count.
+CREATE TABLE IF NOT EXISTS rate_limit_violations (
+  id BIGSERIAL PRIMARY KEY,
+  gateway_name VARCHAR(255) NOT NULL,
+  total_count BIGINT NOT NULL,
+  details JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC')
+);
+CREATE INDEX IF NOT EXISTS idx_rlv_gateway_created ON rate_limit_violations(gateway_name, created_at DESC);

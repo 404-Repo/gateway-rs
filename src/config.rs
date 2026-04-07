@@ -192,6 +192,8 @@ pub struct DbConfig {
     pub events_copy_batch_size: usize,
     #[serde(default = "default_events_queue_capacity")]
     pub events_queue_capacity: usize,
+    #[serde(default = "default_violation_flush_interval_sec")]
+    pub violation_flush_interval_sec: u64,
 }
 
 fn default_deleted_keys_ttl_minutes() -> u64 {
@@ -208,6 +210,10 @@ fn default_events_copy_batch_size() -> usize {
 
 fn default_events_queue_capacity() -> usize {
     50_000
+}
+
+fn default_violation_flush_interval_sec() -> u64 {
+    60
 }
 
 fn default_max_concurrent_image_uploads() -> usize {
