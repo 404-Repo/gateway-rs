@@ -6,7 +6,8 @@ pub use crate::http3::handlers::result::{get_result_handler, get_status_handler}
 pub use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 pub use crate::http3::rate_limits::CompanyRateLimit;
 pub use crate::http3::rate_limits::{
-    RateLimitContext, RateLimiters, basic_rate_limit, prepare_rate_limit_context,
+    RateLimitContext, RateLimiters, UnauthorizedDailyLimiter, basic_rate_limit,
+    prepare_rate_limit_context,
 };
 pub use crate::http3::response::custom_response;
 pub use crate::http3::state::{HttpState, HttpStateInit};
@@ -14,7 +15,7 @@ pub use crate::http3::upload_limiter::ImageUploadLimiter;
 pub use crate::http3::whitelist::RateLimitWhitelist;
 pub use crate::raft::gateway_state::{GatewayState, GatewayStateInit};
 pub use crate::raft::network::Network;
-pub use crate::raft::rate_limit::{DistributedRateLimiter, RateLimitService};
+pub use crate::raft::rate_limit::{DistributedRateLimiter, RateLimitPolicies, RateLimitService};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,15 +28,16 @@ use salvo::http::request::SecureMaxSize;
 use salvo::prelude::*;
 use uuid::Uuid;
 
-use crate::api::Task;
 use crate::api::response::GatewayInfo;
-use crate::common::queue::DupQueue;
+use crate::common::queue::TaskQueue;
 use crate::config::NodeConfig;
 use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
-use crate::db::{ApiKeyValidator, Database, EventRecorder};
+use crate::db::{
+    ApiKeyValidator, ApiKeyValidatorConfig, Database, EventRecorder, TaskLifecycleStoreHandle,
+    api_key_sync_interval,
+};
 use crate::metrics::Metrics;
-use crate::raft::store::RateLimitMutation;
 use crate::raft::{LogStore, StateMachineStore};
 use crate::task::{TaskManager, TaskManagerInit};
 
@@ -73,7 +75,7 @@ pub struct MultipartFilePart<'a> {
 
 pub struct SharedHarnessCore {
     pub generic_key: Uuid,
-    pub task_queue: DupQueue<Task>,
+    pub task_queue: TaskQueue,
     pub task_manager: TaskManager,
     pub key_validator: Arc<ApiKeyValidator>,
     pub state: HttpState,
@@ -96,33 +98,37 @@ pub async fn build_shared_harness_core(
 
     let metrics = Metrics::new(0.05).expect("metrics");
 
-    let task_queue: DupQueue<Task> = DupQueue::<Task>::builder()
+    let task_queue = TaskQueue::builder()
         .dup(config.basic.unique_workers_per_task)
         .ttl(config.basic.taskqueue_task_ttl)
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
+        .default_model(config.model_config.default_model.clone())
+        .models(config.model_config.models.keys().cloned())
         .build();
 
     let db = Arc::new(Database::new_mock());
     let key_validator = Arc::new(
         ApiKeyValidator::new(
             Arc::clone(&db),
-            Duration::from_secs(config.db.api_keys_update_interval),
-            config.db.keys_cache_ttl_sec,
-            config.db.keys_cache_initial_capacity,
-            config.db.keys_cache_max_capacity,
-            &config.http.api_key_secret,
-            config.db.deleted_keys_ttl_minutes,
+            ApiKeyValidatorConfig {
+                update_interval: api_key_sync_interval(config.db.api_keys_update_interval),
+                cache_ttl_sec: config.db.keys_cache_ttl_sec,
+                cache_initial_capacity: config.db.keys_cache_initial_capacity,
+                cache_max_capacity: config.db.keys_cache_max_capacity,
+                api_key_secret: &config.http.api_key_secret,
+                negative_cache_ttl_sec: config.http.invalid_api_key_negative_cache_ttl_sec,
+                unknown_key_ip_miss_ttl_sec: config.http.invalid_api_key_ip_miss_ttl_sec,
+                unknown_key_ip_cooldown_ttl_sec: config.http.invalid_api_key_ip_cooldown_ttl_sec,
+                unknown_key_ip_cache_capacity: config.http.invalid_api_key_ip_cache_capacity,
+                unknown_key_ip_miss_limit: config.http.invalid_api_key_ip_miss_limit,
+                deleted_keys_ttl_minutes: config.db.deleted_keys_ttl_minutes,
+                fallback_generic_key: Some(generic_key),
+            },
         )
         .expect("api key validator"),
     );
 
     let state_machine_store = Arc::new(StateMachineStore::default());
-    {
-        let mut sm = state_machine_store.state_machine.write().await;
-        let serialized_key = rmp_serde::to_vec(&generic_key).expect("serialize key");
-        sm.data.insert("generic_key".to_string(), serialized_key);
-    }
-
     let node_clients =
         scc::HashMap::with_capacity_and_hasher(1, foldhash::fast::RandomState::default());
     let network = Network::new(Arc::new(node_clients));
@@ -177,7 +183,8 @@ pub async fn build_shared_harness_core(
             .insert(config.network.node_id.to_string(), gateway_bytes);
     }
 
-    let rate_limit_mutation_queue = Arc::new(scc::Queue::<RateLimitMutation>::default());
+    let rate_limit_mutation_queue =
+        crate::common::rate_limit_buffer::RateLimitMutationBuffer::default();
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: config.basic.taskmanager_initial_capacity,
         expected_results: config.basic.unique_workers_per_task,
@@ -193,10 +200,10 @@ pub async fn build_shared_harness_core(
         state: Arc::clone(&state_machine_store),
         raft,
         last_task_acquisition: Arc::new(AtomicU64::new(0)),
-        key_validator_updater: key_validator.clone(),
+        task_lifecycle_store: TaskLifecycleStoreHandle::Noop(Default::default()),
+        api_key_validator: key_validator.clone(),
         task_manager: task_manager.clone(),
         config: Arc::clone(&runtime_config),
-        rate_limit_queue: rate_limit_mutation_queue,
         event_recorder,
     });
 
@@ -205,6 +212,7 @@ pub async fn build_shared_harness_core(
         gateway_state,
         task_queue: task_queue.clone(),
         metrics,
+        unauthorized_daily_limiter: Arc::new(UnauthorizedDailyLimiter::new()),
     });
 
     SharedHarnessCore {

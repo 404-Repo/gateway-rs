@@ -18,37 +18,50 @@ pub struct ClientKey {
 
 #[derive(Copy, Clone, Default)]
 pub struct Window {
-    pub hour_epoch: u64,
     pub day_epoch: u64,
-    // Local increments waiting to be reconciled with the cluster snapshot
-    pub hour: u32,
+    pub active: u32,
+    /// Local increments waiting to be reconciled with the cluster snapshot
     pub day: u32,
-    // Cluster totals last observed, used to drop already-applied pending counts
-    pub cluster_hour_seen: u64,
+    pub cluster_active_seen: u64,
+    /// Cluster totals last observed, used to drop already-applied pending counts
     pub cluster_day_seen: u64,
 }
 
 struct EpochCache {
-    hour_epoch: AtomicU64,
     day_epoch: AtomicU64,
 }
 
 #[derive(Copy, Clone)]
 struct ClusterCacheEntry {
-    hour_epoch: u64,
+    active: u64,
     day_epoch: u64,
-    hour: u64,
     day: u64,
     updated_at: Instant,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RateLimitRejection {
+    Active,
+    Daily,
 }
 
 pub struct ClusterUsageParams {
     pub subject: Subject,
     pub id: u128,
-    pub hourly_limit: u64,
+    pub active_limit: u64,
     pub daily_limit: u64,
     pub require_day_match: bool,
-    pub epochs: (u64, u64),
+    pub day_epoch: u64,
+}
+
+#[derive(Copy, Clone)]
+pub struct CheckAndIncrParams {
+    pub key: ClientKey,
+    pub active_limit: u64,
+    pub daily_limit: u64,
+    pub cluster_active: u64,
+    pub cluster_day: u64,
+    pub day_epoch: u64,
 }
 
 const EPOCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -67,20 +80,21 @@ impl DistributedRateLimiter {
     pub fn new(max_capacity: usize) -> Self {
         let max_capacity = max_capacity.max(1);
         let min_capacity = max_capacity.min(8192);
-        let (hour_epoch, day_epoch) = Self::current_epochs();
+        let day_epoch = Self::current_day_epoch();
         let epoch_cache = Arc::new(EpochCache {
-            hour_epoch: AtomicU64::new(hour_epoch),
             day_epoch: AtomicU64::new(day_epoch),
         });
         let refresh_enabled = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                let cache = Arc::clone(&epoch_cache);
+                let cache = Arc::downgrade(&epoch_cache);
                 handle.spawn(async move {
                     let mut tick = interval(EPOCH_REFRESH_INTERVAL);
                     loop {
                         tick.tick().await;
-                        let (hour_epoch, day_epoch) = DistributedRateLimiter::current_epochs();
-                        cache.hour_epoch.store(hour_epoch, Ordering::Relaxed);
+                        let Some(cache) = cache.upgrade() else {
+                            break;
+                        };
+                        let day_epoch = DistributedRateLimiter::current_day_epoch();
                         cache.day_epoch.store(day_epoch, Ordering::Relaxed);
                     }
                 });
@@ -105,71 +119,65 @@ impl DistributedRateLimiter {
         }
     }
 
-    pub(crate) fn current_epochs() -> (u64, u64) {
+    pub(crate) fn current_day_epoch() -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        (now / 3600, now / 86400)
+        now / 86400
     }
 
-    pub fn epochs(&self) -> (u64, u64) {
+    pub fn day_epoch(&self) -> u64 {
         if !self.refresh_enabled {
-            return Self::current_epochs();
+            return Self::current_day_epoch();
         }
-        (
-            self.epoch_cache.hour_epoch.load(Ordering::Relaxed),
-            self.epoch_cache.day_epoch.load(Ordering::Relaxed),
-        )
+        self.epoch_cache.day_epoch.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn epoch_cache_weak(&self) -> std::sync::Weak<EpochCache> {
+        Arc::downgrade(&self.epoch_cache)
     }
 
     pub async fn check_and_incr(
         &self,
-        key: ClientKey,
-        hourly_limit: u64,
-        daily_limit: u64,
-        cluster_hour: u64,
-        cluster_day: u64,
-        epochs: (u64, u64),
-    ) -> bool {
-        if hourly_limit == 0 && daily_limit == 0 {
-            return true;
+        params: CheckAndIncrParams,
+    ) -> Result<(), RateLimitRejection> {
+        let CheckAndIncrParams {
+            key,
+            active_limit,
+            daily_limit,
+            cluster_active,
+            cluster_day,
+            day_epoch,
+        } = params;
+        if active_limit == 0 && daily_limit == 0 {
+            return Ok(());
         }
 
-        let (hour_epoch, day_epoch) = epochs;
-        let mut allowed = true;
+        let mut rejection = None;
         self.inner
             .entry_async(key)
             .await
             .and_modify(|w| {
-                // On hour rollover, reset local tally against the fresh snapshot
-                if w.hour_epoch != hour_epoch {
-                    w.hour = 0;
-                    w.hour_epoch = hour_epoch;
-                    w.cluster_hour_seen = cluster_hour;
-                }
-                // Same for the day window
+                // On day rollover, reset local tally against the fresh snapshot
                 if w.day_epoch != day_epoch {
                     w.day = 0;
                     w.day_epoch = day_epoch;
                     w.cluster_day_seen = cluster_day;
                 }
 
-                if hourly_limit == 0 {
-                    w.hour = 0;
-                    w.cluster_hour_seen = cluster_hour;
-                } else {
-                    // Drop local pending counts already reflected in the cluster snapshot
-                    if let Some(delta) = cluster_hour.checked_sub(w.cluster_hour_seen)
-                        && delta > 0
-                    {
-                        let to_sub = delta.min(w.hour as u64) as u32;
-                        w.hour = w.hour.saturating_sub(to_sub);
-                        w.cluster_hour_seen = cluster_hour;
-                    } else if cluster_hour < w.cluster_hour_seen {
-                        // Cluster counters can decrease when refunded; reset baseline.
-                        w.cluster_hour_seen = cluster_hour;
-                    }
+                if active_limit == 0 {
+                    w.active = 0;
+                    w.cluster_active_seen = cluster_active;
+                } else if let Some(delta) = cluster_active.checked_sub(w.cluster_active_seen)
+                    && delta > 0
+                {
+                    let to_sub = delta.min(w.active as u64) as u32;
+                    w.active = w.active.saturating_sub(to_sub);
+                    w.cluster_active_seen = cluster_active;
+                } else if cluster_active < w.cluster_active_seen {
+                    w.cluster_active_seen = cluster_active;
                 }
 
                 if daily_limit == 0 {
@@ -187,8 +195,8 @@ impl DistributedRateLimiter {
                 }
 
                 // Combine cluster totals with remaining local increments
-                let eff_hour_total = if hourly_limit > 0 {
-                    cluster_hour + w.hour as u64
+                let eff_active_total = if active_limit > 0 {
+                    cluster_active + w.active as u64
                 } else {
                     0
                 };
@@ -198,32 +206,39 @@ impl DistributedRateLimiter {
                     0
                 };
 
-                if (hourly_limit > 0 && eff_hour_total >= hourly_limit)
+                if (active_limit > 0 && eff_active_total >= active_limit)
                     || (daily_limit > 0 && eff_day_total >= daily_limit)
                 {
-                    allowed = false;
+                    rejection = Some(if active_limit > 0 && eff_active_total >= active_limit {
+                        RateLimitRejection::Active
+                    } else {
+                        RateLimitRejection::Daily
+                    });
                     return;
                 }
 
-                if hourly_limit > 0 {
-                    w.hour = w.hour.saturating_add(1);
+                if active_limit > 0 {
+                    w.active = w.active.saturating_add(1);
                 }
                 if daily_limit > 0 {
                     w.day = w.day.saturating_add(1);
                 }
             })
             .or_put_with(|| {
-                let allow_initial = !((hourly_limit > 0 && cluster_hour >= hourly_limit)
+                let allow_initial = !((active_limit > 0 && cluster_active >= active_limit)
                     || (daily_limit > 0 && cluster_day >= daily_limit));
 
                 if !allow_initial {
-                    allowed = false;
+                    rejection = Some(if active_limit > 0 && cluster_active >= active_limit {
+                        RateLimitRejection::Active
+                    } else {
+                        RateLimitRejection::Daily
+                    });
                 }
 
                 Window {
-                    hour_epoch,
                     day_epoch,
-                    hour: if allow_initial && hourly_limit > 0 {
+                    active: if allow_initial && active_limit > 0 {
                         1
                     } else {
                         0
@@ -233,39 +248,37 @@ impl DistributedRateLimiter {
                     } else {
                         0
                     },
-                    cluster_hour_seen: cluster_hour,
+                    cluster_active_seen: cluster_active,
                     cluster_day_seen: cluster_day,
                 }
             });
 
-        allowed
+        rejection.map_or(Ok(()), Err)
     }
 
     pub async fn rollback_pending(
         &self,
         key: ClientKey,
-        hour_decrement: u32,
+        active_decrement: u32,
         day_decrement: u32,
-        epochs: (u64, u64),
+        day_epoch: u64,
     ) {
-        if hour_decrement == 0 && day_decrement == 0 {
+        if active_decrement == 0 && day_decrement == 0 {
             return;
         }
 
-        let (hour_epoch, day_epoch) = epochs;
         self.inner
             .entry_async(key)
             .await
             .and_modify(|w| {
-                if hour_decrement > 0 && w.hour_epoch == hour_epoch {
-                    w.hour = w.hour.saturating_sub(hour_decrement);
+                if active_decrement > 0 {
+                    w.active = w.active.saturating_sub(active_decrement);
                 }
                 if day_decrement > 0 && w.day_epoch == day_epoch {
                     w.day = w.day.saturating_sub(day_decrement);
                 }
             })
             .or_put_with(|| Window {
-                hour_epoch,
                 day_epoch,
                 ..Window::default()
             });
@@ -275,60 +288,50 @@ impl DistributedRateLimiter {
         let ClusterUsageParams {
             subject,
             id,
-            hourly_limit,
+            active_limit,
             daily_limit,
             require_day_match,
-            epochs,
+            day_epoch,
         } = params;
         let now = Instant::now();
         let key = ClientKey { subject, id };
-        let (hour_epoch, day_epoch) = epochs;
 
+        if let Some(cached) = self.cluster_cache.read_async(&key, |_, entry| *entry).await {
+            let is_fresh = now.duration_since(cached.updated_at) <= CLUSTER_CACHE_TTL;
+            let epoch_match = !require_day_match || cached.day_epoch == day_epoch;
+            let near_active_limit = active_limit > 0
+                && cached.active.saturating_add(CLUSTER_CACHE_REFRESH_MARGIN) >= active_limit;
+            let near_day_limit = require_day_match
+                && daily_limit > 0
+                && cached.day.saturating_add(CLUSTER_CACHE_REFRESH_MARGIN) >= daily_limit;
+
+            if is_fresh && epoch_match && !near_active_limit && !near_day_limit {
+                let day = if require_day_match { cached.day } else { 0 };
+                return (cached.active, day);
+            }
+        }
+
+        let (active, day) = gs.get_cluster_rate_usage(subject, id, day_epoch).await;
         match self.cluster_cache.entry_async(key).await {
             CacheEntry::Occupied(mut entry) => {
-                let cached = *entry.get();
-                let is_fresh = now.duration_since(cached.updated_at) <= CLUSTER_CACHE_TTL;
-                let epoch_match = cached.hour_epoch == hour_epoch
-                    && (!require_day_match || cached.day_epoch == day_epoch);
-                let near_hour_limit = hourly_limit > 0
-                    && cached.hour.saturating_add(CLUSTER_CACHE_REFRESH_MARGIN) >= hourly_limit;
-                let near_day_limit = require_day_match
-                    && daily_limit > 0
-                    && cached.day.saturating_add(CLUSTER_CACHE_REFRESH_MARGIN) >= daily_limit;
-
-                if is_fresh && epoch_match && !near_hour_limit && !near_day_limit {
-                    let day = if require_day_match { cached.day } else { 0 };
-                    return (cached.hour, day);
-                }
-
-                let (hour, day) = gs
-                    .get_cluster_rate_usage(subject, id, hour_epoch, day_epoch)
-                    .await;
                 *entry.get_mut() = ClusterCacheEntry {
-                    hour_epoch,
+                    active,
                     day_epoch,
-                    hour,
                     day,
                     updated_at: now,
                 };
-                let day = if require_day_match { day } else { 0 };
-                (hour, day)
             }
             CacheEntry::Vacant(entry) => {
-                let (hour, day) = gs
-                    .get_cluster_rate_usage(subject, id, hour_epoch, day_epoch)
-                    .await;
                 entry.put_entry(ClusterCacheEntry {
-                    hour_epoch,
+                    active,
                     day_epoch,
-                    hour,
                     day,
                     updated_at: now,
                 });
-                let day = if require_day_match { day } else { 0 };
-                (hour, day)
             }
         }
+        let day = if require_day_match { day } else { 0 };
+        (active, day)
     }
 }
 
@@ -337,20 +340,22 @@ mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use crate::config_runtime::RuntimeConfigStore;
-    use crate::crypto::crypto_provider::init_crypto_provider;
-    use crate::db::{ApiKeyValidator, Database, EventRecorder, EventSinkHandle};
+    use crate::db::{
+        ApiKeyValidator, ApiKeyValidatorConfig, Database, EventRecorder, EventSinkHandle,
+        TaskLifecycleStoreHandle, api_key_sync_interval,
+    };
     use crate::metrics::Metrics;
     use crate::raft::gateway_state::{GatewayState, GatewayStateInit};
     use crate::raft::network::Network;
     use crate::raft::store::{RateLimitDelta, RateLimitMutation};
+    use crate::raft::test_utils::ensure_crypto_provider_for_tests;
     use crate::raft::{LogStore, StateMachineStore};
     use crate::task::TaskManager;
     use openraft::BasicNode;
-    use scc::Queue;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Arc, Once};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -358,8 +363,6 @@ mod tests {
     const USER_SUBJECT_ID: u128 = 101;
     const COMPANY_SUBJECT_ID: u128 = 202;
     const GENERIC_IP_SUBJECT_ID: u128 = 303;
-
-    static TEST_CRYPTO_INIT: Once = Once::new();
 
     fn load_single_node_config() -> (NodeConfig, PathBuf) {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -370,9 +373,7 @@ mod tests {
     }
 
     async fn build_gateway_state() -> GatewayState {
-        TEST_CRYPTO_INIT.call_once(|| {
-            init_crypto_provider().expect("crypto provider init must succeed");
-        });
+        ensure_crypto_provider_for_tests();
 
         let (config, config_path) = load_single_node_config();
         let config = Arc::new(config);
@@ -386,12 +387,22 @@ mod tests {
         let key_validator = Arc::new(
             ApiKeyValidator::new(
                 Arc::clone(&db),
-                Duration::from_secs(config.db.api_keys_update_interval),
-                config.db.keys_cache_ttl_sec,
-                config.db.keys_cache_initial_capacity,
-                config.db.keys_cache_max_capacity,
-                &config.http.api_key_secret,
-                config.db.deleted_keys_ttl_minutes,
+                ApiKeyValidatorConfig {
+                    update_interval: api_key_sync_interval(config.db.api_keys_update_interval),
+                    cache_ttl_sec: config.db.keys_cache_ttl_sec,
+                    cache_initial_capacity: config.db.keys_cache_initial_capacity,
+                    cache_max_capacity: config.db.keys_cache_max_capacity,
+                    api_key_secret: &config.http.api_key_secret,
+                    negative_cache_ttl_sec: config.http.invalid_api_key_negative_cache_ttl_sec,
+                    unknown_key_ip_miss_ttl_sec: config.http.invalid_api_key_ip_miss_ttl_sec,
+                    unknown_key_ip_cooldown_ttl_sec: config
+                        .http
+                        .invalid_api_key_ip_cooldown_ttl_sec,
+                    unknown_key_ip_cache_capacity: config.http.invalid_api_key_ip_cache_capacity,
+                    unknown_key_ip_miss_limit: config.http.invalid_api_key_ip_miss_limit,
+                    deleted_keys_ttl_minutes: config.db.deleted_keys_ttl_minutes,
+                    fallback_generic_key: config.http.generic_key,
+                },
             )
             .expect("api key validator"),
         );
@@ -450,15 +461,14 @@ mod tests {
             1024,
             shutdown,
         );
-        let rate_limit_queue = Arc::new(Queue::<RateLimitMutation>::default());
         GatewayState::new(GatewayStateInit {
             state: state_machine_store,
             raft,
             last_task_acquisition: Arc::new(AtomicU64::new(0)),
-            key_validator_updater: key_validator,
+            task_lifecycle_store: TaskLifecycleStoreHandle::Noop(Default::default()),
+            api_key_validator: key_validator,
             task_manager,
             config: runtime_config,
-            rate_limit_queue,
             event_recorder,
         })
     }
@@ -466,54 +476,53 @@ mod tests {
     async fn consume_once_and_sync_cluster(
         limiter: &DistributedRateLimiter,
         gateway_state: &GatewayState,
-        subject: Subject,
-        id: u128,
-        hourly_limit: u64,
-        daily_limit: u64,
-        require_day_match: bool,
+        params: ClusterUsageParams,
         add_day: u32,
     ) -> bool {
-        let epochs = limiter.epochs();
-        let (cluster_hour, cluster_day) = limiter
+        let day_epoch = limiter.day_epoch();
+        let (cluster_active, cluster_day) = limiter
             .cluster_usage(
                 gateway_state,
                 ClusterUsageParams {
-                    subject,
-                    id,
-                    hourly_limit,
-                    daily_limit,
-                    require_day_match,
-                    epochs,
+                    subject: params.subject,
+                    id: params.id,
+                    active_limit: params.active_limit,
+                    daily_limit: params.daily_limit,
+                    require_day_match: params.require_day_match,
+                    day_epoch,
                 },
             )
             .await;
 
         let allowed = limiter
-            .check_and_incr(
-                ClientKey { subject, id },
-                hourly_limit,
-                daily_limit,
-                cluster_hour,
+            .check_and_incr(CheckAndIncrParams {
+                key: ClientKey {
+                    subject: params.subject,
+                    id: params.id,
+                },
+                active_limit: params.active_limit,
+                daily_limit: params.daily_limit,
+                cluster_active,
                 cluster_day,
-                epochs,
-            )
-            .await;
+                day_epoch,
+            })
+            .await
+            .is_ok();
 
         if !allowed {
             return false;
         }
 
         gateway_state
-            .apply_rate_limit_deltas(
+            .apply_rate_limit_mutations(
                 Uuid::new_v4().as_u128(),
-                vec![RateLimitDelta {
-                    subject,
-                    id,
-                    hour_epoch: epochs.0,
-                    day_epoch: epochs.1,
-                    add_hour: 1,
+                vec![RateLimitMutation::from_delta(RateLimitDelta {
+                    subject: params.subject,
+                    id: params.id,
+                    day_epoch,
+                    add_active: u32::from(params.active_limit > 0),
                     add_day,
-                }],
+                })],
             )
             .await
             .expect("apply synced rate-limit delta");
@@ -531,11 +540,14 @@ mod tests {
             consume_once_and_sync_cluster(
                 &gateway_a,
                 &gateway_state,
-                Subject::User,
-                USER_SUBJECT_ID,
-                1,
-                0,
-                false,
+                ClusterUsageParams {
+                    subject: Subject::User,
+                    id: USER_SUBJECT_ID,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    require_day_match: false,
+                    day_epoch: 0,
+                },
                 0,
             )
             .await
@@ -544,11 +556,14 @@ mod tests {
             !consume_once_and_sync_cluster(
                 &gateway_b,
                 &gateway_state,
-                Subject::User,
-                USER_SUBJECT_ID,
-                1,
-                0,
-                false,
+                ClusterUsageParams {
+                    subject: Subject::User,
+                    id: USER_SUBJECT_ID,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    require_day_match: false,
+                    day_epoch: 0,
+                },
                 0,
             )
             .await
@@ -565,11 +580,14 @@ mod tests {
             consume_once_and_sync_cluster(
                 &gateway_a,
                 &gateway_state,
-                Subject::Company,
-                COMPANY_SUBJECT_ID,
-                3,
-                1,
-                true,
+                ClusterUsageParams {
+                    subject: Subject::Company,
+                    id: COMPANY_SUBJECT_ID,
+                    active_limit: 1,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
             )
             .await
@@ -578,11 +596,14 @@ mod tests {
             !consume_once_and_sync_cluster(
                 &gateway_b,
                 &gateway_state,
-                Subject::Company,
-                COMPANY_SUBJECT_ID,
-                3,
-                1,
-                true,
+                ClusterUsageParams {
+                    subject: Subject::Company,
+                    id: COMPANY_SUBJECT_ID,
+                    active_limit: 1,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
             )
             .await
@@ -599,12 +620,15 @@ mod tests {
             consume_once_and_sync_cluster(
                 &gateway_a,
                 &gateway_state,
-                Subject::GenericIp,
-                GENERIC_IP_SUBJECT_ID,
+                ClusterUsageParams {
+                    subject: Subject::GenericIp,
+                    id: GENERIC_IP_SUBJECT_ID,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
-                0,
-                false,
-                0,
             )
             .await
         );
@@ -612,12 +636,15 @@ mod tests {
             !consume_once_and_sync_cluster(
                 &gateway_b,
                 &gateway_state,
-                Subject::GenericIp,
-                GENERIC_IP_SUBJECT_ID,
+                ClusterUsageParams {
+                    subject: Subject::GenericIp,
+                    id: GENERIC_IP_SUBJECT_ID,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
-                0,
-                false,
-                0,
             )
             .await
         );
@@ -633,12 +660,15 @@ mod tests {
             consume_once_and_sync_cluster(
                 &gateway_a,
                 &gateway_state,
-                Subject::GenericGlobal,
-                GENERIC_GLOBAL_SUBJECT_ID,
+                ClusterUsageParams {
+                    subject: Subject::GenericGlobal,
+                    id: GENERIC_GLOBAL_SUBJECT_ID,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
-                0,
-                false,
-                0,
             )
             .await
         );
@@ -646,28 +676,68 @@ mod tests {
             !consume_once_and_sync_cluster(
                 &gateway_b,
                 &gateway_state,
-                Subject::GenericGlobal,
-                GENERIC_GLOBAL_SUBJECT_ID,
+                ClusterUsageParams {
+                    subject: Subject::GenericGlobal,
+                    id: GENERIC_GLOBAL_SUBJECT_ID,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    require_day_match: true,
+                    day_epoch: 0,
+                },
                 1,
-                0,
-                false,
-                0,
             )
             .await
         );
     }
 
     #[tokio::test]
-    async fn local_windows_reset_on_hour_and_day_rollover() {
+    async fn local_windows_reset_on_day_rollover() {
         let limiter = DistributedRateLimiter::new(64);
 
-        let user_key = ClientKey {
-            subject: Subject::User,
+        let generic_key = ClientKey {
+            subject: Subject::GenericGlobal,
             id: 808u128,
         };
-        assert!(limiter.check_and_incr(user_key, 1, 0, 0, 0, (10, 1)).await);
-        assert!(!limiter.check_and_incr(user_key, 1, 0, 0, 0, (10, 1)).await);
-        assert!(limiter.check_and_incr(user_key, 1, 0, 0, 0, (11, 1)).await);
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: generic_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 1,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: generic_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 1,
+                })
+                .await
+                .is_err()
+        );
+        // Day rollover resets window
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: generic_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 2,
+                })
+                .await
+                .is_ok()
+        );
 
         let company_key = ClientKey {
             subject: Subject::Company,
@@ -675,18 +745,42 @@ mod tests {
         };
         assert!(
             limiter
-                .check_and_incr(company_key, 0, 1, 0, 0, (11, 1))
+                .check_and_incr(CheckAndIncrParams {
+                    key: company_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 1,
+                })
                 .await
-        );
-        assert!(
-            !limiter
-                .check_and_incr(company_key, 0, 1, 0, 0, (11, 1))
-                .await
+                .is_ok()
         );
         assert!(
             limiter
-                .check_and_incr(company_key, 0, 1, 0, 0, (11, 2))
+                .check_and_incr(CheckAndIncrParams {
+                    key: company_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 1,
+                })
                 .await
+                .is_err()
+        );
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: company_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch: 2,
+                })
+                .await
+                .is_ok()
         );
     }
 
@@ -696,7 +790,7 @@ mod tests {
         let limiter = DistributedRateLimiter::new(64);
         let subject = Subject::GenericGlobal;
         let id = GENERIC_GLOBAL_SUBJECT_ID;
-        let epochs = limiter.epochs();
+        let day_epoch = limiter.day_epoch();
 
         let initial = limiter
             .cluster_usage(
@@ -704,26 +798,25 @@ mod tests {
                 ClusterUsageParams {
                     subject,
                     id,
-                    hourly_limit: 2,
-                    daily_limit: 0,
-                    require_day_match: false,
-                    epochs,
+                    active_limit: 0,
+                    daily_limit: 2,
+                    require_day_match: true,
+                    day_epoch,
                 },
             )
             .await;
         assert_eq!(initial, (0, 0));
 
         gateway_state
-            .apply_rate_limit_deltas(
+            .apply_rate_limit_mutations(
                 Uuid::new_v4().as_u128(),
-                vec![RateLimitDelta {
+                vec![RateLimitMutation::from_delta(RateLimitDelta {
                     subject,
                     id,
-                    hour_epoch: epochs.0,
-                    day_epoch: epochs.1,
-                    add_hour: 1,
-                    add_day: 0,
-                }],
+                    day_epoch,
+                    add_active: 0,
+                    add_day: 1,
+                })],
             )
             .await
             .expect("apply rate-limit delta");
@@ -734,20 +827,20 @@ mod tests {
                 ClusterUsageParams {
                     subject,
                     id,
-                    hourly_limit: 2,
-                    daily_limit: 0,
-                    require_day_match: false,
-                    epochs,
+                    active_limit: 0,
+                    daily_limit: 2,
+                    require_day_match: true,
+                    day_epoch,
                 },
             )
             .await;
-        assert_eq!(refreshed, (1, 0));
+        assert_eq!(refreshed, (0, 1));
     }
 
     #[tokio::test]
     async fn rollback_pending_restores_capacity_after_partial_success() {
         let limiter = DistributedRateLimiter::new(64);
-        let epochs = (42, 7);
+        let day_epoch = 7u64;
         let global_key = ClientKey {
             subject: Subject::GenericGlobal,
             id: GENERIC_GLOBAL_SUBJECT_ID,
@@ -757,11 +850,61 @@ mod tests {
             id: GENERIC_IP_SUBJECT_ID,
         };
 
-        assert!(limiter.check_and_incr(global_key, 1, 0, 0, 0, epochs).await);
-        assert!(!limiter.check_and_incr(ip_key, 1, 0, 1, 0, epochs).await);
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: global_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: ip_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 1,
+                    day_epoch,
+                })
+                .await
+                .is_err()
+        );
 
-        limiter.rollback_pending(global_key, 1, 0, epochs).await;
+        limiter.rollback_pending(global_key, 0, 1, day_epoch).await;
 
-        assert!(limiter.check_and_incr(global_key, 1, 0, 0, 0, epochs).await);
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key: global_key,
+                    active_limit: 0,
+                    daily_limit: 1,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresher_task_does_not_keep_epoch_cache_alive() {
+        let weak_cache = {
+            let limiter = DistributedRateLimiter::new(64);
+            limiter.epoch_cache_weak()
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            weak_cache.upgrade().is_none(),
+            "background refresher must not keep a dropped limiter alive"
+        );
     }
 }

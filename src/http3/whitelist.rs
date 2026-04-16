@@ -14,10 +14,19 @@ pub struct RateLimitWhitelist {
     pub ips: Arc<HashSet<IpAddr>>,
 }
 
+pub struct RateLimitWhitelistResolution {
+    pub ips: HashSet<IpAddr>,
+    pub had_resolution_failures: bool,
+}
+
 const DNS_RESOLVE_CONCURRENCY: usize = 32;
 
-async fn resolve_domains_best_effort(domains: Vec<String>, context: &str) -> HashSet<IpAddr> {
+async fn resolve_domains_best_effort(
+    domains: Vec<String>,
+    context: &str,
+) -> RateLimitWhitelistResolution {
     let mut ips = HashSet::new();
+    let mut had_resolution_failures = false;
     let mut resolutions = stream::iter(domains.into_iter())
         .map(|domain| async move {
             let result = lookup_all_host_ips(std::slice::from_ref(&domain)).await;
@@ -28,13 +37,25 @@ async fn resolve_domains_best_effort(domains: Vec<String>, context: &str) -> Has
     while let Some((domain, result)) = resolutions.next().await {
         match result {
             Ok(resolved) => ips.extend(resolved),
-            Err(err) => warn!("Failed to resolve {context} domain '{}': {}", domain, err),
+            Err(err) => {
+                had_resolution_failures = true;
+                warn!("Failed to resolve {context} domain '{}': {}", domain, err);
+            }
         }
     }
-    ips
+    RateLimitWhitelistResolution {
+        ips,
+        had_resolution_failures,
+    }
 }
 
 pub async fn resolve_rate_limit_whitelist(entries: &FoldHashSet<String>) -> HashSet<IpAddr> {
+    resolve_rate_limit_whitelist_with_status(entries).await.ips
+}
+
+pub async fn resolve_rate_limit_whitelist_with_status(
+    entries: &FoldHashSet<String>,
+) -> RateLimitWhitelistResolution {
     let mut ips = HashSet::new();
     let mut domains: Vec<String> = Vec::new();
 
@@ -46,11 +67,17 @@ pub async fn resolve_rate_limit_whitelist(entries: &FoldHashSet<String>) -> Hash
         }
     }
 
+    let mut had_resolution_failures = false;
     if !domains.is_empty() {
-        ips.extend(resolve_domains_best_effort(domains, "rate_limit_whitelist").await);
+        let resolved = resolve_domains_best_effort(domains, "rate_limit_whitelist").await;
+        ips.extend(resolved.ips);
+        had_resolution_failures = resolved.had_resolution_failures;
     }
 
-    ips
+    RateLimitWhitelistResolution {
+        ips,
+        had_resolution_failures,
+    }
 }
 
 pub async fn resolve_cluster_peer_ips(
@@ -66,11 +93,12 @@ pub async fn resolve_cluster_peer_ips(
         return HashSet::new();
     }
 
-    resolve_domains_best_effort(domains, "cluster peer").await
+    resolve_domains_best_effort(domains, "cluster peer")
+        .await
+        .ips
 }
 
 pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
-    let cfg = state.config();
     let remote_ip = match req.remote_addr() {
         salvo::conn::SocketAddr::IPv4(addr) => Some(IpAddr::V4(*addr.ip())),
         salvo::conn::SocketAddr::IPv6(addr) => Some(IpAddr::V6(*addr.ip())),
@@ -78,7 +106,7 @@ pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
     };
 
     if let Some(ip) = remote_ip {
-        return cfg.rate_limit_whitelist().ips.contains(&ip);
+        return state.gateway_state().is_rate_limit_whitelisted_ip(&ip);
     }
     false
 }

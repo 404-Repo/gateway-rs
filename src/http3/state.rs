@@ -1,9 +1,9 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use crate::api::Task;
-use crate::common::queue::DupQueue;
+use crate::common::queue::TaskQueue;
 use crate::config_runtime::{RuntimeConfigStore, RuntimeConfigView};
+use crate::http3::rate_limits::UnauthorizedDailyLimiter;
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 
@@ -11,15 +11,17 @@ use crate::raft::gateway_state::GatewayState;
 pub struct HttpState {
     config: Arc<RuntimeConfigStore>,
     gateway_state: GatewayState,
-    task_queue: DupQueue<Task>,
+    task_queue: TaskQueue,
     metrics: Metrics,
+    unauthorized_daily_limiter: Arc<UnauthorizedDailyLimiter>,
 }
 
 pub struct HttpStateInit {
     pub config: Arc<RuntimeConfigStore>,
     pub gateway_state: GatewayState,
-    pub task_queue: DupQueue<Task>,
+    pub task_queue: TaskQueue,
     pub metrics: Metrics,
+    pub unauthorized_daily_limiter: Arc<UnauthorizedDailyLimiter>,
 }
 
 impl HttpState {
@@ -29,12 +31,14 @@ impl HttpState {
             gateway_state,
             task_queue,
             metrics,
+            unauthorized_daily_limiter,
         } = init;
         Self {
             config,
             gateway_state,
             task_queue,
             metrics,
+            unauthorized_daily_limiter,
         }
     }
 
@@ -50,12 +54,16 @@ impl HttpState {
         &self.gateway_state
     }
 
-    pub fn task_queue(&self) -> &DupQueue<Task> {
+    pub fn task_queue(&self) -> &TaskQueue {
         &self.task_queue
     }
 
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
+    }
+
+    pub fn unauthorized_daily_limiter(&self) -> &Arc<UnauthorizedDailyLimiter> {
+        &self.unauthorized_daily_limiter
     }
 
     pub fn is_cluster_ip(&self, ip: &IpAddr) -> bool {

@@ -1,16 +1,16 @@
 use anyhow::{Result, anyhow};
 use base64_simd::{AsOut, STANDARD};
 use blake2::{Blake2b512, Digest};
-use parity_scale_codec::{Decode, Encode};
 use schnorrkel::{PublicKey, Signature, context::signing_context};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::hotkey::Hotkey;
 
-const GATEWAY: &str = "404_GATEWAY_";
+pub const GATEWAY_TIMESTAMP_PREFIX: &str = "404_GATEWAY_";
+const GATEWAY: &str = GATEWAY_TIMESTAMP_PREFIX;
 const SIGNING_CTX: &[u8] = b"substrate";
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Encode, Decode)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AccountId32(pub [u8; 32]);
 
 impl TryFrom<&[u8]> for AccountId32 {

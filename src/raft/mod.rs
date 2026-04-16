@@ -11,12 +11,36 @@ mod tests;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+use crate::api::request::GatewayInfoExtRef;
+use crate::api::response::GatewayInfoRef;
+use crate::common::cert::generate_and_create_keycert;
+use crate::common::cert::load_certificates;
+use crate::common::cert::load_private_key;
+use crate::common::queue::TaskQueue;
+use crate::common::rate_limit_buffer::RateLimitMutationBuffer;
+use crate::common::resolve::lookup_one_ip_per_host;
+use crate::config::{NodeConfig, TransportMode};
+use crate::config_runtime::RuntimeConfigStore;
+use crate::crypto::crypto_provider::init_crypto_provider;
+use crate::db::{
+    ApiKeyValidator, ApiKeyValidatorConfig, DatabaseBuilder, EventRecorder, EventSinkHandle,
+    GatewayRuntimeSettingsStore, TaskLifecycleStoreHandle, api_key_sync_interval,
+};
+use crate::http3::client::Http3Client;
+use crate::http3::client::Http3ClientBuilder;
+use crate::http3::server::Http3Server;
+use crate::metrics::Metrics;
+use crate::raft::client::RClient;
+use crate::raft::client::RClientBuilder;
+use crate::raft::store::RateLimitMutationBatch;
+use crate::raft::store::Request;
+use crate::raft::store::Response;
+use crate::task::{TaskManager, TaskManagerInit};
 use anyhow::Result;
 use anyhow::bail;
 use backon::BackoffBuilder;
 use backon::ConstantBuilder;
 use backon::Retryable;
-use foldhash::HashMap as FoldHashMap;
 use foldhash::fast::RandomState;
 use futures_util::future::try_join_all;
 use gateway_state::{GatewayState, GatewayStateInit};
@@ -25,7 +49,6 @@ use network::Network;
 use openraft::BasicNode;
 use salvo::conn::rustls::Keycert;
 use salvo::conn::rustls::RustlsConfig;
-use scc::Queue;
 use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -39,34 +62,13 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
-use uuid::Uuid;
 
-use crate::api::Task;
-use crate::api::request::GatewayInfoExtRef;
-use crate::api::response::GatewayInfoRef;
-use crate::common::cert::generate_and_create_keycert;
-use crate::common::cert::load_certificates;
-use crate::common::cert::load_private_key;
-use crate::common::queue::DupQueue;
-use crate::common::resolve::lookup_one_ip_per_host;
-use crate::config::NodeConfig;
-use crate::config_runtime::RuntimeConfigStore;
-use crate::crypto::crypto_provider::init_crypto_provider;
-use crate::db::{ApiKeyValidator, DatabaseBuilder, EventRecorder, EventSinkHandle};
-use crate::http3::client::Http3Client;
-use crate::http3::client::Http3ClientBuilder;
-use crate::http3::server::Http3Server;
-use crate::metrics::Metrics;
-use crate::raft::client::RClient;
-use crate::raft::client::RClientBuilder;
-use crate::raft::store::Request;
-use crate::raft::store::Response;
-use crate::raft::store::{RateLimitMutation, Subject};
-use crate::task::{TaskManager, TaskManagerInit};
-use tokio_util::sync::CancellationToken;
+#[cfg(feature = "test-support")]
+use crate::db::ApiKeyLookup;
 
 pub type NodeId = u64;
 pub type LogStore = store::LogStore;
@@ -103,8 +105,13 @@ pub struct Gateway {
     server: RServer,
     gateway_info_updater: JoinHandle<()>,
     gateway_leader_change: JoinHandle<()>,
-    api_key_validator_updater: JoinHandle<()>,
+    api_key_cache_updater: JoinHandle<()>,
+    gateway_settings_updater: JoinHandle<()>,
+    task_lifecycle_reconciler: JoinHandle<()>,
+    _task_queue: TaskQueue,
     task_manager: TaskManager,
+    _api_key_validator: Arc<ApiKeyValidator>,
+    _event_recorder: EventRecorder,
     http_server: Http3Server,
     shutdown: CancellationToken,
 }
@@ -118,94 +125,38 @@ pub enum GatewayExit {
 }
 
 impl Gateway {
-    fn collect_pending_rate_limit_mutations(
-        rate_limit_queue: &Queue<RateLimitMutation>,
+    async fn collect_pending_rate_limit_mutations(
+        rate_limit_queue: &RateLimitMutationBuffer,
         max_mutations_in_batch: usize,
-        pending_mutations: &mut Vec<RateLimitMutation>,
-        pending_request_id: &mut Option<u128>,
+        pending_batch: &mut Option<RateLimitMutationBatch>,
     ) {
-        if pending_request_id.is_some() || !pending_mutations.is_empty() {
+        if pending_batch.is_some() {
             return;
         }
-
-        // Drain and coalesce pending rate limit mutations only when there is no in-flight batch.
-        let mut aggregated: FoldHashMap<(Subject, u128, u64, u64), (i64, i64)> =
-            FoldHashMap::with_capacity_and_hasher(
-                max_mutations_in_batch.min(1024),
-                RandomState::default(),
-            );
-        let mut raw_count = 0usize;
-        while let Some(entry) = rate_limit_queue.pop() {
-            let mutation = **entry;
-            raw_count += 1;
-            let key = (
-                mutation.subject,
-                mutation.id,
-                mutation.hour_epoch,
-                mutation.day_epoch,
-            );
-            aggregated
-                .entry(key)
-                .and_modify(|acc| {
-                    acc.0 = acc.0.saturating_add(mutation.hour_delta);
-                    acc.1 = acc.1.saturating_add(mutation.day_delta);
-                })
-                .or_insert((mutation.hour_delta, mutation.day_delta));
-            if raw_count == max_mutations_in_batch {
-                break;
-            }
-        }
-
-        let mut mutations = Vec::with_capacity(aggregated.len());
-        for ((subject, id, hour_epoch, day_epoch), (hour_delta, day_delta)) in aggregated {
-            if hour_delta == 0 && day_delta == 0 {
-                continue;
-            }
-            mutations.push(RateLimitMutation {
-                subject,
-                id,
-                hour_epoch,
-                day_epoch,
-                hour_delta,
-                day_delta,
-            });
-        }
-
-        if !mutations.is_empty() {
-            pending_request_id.get_or_insert_with(|| Uuid::new_v4().as_u128());
-            pending_mutations.extend(mutations);
-        }
+        *pending_batch = rate_limit_queue.drain_batch(max_mutations_in_batch).await;
     }
 
     async fn flush_pending_rate_limit_mutations(
         gateway_state: &GatewayState,
-        pending_mutations: &mut Vec<RateLimitMutation>,
-        pending_request_id: &mut Option<u128>,
+        pending_batch: &mut Option<RateLimitMutationBatch>,
         client: Option<&Http3Client>,
     ) {
-        if pending_mutations.is_empty() {
-            *pending_request_id = None;
+        let Some(batch) = pending_batch.as_ref() else {
             return;
-        }
-
-        let request_id = *pending_request_id.get_or_insert_with(|| Uuid::new_v4().as_u128());
-        let batch = Arc::new(std::mem::take(pending_mutations));
-        let submit_batch = Arc::clone(&batch);
+        };
 
         match gateway_state
-            .submit_rate_limit_mutations_with_request_id(request_id, submit_batch, client)
+            .submit_rate_limit_mutation_batch(batch, client)
             .await
         {
             Ok(_) => {
-                *pending_request_id = None;
+                *pending_batch = None;
             }
             Err(e) => {
                 warn!(
                     "Rate limit mutation flush failed, retaining batch for retry (request_id: {}): {}",
-                    request_id, e
+                    batch.request_id, e
                 );
-                *pending_mutations =
-                    Arc::try_unwrap(batch).unwrap_or_else(|arc| arc.as_ref().clone());
             }
         }
     }
@@ -213,15 +164,14 @@ impl Gateway {
     pub async fn gateway_info_updater(
         config: Arc<RuntimeConfigStore>,
         gateway_state: GatewayState,
-        task_queue: DupQueue<Task>,
+        task_queue: TaskQueue,
         last_task_acquisition: Arc<AtomicU64>,
-        rate_limit_queue: Arc<Queue<RateLimitMutation>>,
+        rate_limit_queue: RateLimitMutationBuffer,
         shutdown: CancellationToken,
     ) {
         let mut last_leader: Option<u64> = None;
         let mut client: Option<Http3Client> = None;
-        let mut pending_mutations: Vec<RateLimitMutation> = Vec::new();
-        let mut pending_request_id: Option<u128> = None;
+        let mut pending_batch: Option<RateLimitMutationBatch> = None;
 
         loop {
             let cfg = config.snapshot();
@@ -245,9 +195,9 @@ impl Gateway {
             Gateway::collect_pending_rate_limit_mutations(
                 &rate_limit_queue,
                 max_mutations_in_batch,
-                &mut pending_mutations,
-                &mut pending_request_id,
-            );
+                &mut pending_batch,
+            )
+            .await;
 
             let last_update = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -277,17 +227,16 @@ impl Gateway {
                 }
                 Gateway::flush_pending_rate_limit_mutations(
                     &gateway_state,
-                    &mut pending_mutations,
-                    &mut pending_request_id,
+                    &mut pending_batch,
                     None,
                 )
                 .await;
                 Gateway::collect_pending_rate_limit_mutations(
                     &rate_limit_queue,
                     max_mutations_in_batch,
-                    &mut pending_mutations,
-                    &mut pending_request_id,
-                );
+                    &mut pending_batch,
+                )
+                .await;
                 last_leader = Some(leader);
                 client = None;
                 continue;
@@ -341,34 +290,23 @@ impl Gateway {
                 }
                 Gateway::flush_pending_rate_limit_mutations(
                     &gateway_state,
-                    &mut pending_mutations,
-                    &mut pending_request_id,
+                    &mut pending_batch,
                     Some(client),
                 )
                 .await;
                 Gateway::collect_pending_rate_limit_mutations(
                     &rate_limit_queue,
                     max_mutations_in_batch,
-                    &mut pending_mutations,
-                    &mut pending_request_id,
-                );
+                    &mut pending_batch,
+                )
+                .await;
             }
         }
     }
 
-    pub async fn gateway_generic_key_update(
-        gateway_state: &GatewayState,
-        current_node_id: u64,
-        configured_key: Option<Uuid>,
-    ) -> Result<()> {
-        gateway_state
-            .update_gateway_generic_key(current_node_id, configured_key, None)
-            .await
-    }
-
     pub async fn gateway_leader_change(
         gateway_state: GatewayState,
-        current_node_id: u64,
+        _current_node_id: u64,
         shutdown: CancellationToken,
     ) {
         let mut metrics_rx = gateway_state.metrics().await;
@@ -387,23 +325,87 @@ impl Gateway {
             if current_leader != last_leader {
                 if let Some(leader_id) = current_leader {
                     info!("Leader changed to node {}", leader_id);
-                    if leader_id == current_node_id
-                        && let Err(err) = Gateway::gateway_generic_key_update(
-                            &gateway_state,
-                            current_node_id,
-                            gateway_state.preconfigured_generic_key(),
-                        )
-                        .await
-                    {
-                        warn!(
-                            "Failed to update generic key after leader change: {:?}",
-                            err
-                        );
-                    }
                 } else {
                     info!("Leadership changed, but no leader is elected yet");
                 }
                 last_leader = current_leader;
+            }
+        }
+    }
+
+    pub async fn task_lifecycle_reconciler(
+        gateway_state: GatewayState,
+        interval: Duration,
+        batch_size: i32,
+        terminal_task_retention: Duration,
+        shutdown: CancellationToken,
+    ) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or_else(|err| {
+                    error!(
+                        "SystemTime before UNIX EPOCH during task lifecycle reconciliation: {:?}",
+                        err
+                    );
+                    0
+                });
+
+            if gateway_state.leader().await != Some(gateway_state.current_node_id()) {
+                continue;
+            }
+
+            let retention_ms = terminal_task_retention
+                .as_millis()
+                .clamp(1, i64::MAX as u128) as i64;
+            let completed_before_ms = now_ms.saturating_sub(retention_ms);
+            let reconcile_limit = batch_size.max(1);
+
+            match gateway_state
+                .expire_generation_tasks(reconcile_limit, now_ms)
+                .await
+            {
+                Ok(expired_task_ids) => {
+                    if !expired_task_ids.is_empty() {
+                        info!(
+                            "Expired {} overdue generation tasks in the billing database",
+                            expired_task_ids.len()
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to reconcile overdue generation tasks in the billing database: {:?}",
+                        err
+                    );
+                }
+            }
+
+            match gateway_state
+                .purge_terminal_generation_tasks(reconcile_limit, completed_before_ms)
+                .await
+            {
+                Ok(purged_task_ids) => {
+                    if !purged_task_ids.is_empty() {
+                        info!(
+                            "Purged {} terminal generation tasks from the billing database",
+                            purged_task_ids.len()
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to purge terminal generation tasks from the billing database: {:?}",
+                        err
+                    );
+                }
             }
         }
     }
@@ -413,7 +415,9 @@ impl Gateway {
             server,
             gateway_info_updater,
             gateway_leader_change,
-            api_key_validator_updater,
+            api_key_cache_updater,
+            gateway_settings_updater,
+            task_lifecycle_reconciler,
             http_server,
             shutdown,
             ..
@@ -437,11 +441,44 @@ impl Gateway {
                 task: "gateway_leader_change",
                 result: res,
             },
-            res = api_key_validator_updater => GatewayExit::TaskStopped {
-                task: "api_key_validator_updater",
+            res = api_key_cache_updater => GatewayExit::TaskStopped {
+                task: "api_key_cache_updater",
+                result: res,
+            },
+            res = gateway_settings_updater => GatewayExit::TaskStopped {
+                task: "gateway_settings_updater",
+                result: res,
+            },
+            res = task_lifecycle_reconciler => GatewayExit::TaskStopped {
+                task: "task_lifecycle_reconciler",
                 result: res,
             },
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn task_queue(&self) -> TaskQueue {
+        self._task_queue.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn task_manager(&self) -> TaskManager {
+        self.task_manager.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn sync_db_caches_for_test(&self) -> Result<()> {
+        self._api_key_validator.sync_db_caches_for_test().await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn lookup_api_key_for_test(&self, api_key: &str) -> ApiKeyLookup {
+        self._api_key_validator.lookup(api_key).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn flush_events_for_test(&self) {
+        self._event_recorder.flush_once_for_test().await;
     }
 }
 
@@ -451,7 +488,9 @@ impl Drop for Gateway {
         self.http_server.abort();
         self.gateway_info_updater.abort();
         self.gateway_leader_change.abort();
-        self.api_key_validator_updater.abort();
+        self.api_key_cache_updater.abort();
+        self.gateway_settings_updater.abort();
+        self.task_lifecycle_reconciler.abort();
         self.server.abort();
         self.task_manager.abort();
     }
@@ -529,11 +568,13 @@ pub async fn get_node_ids(
     Ok(ids)
 }
 
-fn build_task_queue(cfg: &NodeConfig) -> DupQueue<Task> {
-    DupQueue::<Task>::builder()
+fn build_task_queue(cfg: &NodeConfig) -> TaskQueue {
+    TaskQueue::builder()
         .dup(cfg.basic.unique_workers_per_task)
         .ttl(cfg.basic.taskqueue_task_ttl)
         .cleanup_interval(cfg.basic.taskqueue_cleanup_interval)
+        .default_model(cfg.model_config.default_model.clone())
+        .models(cfg.model_config.models.keys().cloned())
         .build()
 }
 
@@ -689,6 +730,10 @@ pub async fn start_gateway(
     let cfg_view = config.snapshot();
     let cfg = cfg_view.node();
 
+    if cfg.http.transport == TransportMode::Plain && mode != GatewayMode::Single {
+        bail!("Plain HTTP transport is currently only supported in single-node mode");
+    }
+
     let clients_map = Arc::new(scc::HashMap::with_capacity_and_hasher(
         cfg.network.node_dns_names.len(),
         RandomState::default(),
@@ -774,15 +819,30 @@ pub async fn start_gateway(
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     ));
 
-    let db = Arc::new(DatabaseBuilder::from_config(&cfg.db).build().await?);
+    info!("Initializing PostgreSQL gateway state");
+    let db = Arc::new(
+        DatabaseBuilder::from_config(&cfg.db)
+            .shutdown_token(gateway_shutdown.clone())
+            .build()
+            .await?,
+    );
+    info!("PostgreSQL gateway state initialized");
     let api_key_validator = ApiKeyValidator::new(
         Arc::clone(&db),
-        Duration::from_secs(cfg.db.api_keys_update_interval),
-        cfg.db.keys_cache_ttl_sec,
-        cfg.db.keys_cache_initial_capacity,
-        cfg.db.keys_cache_max_capacity,
-        &cfg.http.api_key_secret,
-        cfg.db.deleted_keys_ttl_minutes,
+        ApiKeyValidatorConfig {
+            update_interval: api_key_sync_interval(cfg.db.api_keys_update_interval),
+            cache_ttl_sec: cfg.db.keys_cache_ttl_sec,
+            cache_initial_capacity: cfg.db.keys_cache_initial_capacity,
+            cache_max_capacity: cfg.db.keys_cache_max_capacity,
+            api_key_secret: &cfg.http.api_key_secret,
+            negative_cache_ttl_sec: cfg.http.invalid_api_key_negative_cache_ttl_sec,
+            unknown_key_ip_miss_ttl_sec: cfg.http.invalid_api_key_ip_miss_ttl_sec,
+            unknown_key_ip_cooldown_ttl_sec: cfg.http.invalid_api_key_ip_cooldown_ttl_sec,
+            unknown_key_ip_cache_capacity: cfg.http.invalid_api_key_ip_cache_capacity,
+            unknown_key_ip_miss_limit: cfg.http.invalid_api_key_ip_miss_limit,
+            deleted_keys_ttl_minutes: cfg.db.deleted_keys_ttl_minutes,
+            fallback_generic_key: cfg.http.generic_key,
+        },
     )?;
     let api_key_validator = Arc::new(api_key_validator);
     let events_flush_interval = cfg.db.events_flush_interval_sec.max(1);
@@ -796,13 +856,17 @@ pub async fn start_gateway(
         gateway_shutdown.clone(),
     );
 
-    let api_key_validator_updater = tokio::spawn(ApiKeyValidator::run(
+    let api_key_cache_updater = tokio::spawn(ApiKeyValidator::run(
         Arc::clone(&api_key_validator),
+        gateway_shutdown.clone(),
+    ));
+    let gateway_settings_updater = tokio::spawn(GatewayRuntimeSettingsStore::run(
+        api_key_validator.gateway_settings(),
         gateway_shutdown.clone(),
     ));
     let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
 
-    let rate_limit_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let rate_limit_queue = RateLimitMutationBuffer::default();
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: cfg.basic.taskmanager_initial_capacity,
         expected_results: cfg.basic.unique_workers_per_task,
@@ -818,24 +882,29 @@ pub async fn start_gateway(
         state: state_machine_store,
         raft: raft.clone(),
         last_task_acquisition: last_task_acquisition.clone(),
-        key_validator_updater: api_key_validator,
+        task_lifecycle_store: TaskLifecycleStoreHandle::Database(Arc::clone(&db)),
+        api_key_validator: Arc::clone(&api_key_validator),
         task_manager: task_manager.clone(),
         config: Arc::clone(&config),
-        rate_limit_queue: rate_limit_queue.clone(),
         event_recorder: event_recorder.clone(),
     });
 
-    let key_cert = if use_cert_files {
-        Keycert::new()
-            .cert_from_path(&cfg.cert.cert_file_path)?
-            .key_from_path(&cfg.cert.key_file_path)?
+    let http_tls_config = if cfg.http.transport == TransportMode::Tls {
+        let key_cert = if use_cert_files {
+            Keycert::new()
+                .cert_from_path(&cfg.cert.cert_file_path)?
+                .key_from_path(&cfg.cert.key_file_path)?
+        } else {
+            generate_and_create_keycert(vec!["localhost".to_string()])?
+        };
+        Some(RustlsConfig::new(key_cert))
     } else {
-        generate_and_create_keycert(vec!["localhost".to_string()])?
+        None
     };
 
     let http_server = match Http3Server::run(
         Arc::clone(&config),
-        RustlsConfig::new(key_cert),
+        http_tls_config,
         gateway_state.clone(),
         task_queue.clone(),
         metrics.clone(),
@@ -879,14 +948,21 @@ pub async fn start_gateway(
     let gateway_info_updater = tokio::spawn(Gateway::gateway_info_updater(
         Arc::clone(&config),
         gateway_state.clone(),
-        task_queue,
+        task_queue.clone(),
         last_task_acquisition,
         rate_limit_queue,
         gateway_shutdown.clone(),
     ));
     let gateway_leader_change = tokio::spawn(Gateway::gateway_leader_change(
-        gateway_state,
+        gateway_state.clone(),
         node_id,
+        gateway_shutdown.clone(),
+    ));
+    let task_lifecycle_reconciler = tokio::spawn(Gateway::task_lifecycle_reconciler(
+        gateway_state.clone(),
+        Duration::from_secs(cfg.basic.taskmanager_cleanup_interval.max(1)),
+        cfg.basic.taskmanager_initial_capacity.clamp(1, 512) as i32,
+        Duration::from_secs(cfg.basic.generation_task_retention_sec.max(1)),
         gateway_shutdown.clone(),
     ));
 
@@ -894,8 +970,13 @@ pub async fn start_gateway(
         server,
         gateway_info_updater,
         gateway_leader_change,
-        api_key_validator_updater,
+        api_key_cache_updater,
+        gateway_settings_updater,
+        task_lifecycle_reconciler,
+        _task_queue: task_queue,
         task_manager,
+        _api_key_validator: api_key_validator,
+        _event_recorder: event_recorder,
         http_server,
         shutdown: gateway_shutdown,
     })

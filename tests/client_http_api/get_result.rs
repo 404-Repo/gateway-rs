@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use futures_lite::io::AsyncReadExt;
 use http::StatusCode;
-use salvo::test::TestClient;
 use uuid::Uuid;
 
 use gateway::api::Task;
 
 use crate::support::{
-    HOTKEY_SEED_BASE, add_failure_result, add_success_result, add_task_image, add_task_prompt,
-    build_harness, hotkey_from_seed, read_response, tiny_png_bytes, tiny_spz_bytes,
+    HOTKEY_SEED_BASE, TestClient, add_failure_result, add_success_result, add_task_image,
+    add_task_prompt, add_task_prompt_with_api_key, build_harness, create_personal_api_key,
+    hotkey_from_seed, read_response, tiny_png_bytes, tiny_spz_bytes,
+    top_up_personal_api_key_balance,
 };
 
 #[tokio::test]
@@ -256,7 +257,7 @@ async fn get_result_invalid_model_config() {
     let task_id = Uuid::new_v4();
     h.task_manager
         .add_task_with_rate_limit_reservation(
-            Task {
+            &Task {
                 id: task_id,
                 prompt: Some(Arc::new("robot".to_string())),
                 image: None,
@@ -287,7 +288,7 @@ async fn get_result_allows_none_model_params() {
     let task_id = Uuid::new_v4();
     h.task_manager
         .add_task_with_rate_limit_reservation(
-            Task {
+            &Task {
                 id: task_id,
                 prompt: Some(Arc::new("robot".to_string())),
                 image: None,
@@ -382,4 +383,64 @@ async fn get_result_invalid_compress() {
     .await;
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn get_result_personal_api_key_allows_owner_account() {
+    let h = build_harness().await;
+    top_up_personal_api_key_balance(&h, &h.user_api_key, 100_000).await;
+    let task_id = add_task_prompt_with_api_key(&h, &h.user_api_key, "robot", None).await;
+
+    let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 21);
+    let payload = b"owner-asset".to_vec();
+    add_success_result(&h.task_manager, task_id, worker, payload.clone()).await;
+
+    let res = TestClient::get(format!(
+        "http://localhost/get_result?id={task_id}&format=spz"
+    ))
+    .add_header("x-api-key", &h.user_api_key, true)
+    .send(&h.service)
+    .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
+}
+
+#[tokio::test]
+async fn get_result_personal_api_key_denies_other_account() {
+    let h = build_harness().await;
+    top_up_personal_api_key_balance(&h, &h.user_api_key, 100_000).await;
+    let task_id = add_task_prompt_with_api_key(&h, &h.user_api_key, "robot", None).await;
+
+    let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 22);
+    add_success_result(&h.task_manager, task_id, worker, b"asset".to_vec()).await;
+    let second_api_key = create_personal_api_key(&h).await;
+
+    let res = TestClient::get(format!(
+        "http://localhost/get_result?id={task_id}&format=spz"
+    ))
+    .add_header("x-api-key", second_api_key, true)
+    .send(&h.service)
+    .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_result_generic_key_denies_personal_task_owner() {
+    let h = build_harness().await;
+    top_up_personal_api_key_balance(&h, &h.user_api_key, 100_000).await;
+    let task_id = add_task_prompt_with_api_key(&h, &h.user_api_key, "robot", None).await;
+
+    let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 23);
+    add_success_result(&h.task_manager, task_id, worker, b"asset".to_vec()).await;
+
+    let res = TestClient::get(format!(
+        "http://localhost/get_result?id={task_id}&format=spz"
+    ))
+    .add_header("x-api-key", h.api_key.to_string(), true)
+    .send(&h.service)
+    .await;
+    let (status, _headers, _body) = read_response(res).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

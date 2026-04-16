@@ -4,7 +4,7 @@ This page gives the minimal setup and where to find runnable examples.
 
 ## Quick start
 
-1) Get your API key: https://auth.404.xyz
+1) Get your API key from your `gen.404.xyz/account` page after signing in.
 2) Pick the closest gateway base URL:
 
 - **EU**: `https://gateway-eu.404.xyz:4443`

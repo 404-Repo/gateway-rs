@@ -5,10 +5,10 @@ use crate::raft::Raft;
 use crate::raft::Request;
 use crate::raft::StateMachineStore;
 use crate::raft::client::RClientBuilder;
-use crate::raft::init_crypto_provider;
 use crate::raft::test_utils::{
-    init_tracing, make_node_clients, membership_from, reserve_udp_addresses, start_test_rserver,
-    unique_path, wait_for_log_commit, wait_for_node_to_be_voter, wait_for_snapshot_file,
+    ensure_crypto_provider_for_tests, init_tracing, make_node_clients, membership_from,
+    reserve_udp_addresses, start_test_rserver, unique_path, wait_for_log_commit,
+    wait_for_node_to_be_voter, wait_for_snapshot_file,
 };
 use crate::{
     config::RServerConfig,
@@ -26,11 +26,10 @@ use uuid::Uuid;
 
 mod cluster_setup {
     use super::*;
-    use std::sync::{Once, OnceLock};
+    use std::sync::OnceLock;
 
     static LOG_STORE_REGISTRY: OnceLock<scc::HashMap<String, LogStore, RandomState>> =
         OnceLock::new();
-    static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
     pub(super) struct NodeStoragePaths {
         pub(super) snapshot_dir: PathBuf,
@@ -123,9 +122,7 @@ mod cluster_setup {
         Vec<Arc<StateMachineStore>>,
         Vec<RServer>,
     )> {
-        CRYPTO_PROVIDER_INIT.call_once(|| {
-            init_crypto_provider().expect("crypto provider init must succeed");
-        });
+        ensure_crypto_provider_for_tests();
 
         let pcfg = RServerConfig::default();
         let config = Arc::new(
@@ -244,7 +241,8 @@ mod cluster_setup {
         node_configs: &[OwnedNodeConfig],
     ) {
         let refs = node_config_refs(node_configs);
-        for raft in raft_nodes.iter().cloned() {
+        for raft in raft_nodes {
+            let raft = raft.clone();
             let initial_nodes = membership_from(&refs);
             tokio::spawn(async move {
                 raft.initialize(initial_nodes).await.unwrap();
@@ -443,6 +441,7 @@ async fn wait_for_consistent_leader_index(
 }
 
 mod cluster_bootstrap;
+mod cross_gateway_add_task;
 mod leader_failover;
 mod membership_flows;
 mod rate_limit_queue_flush;

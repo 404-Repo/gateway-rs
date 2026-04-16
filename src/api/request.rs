@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -74,28 +75,22 @@ pub struct GetTaskStatus {
     pub id: Uuid,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone)]
 pub struct AddTaskResultRequest {
-    #[serde(alias = "validator_hotkey")]
     pub worker_hotkey: Hotkey,
     pub worker_id: Arc<str>,
-    pub asset: Option<Vec<u8>>,
+    pub assignment_token: Uuid,
+    pub asset: Option<Bytes>,
     pub reason: Option<Arc<str>>,
-    #[serde(skip_deserializing, default = "Instant::now")]
     pub instant: Instant,
 }
 
 impl AddTaskResultRequest {
-    pub fn get_asset(&mut self) -> Option<Vec<u8>> {
+    pub fn get_asset(&mut self) -> Option<Bytes> {
         self.asset.take()
     }
 
     pub fn is_success(&self) -> bool {
         self.reason.is_none()
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct UpdateGenericKeyRequest {
-    pub generic_key: Uuid,
 }

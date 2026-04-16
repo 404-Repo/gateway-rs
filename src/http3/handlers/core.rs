@@ -3,13 +3,15 @@ use crate::api::response::{GatewayInfoRef, LeaderResponse};
 use crate::common::log::get_build_information;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
-use crate::http3::rate_limits::RateLimitContext;
+use crate::http3::rate_limits::{RateLimitContext, ensure_api_key_context};
 use crate::http3::state::HttpState;
+use crate::raft::gateway_state::TaskLifecycleWriteRequest;
 use crate::raft::store::Request as RaftRequest;
 use http::HeaderValue;
 use itoa::Buffer;
 use prometheus::Encoder;
 use salvo::prelude::*;
+use serde_json::json;
 
 pub const MULTIPART_PREFIX: &str = "multipart/form-data";
 pub const BOUNDARY_PREFIX: &str = "boundary=";
@@ -30,13 +32,10 @@ pub async fn write_handler(
     let gateway_state = state.gateway_state().clone();
 
     if let Ok(request) = rmp_serde::from_slice::<RaftRequest>(body.as_ref()) {
-        match request {
-            RaftRequest::RateLimitMutations {
-                request_id,
-                mutations,
-            } => {
+        match request.into_rate_limit_batch() {
+            Ok(batch) => {
                 gateway_state
-                    .apply_rate_limit_mutations(request_id, mutations)
+                    .apply_rate_limit_mutation_batch(batch)
                     .await
                     .map_err(|e| {
                         ServerError::Internal(format!(
@@ -48,41 +47,28 @@ pub async fn write_handler(
                 res.render(Text::Plain("Ok"));
                 return Ok(());
             }
-            RaftRequest::RateLimitDeltas { request_id, deltas } => {
-                gateway_state
-                    .apply_rate_limit_deltas(request_id, deltas)
-                    .await
-                    .map_err(|e| {
-                        ServerError::Internal(format!("Failed to apply rate limit deltas: {:?}", e))
-                    })?;
-                res.status_code(StatusCode::OK);
-                res.render(Text::Plain("Ok"));
-                return Ok(());
-            }
-            RaftRequest::RateLimitRefunds {
-                request_id,
-                refunds,
-            } => {
-                gateway_state
-                    .apply_rate_limit_refunds(request_id, refunds)
-                    .await
-                    .map_err(|e| {
-                        ServerError::Internal(format!(
-                            "Failed to apply rate limit refunds: {:?}",
-                            e
-                        ))
-                    })?;
-                res.status_code(StatusCode::OK);
-                res.render(Text::Plain("Ok"));
-                return Ok(());
-            }
-            other => {
+            Err(other) => {
                 return Err(ServerError::BadRequest(format!(
                     "Unsupported raft write request: {:?}",
                     other
                 )));
             }
         }
+    }
+
+    if let Ok(request) = rmp_serde::from_slice::<TaskLifecycleWriteRequest>(body.as_ref()) {
+        gateway_state
+            .apply_task_lifecycle_write(request)
+            .await
+            .map_err(|e| {
+                ServerError::Internal(format!(
+                    "Failed to apply generation lifecycle write: {:?}",
+                    e
+                ))
+            })?;
+        res.status_code(StatusCode::OK);
+        res.render(Text::Plain("Ok"));
+        return Ok(());
     }
 
     let gi: GatewayInfoExt = rmp_serde::from_slice(body.as_ref())
@@ -164,6 +150,7 @@ pub async fn api_or_generic_key_check(
     depot: &mut Depot,
     req: &mut Request,
 ) -> Result<(), ServerError> {
+    ensure_api_key_context(depot, req).await?;
     let context = depot.require::<RateLimitContext>()?;
 
     if req.headers().get("x-api-key").is_none() {
@@ -178,6 +165,14 @@ pub async fn api_or_generic_key_check(
 
     if context.has_authorized_key() {
         Ok(())
+    } else if context.auth_lookup_blocked {
+        Err(ServerError::Json(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({
+                "error": "invalid_api_key_rate_limit",
+                "message": "Too many invalid API key attempts from this IP. Please retry later.",
+            }),
+        ))
     } else {
         Err(ServerError::Unauthorized("Invalid API key".to_string()))
     }

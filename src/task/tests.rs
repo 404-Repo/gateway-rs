@@ -3,16 +3,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rand::RngExt;
-use scc::Queue;
 use uuid::Uuid;
 
-use super::{TaskManager, TaskManagerInit, TaskStatus};
+use super::{AddResultError, TaskManager, TaskManagerInit, TaskStatus};
 use crate::api::Task;
 use crate::api::request::AddTaskResultRequest;
+use crate::common::rate_limit_buffer::RateLimitMutationBuffer;
 use crate::crypto::hotkey::Hotkey;
 use crate::http3::rate_limits::RateLimitReservation;
 use crate::metrics::Metrics;
-use crate::raft::rate_limit::{ClientKey, DistributedRateLimiter};
+use crate::raft::rate_limit::{CheckAndIncrParams, ClientKey, DistributedRateLimiter};
 use crate::raft::store::{RateLimitDelta, RateLimitMutation, Subject};
 
 fn tasks_in_progress_total(metrics: &Metrics) -> f64 {
@@ -34,10 +34,501 @@ fn make_result(worker: &str, worker_id: &str, instant: Instant) -> AddTaskResult
     AddTaskResultRequest {
         worker_hotkey: worker.parse().unwrap(),
         worker_id: worker_id.to_string().into(),
-        asset: Some(vec![]),
+        assignment_token: Uuid::nil(),
+        asset: Some(Bytes::new()),
         reason: None,
         instant,
     }
+}
+
+fn make_failed_result(worker: &str, worker_id: &str, instant: Instant) -> AddTaskResultRequest {
+    AddTaskResultRequest {
+        worker_hotkey: worker.parse().unwrap(),
+        worker_id: worker_id.to_string().into(),
+        assignment_token: Uuid::nil(),
+        asset: None,
+        reason: Some("worker failed".into()),
+        instant,
+    }
+}
+
+fn sample_task(task_id: Uuid) -> Task {
+    Task {
+        id: task_id,
+        prompt: Some(Arc::new("task".to_string())),
+        image: None,
+        model: None,
+        seed: 0,
+        model_params: None,
+    }
+}
+
+async fn pop_only_mutation(queue: &RateLimitMutationBuffer) -> RateLimitMutation {
+    let batch = queue
+        .drain_batch(1)
+        .await
+        .expect("a rate-limit batch should be emitted");
+    assert_eq!(
+        batch.mutations.len(),
+        1,
+        "tests expect a single mutation per emitted batch"
+    );
+    batch.mutations.into_iter().next().expect("single mutation")
+}
+
+#[tokio::test]
+async fn single_success_stays_partial_until_expected_results_are_exhausted() {
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[51u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+    task_manager
+        .add_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::PartialResult(1)
+    );
+}
+
+#[tokio::test]
+async fn single_failure_stays_partial_until_expected_results_are_exhausted() {
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[52u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+    task_manager
+        .add_result(
+            task_id,
+            make_failed_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::PartialResult(0)
+    );
+}
+
+#[tokio::test]
+async fn staged_result_is_invisible_until_committed() {
+    let task_manager = TaskManager::new(
+        4,
+        1,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[58u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+
+    task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert!(
+        task_manager.get_result(task_id).await.is_none(),
+        "staged results must stay invisible until durable finalize succeeds"
+    );
+
+    let outcome = task_manager
+        .commit_staged_result(task_id, &worker)
+        .await
+        .unwrap();
+    assert!(outcome.completed);
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Success {
+            worker_id: worker_str.clone().into(),
+        }
+    );
+    assert_eq!(
+        task_manager
+            .get_result(task_id)
+            .await
+            .expect("committed result should be readable")
+            .results
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rollback_staged_result_allows_retry() {
+    let task_manager = TaskManager::new(
+        4,
+        1,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[59u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+
+    task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+    task_manager.rollback_staged_result(task_id, &worker).await;
+
+    assert!(task_manager.is_assigned(task_id, &worker).await);
+    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert!(task_manager.get_result(task_id).await.is_none());
+
+    let outcome = task_manager
+        .add_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        outcome.completed,
+        "retry after rollback should still succeed"
+    );
+}
+
+#[tokio::test]
+async fn stage_result_rejects_double_stage_for_same_worker() {
+    let task_manager = TaskManager::new(
+        4,
+        1,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[60u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+
+    task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    let second_stage = task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await;
+    assert!(matches!(second_stage, Err(AddResultError::AlreadyStaged)));
+}
+
+#[tokio::test]
+async fn staged_result_defers_timeout_until_commit() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(120);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = RateLimitMutationBuffer::default();
+    let limiter = DistributedRateLimiter::new(64);
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 4,
+        expected_results: 1,
+        cleanup_interval: CLEANUP_INTERVAL,
+        result_lifetime: RESULT_LIFETIME,
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+    let task_id = Uuid::new_v4();
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            &sample_task(task_id),
+            Some(RateLimitReservation::new(
+                limiter,
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 4_242u128,
+                    day_epoch: 99,
+                    add_active: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker: Hotkey = Hotkey::from_bytes(&[61u8; 32]);
+    let worker_str = worker.to_string();
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+    task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(
+        RESULT_LIFETIME.as_millis() as u64 + 200,
+    ))
+    .await;
+
+    assert!(
+        task_manager.is_assigned(task_id, &worker).await,
+        "timeout cleanup must defer while a staged result is waiting to commit"
+    );
+    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert!(
+        task_manager.get_result(task_id).await.is_none(),
+        "staged result must remain hidden before commit"
+    );
+    assert!(
+        mutation_queue.drain_batch(1).await.is_none(),
+        "timeout cleanup must not emit completion side effects while a staged result exists"
+    );
+
+    let outcome = task_manager
+        .commit_staged_result(task_id, &worker)
+        .await
+        .unwrap();
+    assert!(outcome.completed);
+    assert!(
+        mutation_queue.drain_batch(1).await.is_some(),
+        "completion side effects should emit after the staged result commits"
+    );
+}
+
+#[tokio::test]
+async fn mixed_outcome_reports_success_when_expected_results_are_exhausted() {
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker1: Hotkey = Hotkey::from_bytes(&[53u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[54u8; 32]);
+    let worker1_str = worker1.to_string();
+    let worker2_str = worker2.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1_str.clone().into())
+        .await;
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2_str.clone().into())
+        .await;
+    task_manager
+        .add_result(
+            task_id,
+            make_failed_result(worker1_str.as_str(), worker1_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+    task_manager
+        .add_result(
+            task_id,
+            make_result(worker2_str.as_str(), worker2_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Success {
+            worker_id: worker2_str.into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn one_of_one_success_reports_success() {
+    let task_manager = TaskManager::new(
+        4,
+        1,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker: Hotkey = Hotkey::from_bytes(&[55u8; 32]);
+    let worker_str = worker.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+    task_manager
+        .add_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Success {
+            worker_id: worker_str.into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn partial_success_becomes_success_after_task_timeout() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(120);
+
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        CLEANUP_INTERVAL,
+        RESULT_LIFETIME,
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker1: Hotkey = Hotkey::from_bytes(&[56u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[57u8; 32]);
+    let worker1_str = worker1.to_string();
+    let worker2_str = worker2.to_string();
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1_str.clone().into())
+        .await;
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2_str.clone().into())
+        .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    task_manager
+        .add_result(
+            task_id,
+            make_result(worker1_str.as_str(), worker1_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::PartialResult(1)
+    );
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Success {
+            worker_id: worker1_str.into(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn timeout_without_results_becomes_failure() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
+    const RESULT_LIFETIME: Duration = Duration::from_millis(120);
+
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        CLEANUP_INTERVAL,
+        RESULT_LIFETIME,
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let worker1: Hotkey = Hotkey::from_bytes(&[58u8; 32]);
+    let worker2: Hotkey = Hotkey::from_bytes(&[59u8; 32]);
+    let task_id = Uuid::new_v4();
+
+    task_manager.add_task(sample_task(task_id)).await;
+    task_manager
+        .record_assignment(task_id, worker1.clone(), worker1.to_string().into())
+        .await;
+    task_manager
+        .record_assignment(task_id, worker2.clone(), worker2.to_string().into())
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(
+        RESULT_LIFETIME.as_millis() as u64 + 120,
+    ))
+    .await;
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Failure {
+            reason: Arc::<str>::from("Task timed out"),
+        }
+    );
 }
 
 #[tokio::test]
@@ -63,6 +554,7 @@ async fn test_cleanup() {
     let worker2_str = worker2.to_string();
 
     let task_id1 = Uuid::new_v4();
+    task_manager.add_task(sample_task(task_id1)).await;
     task_manager
         .record_assignment(task_id1, worker1.clone(), worker1.to_string().into())
         .await;
@@ -82,6 +574,7 @@ async fn test_cleanup() {
         .unwrap();
 
     let task_id2 = Uuid::new_v4();
+    task_manager.add_task(sample_task(task_id2)).await;
     task_manager
         .record_assignment(task_id2, worker1.clone(), worker1.to_string().into())
         .await;
@@ -110,8 +603,10 @@ async fn test_cleanup() {
         )
         .await
         .unwrap();
+    task_manager.finalize_task(task_id2).await;
 
     let task_id3 = Uuid::new_v4();
+    task_manager.add_task(sample_task(task_id3)).await;
     task_manager
         .record_assignment(task_id3, worker1.clone(), worker1.to_string().into())
         .await;
@@ -140,6 +635,7 @@ async fn test_cleanup() {
         )
         .await
         .unwrap();
+    task_manager.finalize_task(task_id3).await;
 
     assert_eq!(
         task_manager.get_status(task_id1).await,
@@ -156,9 +652,12 @@ async fn test_cleanup() {
 
     tokio::time::sleep(WAIT_DURATION).await;
 
+    // task_id1 has an unfinished worker (worker2 never responded) so it times out as Failure
     assert_eq!(
         task_manager.get_status(task_id1).await,
-        TaskStatus::NoResult
+        TaskStatus::Failure {
+            reason: Arc::<str>::from("Task timed out"),
+        }
     );
     assert_eq!(
         task_manager.get_status(task_id2).await,
@@ -212,7 +711,8 @@ async fn image_task_persists_until_all_assignments_complete() {
     let first_result = AddTaskResultRequest {
         worker_hotkey: first_worker.clone(),
         worker_id: first_worker.to_string().into(),
-        asset: Some(vec![]),
+        assignment_token: Uuid::nil(),
+        asset: Some(Bytes::new()),
         reason: None,
         instant: Instant::now(),
     };
@@ -233,7 +733,8 @@ async fn image_task_persists_until_all_assignments_complete() {
     let second_result = AddTaskResultRequest {
         worker_hotkey: second_worker.clone(),
         worker_id: second_worker.to_string().into(),
-        asset: Some(vec![]),
+        assignment_token: Uuid::nil(),
+        asset: Some(Bytes::new()),
         reason: None,
         instant: Instant::now(),
     };
@@ -285,7 +786,8 @@ async fn model_persists_until_result_retrieval() {
             AddTaskResultRequest {
                 worker_hotkey: worker.clone(),
                 worker_id: worker.to_string().into(),
-                asset: Some(vec![]),
+                assignment_token: Uuid::nil(),
+                asset: Some(Bytes::new()),
                 reason: None,
                 instant: Instant::now(),
             },
@@ -306,7 +808,14 @@ async fn model_persists_until_result_retrieval() {
         .expect("result bundle should exist");
     assert_eq!(results_bundle.model.as_deref(), Some("404-3dgs"));
     assert_eq!(results_bundle.results.len(), 1);
-    assert!(task_manager.get_model(task_id).await.is_none());
+
+    // get_result is now idempotent — model and results remain until TTL expiry
+    let results_bundle2 = task_manager
+        .get_result(task_id)
+        .await
+        .expect("second get_result should still return results");
+    assert_eq!(results_bundle2.model.as_deref(), Some("404-3dgs"));
+    assert_eq!(results_bundle2.results.len(), 1);
 }
 
 #[tokio::test]
@@ -366,7 +875,8 @@ async fn tasks_in_progress_gauge_tracks_assignments() {
             AddTaskResultRequest {
                 worker_hotkey: worker.clone(),
                 worker_id: worker.to_string().into(),
-                asset: Some(vec![]),
+                assignment_token: Uuid::nil(),
+                asset: Some(Bytes::new()),
                 reason: None,
                 instant: Instant::now(),
             },
@@ -449,7 +959,8 @@ async fn tasks_in_progress_handles_multiple_random_assignments() {
                 AddTaskResultRequest {
                     worker_hotkey: v.clone(),
                     worker_id: v.to_string().into(),
-                    asset: Some(vec![]),
+                    assignment_token: Uuid::nil(),
+                    asset: Some(Bytes::new()),
                     reason: None,
                     instant: Instant::now(),
                 },
@@ -536,7 +1047,7 @@ async fn emits_refund_when_task_completes_with_only_failures() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let mutation_queue = RateLimitMutationBuffer::default();
     let limiter = DistributedRateLimiter::new(64);
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: 4,
@@ -560,15 +1071,14 @@ async fn emits_refund_when_task_completes_with_only_failures() {
     };
     task_manager
         .add_task_with_rate_limit_reservation(
-            task,
+            &task,
             Some(RateLimitReservation::new(
                 limiter.clone(),
                 vec![RateLimitDelta {
                     subject: Subject::User,
                     id: 777u128,
-                    hour_epoch: 900,
                     day_epoch: 90,
-                    add_hour: 1,
+                    add_active: 1,
                     add_day: 0,
                 }],
             )),
@@ -590,6 +1100,7 @@ async fn emits_refund_when_task_completes_with_only_failures() {
             AddTaskResultRequest {
                 worker_hotkey: worker1.clone(),
                 worker_id: worker1.to_string().into(),
+                assignment_token: Uuid::nil(),
                 asset: None,
                 reason: Some("worker failed".into()),
                 instant: Instant::now(),
@@ -603,6 +1114,7 @@ async fn emits_refund_when_task_completes_with_only_failures() {
             AddTaskResultRequest {
                 worker_hotkey: worker2.clone(),
                 worker_id: worker2.to_string().into(),
+                assignment_token: Uuid::nil(),
                 asset: None,
                 reason: Some("worker failed".into()),
                 instant: Instant::now(),
@@ -612,14 +1124,11 @@ async fn emits_refund_when_task_completes_with_only_failures() {
         .unwrap();
     assert!(completed.completed);
 
-    let refund = mutation_queue
-        .pop()
-        .expect("a refund should be emitted for all-failure completion");
+    let refund = pop_only_mutation(&mutation_queue).await;
     assert_eq!(refund.subject, Subject::User);
     assert_eq!(refund.id, 777u128);
-    assert_eq!(refund.hour_epoch, 900);
     assert_eq!(refund.day_epoch, 90);
-    assert_eq!(refund.hour_delta, -1);
+    assert_eq!(refund.active_delta, -1);
     assert_eq!(refund.day_delta, 0);
 }
 
@@ -629,7 +1138,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let mutation_queue = RateLimitMutationBuffer::default();
     let limiter = DistributedRateLimiter::new(64);
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: 4,
@@ -645,7 +1154,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
     let task_id = Uuid::new_v4();
     task_manager
         .add_task_with_rate_limit_reservation(
-            Task {
+            &Task {
                 id: task_id,
                 prompt: Some(Arc::new("deferred refund".to_string())),
                 image: None,
@@ -658,9 +1167,8 @@ async fn waits_for_expected_results_before_emitting_refund() {
                 vec![RateLimitDelta {
                     subject: Subject::User,
                     id: 901u128,
-                    hour_epoch: 910,
                     day_epoch: 91,
-                    add_hour: 1,
+                    add_active: 1,
                     add_day: 0,
                 }],
             )),
@@ -680,6 +1188,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
             AddTaskResultRequest {
                 worker_hotkey: worker1.clone(),
                 worker_id: worker1.to_string().into(),
+                assignment_token: Uuid::nil(),
                 asset: None,
                 reason: Some("worker failed".into()),
                 instant: Instant::now(),
@@ -692,7 +1201,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
         "single failed attempt must not complete when more results are expected"
     );
     assert!(
-        mutation_queue.pop().is_none(),
+        mutation_queue.drain_batch(1).await.is_none(),
         "refund must wait until expected attempts are exhausted"
     );
 
@@ -706,6 +1215,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
             AddTaskResultRequest {
                 worker_hotkey: worker2.clone(),
                 worker_id: worker2.to_string().into(),
+                assignment_token: Uuid::nil(),
                 asset: None,
                 reason: Some("worker failed".into()),
                 instant: Instant::now(),
@@ -715,7 +1225,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
         .unwrap();
     assert!(second.completed);
     assert!(
-        mutation_queue.pop().is_some(),
+        mutation_queue.drain_batch(1).await.is_some(),
         "refund should be emitted after final expected failure"
     );
 }
@@ -726,7 +1236,7 @@ async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(120);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let mutation_queue = RateLimitMutationBuffer::default();
     let limiter = DistributedRateLimiter::new(64);
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: 4,
@@ -750,16 +1260,15 @@ async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
     };
     task_manager
         .add_task_with_rate_limit_reservation(
-            task,
+            &task,
             Some(RateLimitReservation::new(
                 limiter.clone(),
                 vec![RateLimitDelta {
                     subject: Subject::User,
                     id: 888u128,
-                    hour_epoch: 901,
                     day_epoch: 90,
-                    add_hour: 1,
-                    add_day: 0,
+                    add_active: 1,
+                    add_day: 1,
                 }],
             )),
         )
@@ -780,7 +1289,8 @@ async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
             AddTaskResultRequest {
                 worker_hotkey: worker1.clone(),
                 worker_id: worker1.to_string().into(),
-                asset: Some(vec![1, 2, 3]),
+                assignment_token: Uuid::nil(),
+                asset: Some(Bytes::from_static(&[1, 2, 3])),
                 reason: None,
                 instant: Instant::now(),
             },
@@ -793,9 +1303,14 @@ async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
     ))
     .await;
 
+    // Partial success triggers the success path which releases the active slot
+    // but must NOT refund day charges.
+    let mutation = pop_only_mutation(&mutation_queue).await;
+    assert_eq!(mutation.active_delta, -1, "active slot should be released");
+    assert_eq!(mutation.day_delta, 0, "day charge must not be refunded");
     assert!(
-        mutation_queue.pop().is_none(),
-        "partial success must not trigger refund on timeout"
+        mutation_queue.drain_batch(1).await.is_none(),
+        "only one mutation (active release) should be emitted"
     );
 }
 
@@ -805,16 +1320,40 @@ async fn refund_rolls_back_local_pending_capacity() {
     const RESULT_LIFETIME: Duration = Duration::from_millis(500);
 
     let metrics = Metrics::new(0.05).unwrap();
-    let mutation_queue = Arc::new(Queue::<RateLimitMutation>::default());
+    let mutation_queue = RateLimitMutationBuffer::default();
     let limiter = DistributedRateLimiter::new(64);
     let key = ClientKey {
         subject: Subject::User,
         id: 999u128,
     };
-    let epochs = (901u64, 90u64);
+    let day_epoch = 90u64;
 
-    assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
-    assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+    assert!(
+        limiter
+            .check_and_incr(CheckAndIncrParams {
+                key,
+                active_limit: 1,
+                daily_limit: 0,
+                cluster_active: 0,
+                cluster_day: 0,
+                day_epoch,
+            })
+            .await
+            .is_ok()
+    );
+    assert!(
+        limiter
+            .check_and_incr(CheckAndIncrParams {
+                key,
+                active_limit: 1,
+                daily_limit: 0,
+                cluster_active: 0,
+                cluster_day: 0,
+                day_epoch,
+            })
+            .await
+            .is_err()
+    );
 
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: 2,
@@ -830,7 +1369,7 @@ async fn refund_rolls_back_local_pending_capacity() {
     let task_id = Uuid::new_v4();
     task_manager
         .add_task_with_rate_limit_reservation(
-            Task {
+            &Task {
                 id: task_id,
                 prompt: Some(Arc::new("rollback".to_string())),
                 image: None,
@@ -843,9 +1382,8 @@ async fn refund_rolls_back_local_pending_capacity() {
                 vec![RateLimitDelta {
                     subject: key.subject,
                     id: key.id,
-                    hour_epoch: epochs.0,
-                    day_epoch: epochs.1,
-                    add_hour: 1,
+                    day_epoch,
+                    add_active: 1,
                     add_day: 0,
                 }],
             )),
@@ -862,6 +1400,7 @@ async fn refund_rolls_back_local_pending_capacity() {
             AddTaskResultRequest {
                 worker_hotkey: worker.clone(),
                 worker_id: worker.to_string().into(),
+                assignment_token: Uuid::nil(),
                 asset: None,
                 reason: Some("worker failed".into()),
                 instant: Instant::now(),
@@ -871,15 +1410,112 @@ async fn refund_rolls_back_local_pending_capacity() {
         .unwrap();
     assert!(completed.completed);
 
-    let refund = mutation_queue
-        .pop()
-        .expect("a refund mutation should be emitted");
+    let refund = pop_only_mutation(&mutation_queue).await;
     assert_eq!(refund.subject, Subject::User);
     assert_eq!(refund.id, 999u128);
-    assert_eq!(refund.hour_delta, -1);
+    assert_eq!(refund.active_delta, -1);
+    assert_eq!(refund.day_delta, 0);
 
     assert!(
-        limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+        limiter
+            .check_and_incr(CheckAndIncrParams {
+                key,
+                active_limit: 1,
+                daily_limit: 0,
+                cluster_active: 0,
+                cluster_day: 0,
+                day_epoch,
+            })
+            .await
+            .is_ok(),
         "refund must restore local pending capacity immediately"
     );
+}
+
+#[tokio::test]
+async fn stale_assignment_token_is_rejected_after_reassignment() {
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        Duration::from_millis(50),
+        Duration::from_secs(5),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+
+    let task_id = Uuid::new_v4();
+    task_manager.add_task(sample_task(task_id)).await;
+
+    let worker: Hotkey = Hotkey::from_bytes(&[55u8; 32]);
+    let worker_id: Arc<str> = worker.to_string().into();
+    let first_token = Uuid::new_v4();
+    let second_token = Uuid::new_v4();
+
+    task_manager
+        .record_assignment_with_token(task_id, worker.clone(), worker_id.clone(), first_token)
+        .await;
+    let first_outcome = task_manager
+        .add_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker.clone(),
+                worker_id: worker_id.clone(),
+                assignment_token: first_token,
+                asset: None,
+                reason: Some("first attempt failed".into()),
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .expect("first result should be accepted");
+    assert!(
+        !first_outcome.completed,
+        "task should remain open after the first failed attempt"
+    );
+
+    task_manager
+        .record_assignment_with_token(task_id, worker.clone(), worker_id.clone(), second_token)
+        .await;
+
+    assert!(
+        task_manager
+            .is_assigned_with_token(task_id, &worker, second_token)
+            .await
+    );
+    assert!(
+        !task_manager
+            .is_assigned_with_token(task_id, &worker, first_token)
+            .await
+    );
+
+    let stale_stage = task_manager
+        .stage_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker.clone(),
+                worker_id: worker_id.clone(),
+                assignment_token: first_token,
+                asset: Some(Bytes::new()),
+                reason: None,
+                instant: Instant::now(),
+            },
+        )
+        .await;
+    assert!(matches!(stale_stage, Err(AddResultError::NotAssigned)));
+
+    task_manager
+        .stage_result(
+            task_id,
+            AddTaskResultRequest {
+                worker_hotkey: worker,
+                worker_id,
+                assignment_token: second_token,
+                asset: Some(Bytes::new()),
+                reason: None,
+                instant: Instant::now(),
+            },
+        )
+        .await
+        .expect("current assignment token should still be accepted");
 }

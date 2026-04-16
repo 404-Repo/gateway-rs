@@ -1,41 +1,51 @@
 mod connection;
+mod data_access;
 mod event_recorder;
+mod gateway_settings;
 mod key_validator;
-mod repository;
+mod task_lifecycle;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use foldhash::fast::RandomState;
-use scc::HashMap as SccHashMap;
-use sdd::AtomicOwned;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, Statement};
 
-pub use connection::PostgresConnectionConfigOwned;
+use crate::config::TransportMode;
+
 pub use event_recorder::EventRecorder;
-pub use key_validator::{ApiKeyLookup, ApiKeyValidator};
+pub use gateway_settings::{
+    GatewayRuntimeSettingsConfig, GatewayRuntimeSettingsStore, gateway_settings_sync_interval,
+};
+pub use key_validator::{
+    ApiKeyLookup, ApiKeyValidator, ApiKeyValidatorConfig, api_key_sync_interval,
+};
+pub use task_lifecycle::{
+    CreateGenerationTaskInput, CreateGenerationTaskOutcome, CreateGenerationTaskRejection,
+    FinalizeGenerationTaskAssignmentInput, FinalizeGenerationTaskAssignmentOutcome,
+    GenerationBillingOwner, GenerationTaskAccessOwner, GenerationTaskStatusSnapshot,
+    RecordedGenerationTaskAssignment, RecordedGenerationTaskAssignmentAction, TaskLifecycleStore,
+    TaskLifecycleStoreHandle,
+};
 
-use connection::{AbortOnDropJoinHandle, StmtKey};
+use connection::{CopyLane, MainPool};
 
 pub struct Database {
-    client: AtomicOwned<Arc<Client>>,
-    config: PostgresConnectionConfigOwned,
+    main_pool: Arc<MainPool>,
     events_copy_batch_size: usize,
-    prepared: SccHashMap<StmtKey, Arc<Statement>, RandomState>,
-    connection_task: AtomicOwned<AbortOnDropJoinHandle>,
+    activity_copy_lane: Arc<CopyLane>,
+    worker_copy_lane: Arc<CopyLane>,
 }
 
 #[derive(Clone)]
 pub struct ActivityEventRow {
-    pub user_id: Option<uuid::Uuid>,
+    pub user_id: Option<i64>,
     pub user_email: Option<String>,
     pub company_id: Option<uuid::Uuid>,
     pub company_name: Option<String>,
     pub action: String,
-    pub tool: String,
+    pub client_origin: String,
     pub task_kind: String,
     pub model: Option<String>,
     pub gateway_name: String,
@@ -56,6 +66,7 @@ pub struct WorkerEventRow {
 }
 
 pub struct DatabaseBuilder {
+    transport: Option<TransportMode>,
     sslcert_path: Option<String>,
     sslkey_path: Option<String>,
     sslrootcert_path: Option<String>,
@@ -65,6 +76,8 @@ pub struct DatabaseBuilder {
     password: Option<String>,
     dbname: Option<String>,
     events_copy_batch_size: Option<usize>,
+    pool_size: Option<usize>,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[async_trait]

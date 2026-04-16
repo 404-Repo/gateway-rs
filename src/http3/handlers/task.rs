@@ -1,18 +1,28 @@
 use anyhow::Result;
 use bytes::Bytes;
-use futures::{StreamExt, stream};
+use http::StatusCode;
 use multer::{Constraints, Multipart, SizeLimit};
 use salvo::prelude::*;
 use serde_json::json;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::OwnedSemaphorePermit;
-use tracing::info;
+use tokio::time::{Duration, sleep};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::api::request::{AddTaskRequest, GetTasksRequest};
-use crate::api::response::{GetTasksResponse, LoadResponse};
+use crate::api::response::{AssignedTask, GetTasksResponse, LoadResponse};
 use crate::api::{ModelParams, Task};
 use crate::common::image::validate_image;
+use crate::crypto::crypto_provider::GuestIpHasher;
+use crate::db::{
+    CreateGenerationTaskInput, CreateGenerationTaskOutcome, CreateGenerationTaskRejection,
+    RecordedGenerationTaskAssignment, RecordedGenerationTaskAssignmentAction,
+};
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::handlers::common::activity::{TaskActivityContext, record_task_activity};
@@ -29,46 +39,196 @@ use crate::http3::rate_limits::{
 };
 use crate::http3::state::HttpState;
 use crate::metrics::TaskKind;
-use crate::raft::gateway_state::WorkerEventRef;
+use crate::raft::gateway_state::{GatewayState, WorkerEventRef};
+use crate::raft::store::RateLimitMutationBatch;
 
-const ASSIGNMENT_RECORD_CONCURRENCY: usize = 16;
+const RECONCILIATION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+const RECONCILIATION_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const RECONCILIATION_RETRY_MAX_ATTEMPTS: u32 = 12;
 
 struct PendingRateLimitRollbackGuard {
     reservation: Option<RateLimitReservation>,
+    published_charge_rollback: Option<(GatewayState, RateLimitMutationBatch)>,
 }
 
 impl PendingRateLimitRollbackGuard {
     fn new(reservation: Option<RateLimitReservation>) -> Self {
-        Self { reservation }
+        Self {
+            reservation,
+            published_charge_rollback: None,
+        }
     }
 
     fn arm(&mut self, reservation: Option<RateLimitReservation>) {
         self.reservation = reservation;
     }
 
+    fn arm_published_charge_rollback(
+        &mut self,
+        gateway_state: GatewayState,
+        batch: RateLimitMutationBatch,
+    ) {
+        if batch.is_empty() {
+            self.published_charge_rollback = None;
+        } else {
+            self.published_charge_rollback = Some((gateway_state, batch));
+        }
+    }
+
     fn disarm(&mut self) {
         self.reservation = None;
+        self.published_charge_rollback = None;
     }
 
     async fn rollback_now(&mut self) {
         if let Some(reservation) = self.reservation.as_ref() {
             reservation.rollback_pending().await;
-            self.reservation = None;
+        }
+        self.reservation = None;
+        if let Some((gateway_state, batch)) = self.published_charge_rollback.take() {
+            rollback_published_charge(gateway_state, batch).await;
         }
     }
 }
 
 impl Drop for PendingRateLimitRollbackGuard {
     fn drop(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
-            return;
-        };
+        let reservation = self.reservation.take();
+        let published_charge_rollback = self.published_charge_rollback.take();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                reservation.rollback_pending().await;
+                if let Some(reservation) = reservation {
+                    reservation.rollback_pending().await;
+                }
+                if let Some((gateway_state, batch)) = published_charge_rollback {
+                    rollback_published_charge(gateway_state, batch).await;
+                }
             });
         }
+    }
+}
+
+async fn publish_accepted_reservation(
+    gateway_state: &GatewayState,
+    reservation: &RateLimitReservation,
+) -> Result<Option<RateLimitMutationBatch>, ServerError> {
+    let Some(charge_batch) = reservation.accepted_charge_batch() else {
+        return Ok(None);
+    };
+    let rollback_batch = reservation.refund_batch();
+
+    gateway_state
+        .submit_rate_limit_mutation_batch(&charge_batch, None)
+        .await
+        .map_err(|err| {
+            if let Some(rollback_batch) = rollback_batch.clone() {
+                reconcile_failed_accepted_publish(
+                    gateway_state.clone(),
+                    charge_batch.clone(),
+                    rollback_batch,
+                );
+            }
+            error!(error = ?err, "Failed to publish accepted task reservation");
+            ServerError::ServiceUnavailable("Task limiter is unavailable".to_string())
+        })?;
+
+    Ok(rollback_batch)
+}
+
+async fn retry_rate_limit_batch(
+    gateway_state: &GatewayState,
+    batch: &RateLimitMutationBatch,
+    retry_context: &'static str,
+) -> bool {
+    let mut delay = RECONCILIATION_RETRY_INITIAL_DELAY;
+    for attempt in 1..=RECONCILIATION_RETRY_MAX_ATTEMPTS {
+        match gateway_state
+            .submit_rate_limit_mutation_batch(batch, None)
+            .await
+        {
+            Ok(_) => return true,
+            Err(err) => {
+                if attempt == RECONCILIATION_RETRY_MAX_ATTEMPTS {
+                    error!(
+                        error = ?err,
+                        attempt,
+                        max_attempts = RECONCILIATION_RETRY_MAX_ATTEMPTS,
+                        request_id = batch.request_id,
+                        retry_context,
+                        "Rate limit reconciliation exhausted"
+                    );
+                    return false;
+                }
+
+                error!(
+                    error = ?err,
+                    attempt,
+                    max_attempts = RECONCILIATION_RETRY_MAX_ATTEMPTS,
+                    request_id = batch.request_id,
+                    retry_context,
+                    "Retrying rate limit reconciliation"
+                );
+                sleep(delay).await;
+                delay = (delay * 2).min(RECONCILIATION_RETRY_MAX_DELAY);
+            }
+        }
+    }
+    false
+}
+
+fn reconcile_failed_accepted_publish(
+    gateway_state: GatewayState,
+    charge_batch: RateLimitMutationBatch,
+    rollback_batch: RateLimitMutationBatch,
+) {
+    if charge_batch.is_empty() {
+        return;
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if retry_rate_limit_batch(
+                &gateway_state,
+                &charge_batch,
+                "publish accepted task reservation before rollback",
+            )
+            .await
+            {
+                rollback_published_charge(gateway_state, rollback_batch).await;
+            }
+        });
+    }
+}
+
+async fn rollback_published_charge(gateway_state: GatewayState, batch: RateLimitMutationBatch) {
+    if batch.is_empty() {
+        return;
+    }
+
+    if let Err(err) = gateway_state
+        .submit_rate_limit_mutation_batch(&batch, None)
+        .await
+    {
+        error!(
+            error = ?err,
+            request_id = batch.request_id,
+            "Failed to rollback published accepted task charge"
+        );
+        reconcile_failed_charge_rollback(gateway_state, batch);
+    }
+}
+
+fn reconcile_failed_charge_rollback(gateway_state: GatewayState, batch: RateLimitMutationBatch) {
+    if batch.is_empty() {
+        return;
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = retry_rate_limit_batch(&gateway_state, &batch, "rollback accepted task charge")
+                .await;
+        });
     }
 }
 
@@ -77,6 +237,103 @@ fn task_kind_label(task: &Task) -> &'static str {
         "img3d"
     } else {
         "txt3d"
+    }
+}
+
+fn billing_task_kind(task_kind: TaskKind) -> &'static str {
+    match task_kind {
+        TaskKind::TextTo3D => "text_to_3d",
+        TaskKind::ImageTo3D => "image_to_3d",
+    }
+}
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn registered_user_free_limits(
+    user_limits: Option<(u64, u64)>,
+    registered_generation_limit: u64,
+    registered_window_ms: u64,
+) -> Result<(Option<i32>, Option<i64>), ServerError> {
+    user_limits.ok_or_else(|| {
+        ServerError::Internal("Authenticated user limits are missing".to_string())
+    })?;
+    Ok((
+        Some(registered_generation_limit.min(i32::MAX as u64) as i32),
+        Some(registered_window_ms.min(i64::MAX as u64) as i64),
+    ))
+}
+
+fn generic_key_limits(
+    generic_global_daily_limit: u64,
+    generic_per_ip_daily_limit: u64,
+    generic_window_ms: u64,
+) -> (Option<i32>, Option<i32>, Option<i64>) {
+    (
+        Some(generic_global_daily_limit.min(i32::MAX as u64) as i32),
+        Some(generic_per_ip_daily_limit.min(i32::MAX as u64) as i32),
+        Some(generic_window_ms.min(i64::MAX as u64) as i64),
+    )
+}
+
+fn guest_key_hash(ctx: &RateLimitContext, secret: &str) -> Result<Vec<u8>, ServerError> {
+    let subject = ctx
+        .decimal_ip
+        .as_deref()
+        .or(ctx.source_addr.as_deref())
+        .unwrap_or("unknown");
+    let hasher = GuestIpHasher::new(secret)
+        .map_err(|err| ServerError::Internal(format!("Invalid API key secret: {err}")))?;
+    Ok(hasher.compute_hash_128(subject).to_vec())
+}
+
+fn unexpected_task_billing_error_to_server_error(error: anyhow::Error) -> ServerError {
+    error!(error = ?error, "Unexpected task billing lifecycle error");
+    ServerError::Internal(String::new())
+}
+
+fn sanitize_task_rejection_message(error_code: &str, error_message: String) -> String {
+    if error_code == "insufficient_balance"
+        && error_message
+            .to_ascii_lowercase()
+            .contains("insufficient balance for account")
+    {
+        return "Insufficient balance.".to_string();
+    }
+    error_message
+}
+
+fn task_submission_rejection_to_server_error(
+    rejection: CreateGenerationTaskRejection,
+) -> ServerError {
+    let CreateGenerationTaskRejection {
+        error_code,
+        error_message,
+    } = rejection;
+    let error_message = sanitize_task_rejection_message(&error_code, error_message);
+    let payload = json!({
+        "error": error_code.clone(),
+        "message": error_message,
+    });
+
+    match error_code.as_str() {
+        "concurrent_limit" => ServerError::Json(StatusCode::TOO_MANY_REQUESTS, payload),
+        "daily_limit" => ServerError::Json(StatusCode::TOO_MANY_REQUESTS, payload),
+        "insufficient_balance" => ServerError::Json(StatusCode::PAYMENT_REQUIRED, payload),
+        "login_required" => ServerError::Json(StatusCode::UNAUTHORIZED, payload),
+        "pricing_unavailable" => ServerError::Json(StatusCode::SERVICE_UNAVAILABLE, payload),
+        _ => {
+            error!(
+                error_code = %error_code,
+                payload = ?payload,
+                "Unexpected task submission rejection code"
+            );
+            ServerError::Internal(String::new())
+        }
     }
 }
 
@@ -354,13 +611,14 @@ pub async fn add_task_handler(
         let queue = state.task_queue().clone();
         let metrics = state.metrics().clone();
         let http_cfg = cfg.http();
+        let queue_limit = gateway_state.max_task_queue_len();
         let rate_ctx = depot.require::<RateLimitContext>()?.clone();
         let record_origin = normalize_origin(req, http_cfg);
         metrics.inc_request_origin(record_origin);
 
-        if queue.len() >= http_cfg.max_task_queue_len {
-            return Err(ServerError::Internal("Task queue is full".to_string()));
-        }
+        let queue_slot = queue
+            .try_reserve(queue_limit)
+            .ok_or_else(|| ServerError::ServiceUnavailable("Task queue is full".to_string()))?;
 
         let model_cfg = &cfg.node().model_config;
         let resolved_model = model_cfg
@@ -370,6 +628,14 @@ pub async fn add_task_handler(
             })?;
         let reservation = reserve_add_task_rate_limit(depot).await?;
         rollback_guard.arm(reservation.clone());
+        if let Some(reservation) = reservation.as_ref() {
+            let charge_rollback = publish_accepted_reservation(&gateway_state, reservation).await?;
+            if let Some(charge_rollback) = charge_rollback {
+                rollback_guard
+                    .arm_published_charge_rollback(gateway_state.clone(), charge_rollback);
+            }
+        }
+        let now_ms = current_time_ms();
 
         let task_id = Uuid::new_v4();
         let task_description = if let Some(prompt) = &validated.prompt {
@@ -386,6 +652,29 @@ pub async fn add_task_handler(
         };
 
         let model_name = resolved_model.model.clone();
+        let billing_owner =
+            if rate_ctx.key_is_uuid && (rate_ctx.user_id.is_some() || rate_ctx.is_company_key) {
+                let owner = rate_ctx.billing_owner.clone();
+                if owner.is_none() {
+                    return Err(ServerError::Unauthorized(
+                        "API key is no longer active for billing.".to_string(),
+                    ));
+                }
+                owner
+            } else {
+                None
+            };
+        let billing_request_json = json!({
+            "seed": seed,
+            "model": &model_name,
+            "model_params": model_params.as_ref(),
+            "prompt": validated.prompt.as_deref(),
+            "image": validated.image.as_ref().map(|image| json!({
+                "width": image.width,
+                "height": image.height,
+                "format": format!("{:?}", image.format),
+            })),
+        });
         let task = Task {
             id: task_id,
             prompt: validated.prompt.map(Arc::new),
@@ -394,29 +683,149 @@ pub async fn add_task_handler(
             seed,
             model_params,
         };
-
-        gateway_state
-            .task_manager()
-            .add_task_with_rate_limit_reservation(task.clone(), reservation.clone())
-            .await;
-        if let Some(reservation) = reservation.as_ref() {
-            for mutation in reservation.charge_mutations() {
-                gateway_state.enqueue_rate_limit_mutation(mutation);
+        let (
+            account_id,
+            user_id,
+            company_id,
+            api_key_id,
+            registered_generation_limit,
+            registered_window_ms,
+            guest_generation_limit,
+            guest_window_ms,
+            guest_key_hash,
+            guest_access_mode,
+            generic_global_limit,
+            generic_per_ip_limit,
+            generic_window_ms,
+            generic_key_hash,
+            billing_client_origin,
+            billing_actor,
+        ) = if let Some(owner) = billing_owner.as_ref() {
+            let (registered_generation_limit, registered_window_ms) = if owner.user_id.is_some() {
+                registered_user_free_limits(
+                    rate_ctx.user_limits,
+                    gateway_state.registered_generation_limit(),
+                    gateway_state.registered_window_ms(),
+                )?
+            } else {
+                (None, None)
+            };
+            (
+                Some(owner.account_id),
+                owner.user_id,
+                owner.company_id,
+                Some(owner.api_key_id),
+                registered_generation_limit,
+                registered_window_ms,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                record_origin,
+                if owner.company_id.is_some() {
+                    "company"
+                } else {
+                    "registered_personal"
+                },
+            )
+        } else if rate_ctx.key_is_uuid && rate_ctx.is_generic_key {
+            let (generic_global_limit, generic_per_ip_limit, generic_window_ms) =
+                generic_key_limits(
+                    gateway_state.generic_global_daily_limit(),
+                    gateway_state.generic_per_ip_daily_limit(),
+                    gateway_state.generic_window_ms(),
+                );
+            let generic_key_hash =
+                Some(guest_key_hash(&rate_ctx, http_cfg.api_key_secret.as_str())?);
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("generic_key".to_string()),
+                generic_global_limit,
+                generic_per_ip_limit,
+                generic_window_ms,
+                generic_key_hash,
+                "guest_generic",
+                "guest_generic",
+            )
+        } else {
+            return Err(ServerError::Unauthorized(
+                "API key is not authorized for task billing.".to_string(),
+            ));
+        };
+        let input = CreateGenerationTaskInput {
+            task_id,
+            account_id,
+            user_id,
+            company_id,
+            api_key_id,
+            task_kind: billing_task_kind(task_kind).to_string(),
+            model: model_name.clone(),
+            expected_results: cfg.node().basic.unique_workers_per_task as i32,
+            deadline_at_ms: now_ms
+                + (cfg.node().basic.taskmanager_result_lifetime.max(1) as i64 * 1000),
+            gateway_name: cfg.node().network.name.clone(),
+            client_origin: billing_client_origin.to_string(),
+            request_json: billing_request_json.to_string(),
+            registered_generation_limit,
+            registered_window_ms,
+            now_ms,
+            guest_generation_limit,
+            guest_window_ms,
+            guest_key_hash,
+            guest_access_mode,
+            generic_global_limit,
+            generic_per_ip_limit,
+            generic_window_ms,
+            generic_key_hash,
+        };
+        match gateway_state
+            .create_generation_task(&input)
+            .await
+            .map_err(unexpected_task_billing_error_to_server_error)?
+        {
+            CreateGenerationTaskOutcome::Created => {}
+            CreateGenerationTaskOutcome::Rejected(rejection) => {
+                return Err(task_submission_rejection_to_server_error(rejection));
             }
         }
 
-        queue.push(task);
+        gateway_state
+            .task_manager()
+            .add_task_with_rate_limit_reservation(&task, reservation.clone())
+            .await;
+        queue_slot.push(task);
         metrics.set_queue_len(queue.len());
 
         if let Some(user_seed) = user_seed {
             info!(
+                billing_actor = billing_actor,
                 "A new task has been pushed with ID: {}, model: {}, origin: {}, {}, seed: {}",
-                task_id, model_name, record_origin, task_description, user_seed
+                task_id,
+                model_name,
+                record_origin,
+                task_description,
+                user_seed
             );
         } else {
             info!(
+                billing_actor = billing_actor,
                 "A new task has been pushed with ID: {}, model: {}, origin: {}, {}",
-                task_id, model_name, record_origin, task_description
+                task_id,
+                model_name,
+                record_origin,
+                task_description
             );
         }
 
@@ -516,49 +925,120 @@ pub async fn get_tasks_handler(
 
     let requested_task_count = get_tasks
         .requested_task_count
-        .min(http_cfg.max_task_queue_len.max(1));
-    let mut tasks = Vec::with_capacity(requested_task_count);
+        .min(state.gateway_state().max_task_queue_len().max(1));
     let mut task_ids = Vec::with_capacity(requested_task_count);
     let task_manager = gateway_state.task_manager();
-    let model_set: HashSet<String> = model_filter.into_iter().collect();
-    let default_model = model_cfg.default_model.as_str();
-    for (task, dur) in
-        queue.pop_with_filter(requested_task_count, &get_tasks.worker_hotkey, |task| {
-            let model = task.model.as_deref().unwrap_or(default_model);
-            model_set.contains(model)
-        })
-    {
-        if let Some(dur) = dur {
+    let mut deliveries = queue.reserve_for_models(
+        requested_task_count,
+        &get_tasks.worker_hotkey,
+        model_filter.as_slice(),
+    );
+    for delivery in &deliveries {
+        if let Some(dur) = delivery.duration() {
             metrics.record_queue_time(dur.as_secs_f64());
         }
-        task_ids.push(task.id);
-        tasks.push(task);
+        task_ids.push(delivery.task().id);
     }
+    let mut tasks = Vec::with_capacity(deliveries.len());
 
     if !task_ids.is_empty() {
         let worker_hotkey = get_tasks.worker_hotkey.clone();
         let worker_id = get_tasks.worker_id.clone();
-        let concurrency = ASSIGNMENT_RECORD_CONCURRENCY.min(task_ids.len());
-        stream::iter(task_ids)
-            .for_each_concurrent(Some(concurrency.max(1)), |task_id| {
-                let task_manager = task_manager.clone();
-                let worker_hotkey = worker_hotkey.clone();
-                let worker_id = worker_id.clone();
-                async move {
-                    task_manager
-                        .record_assignment(task_id, worker_hotkey, worker_id)
-                        .await;
+        let assigned_at_ms = current_time_ms();
+        match gateway_state
+            .record_generation_task_assignments(
+                task_ids.as_slice(),
+                worker_hotkey.as_ref(),
+                worker_id.as_ref(),
+                assigned_at_ms,
+            )
+            .await
+        {
+            Err(err) => {
+                error!(
+                    "Failed to persist {} task assignments for worker {}: {:?}; requeueing tasks",
+                    task_ids.len(),
+                    worker_hotkey.as_ref(),
+                    err
+                );
+                deliveries.clear();
+                task_ids.clear();
+            }
+            Ok(assigned_assignments) => {
+                let task_outcomes: HashMap<Uuid, RecordedGenerationTaskAssignment> =
+                    assigned_assignments
+                        .into_iter()
+                        .map(|assignment| (assignment.task_id, assignment))
+                        .collect();
+                let assigned_count = task_outcomes
+                    .values()
+                    .filter(|assignment| {
+                        assignment.action == RecordedGenerationTaskAssignmentAction::Assigned
+                    })
+                    .count();
+                let requeue_count = task_outcomes
+                    .values()
+                    .filter(|assignment| {
+                        assignment.action == RecordedGenerationTaskAssignmentAction::Requeue
+                    })
+                    .count();
+                let retire_count = task_outcomes
+                    .values()
+                    .filter(|assignment| {
+                        assignment.action == RecordedGenerationTaskAssignmentAction::Retire
+                    })
+                    .count();
+                if requeue_count > 0 || retire_count > 0 {
+                    warn!(
+                        requested = task_ids.len(),
+                        assigned = assigned_count,
+                        requeue = requeue_count,
+                        retire = retire_count,
+                        worker = worker_hotkey.as_ref(),
+                        "Some queued deliveries were not assignable to this worker and were requeued or retired"
+                    );
                 }
-            })
-            .await;
+                for delivery in deliveries.drain(..) {
+                    let task_id = delivery.task().id;
+                    let Some(assignment) = task_outcomes.get(&task_id) else {
+                        delivery.retire();
+                        continue;
+                    };
+                    match assignment.action {
+                        RecordedGenerationTaskAssignmentAction::Assigned => {
+                            let assignment_token = assignment
+                                .assignment_token
+                                .expect("assigned task is missing assignment token");
+                            let task = delivery.commit().0;
+                            tasks.push(AssignedTask {
+                                task: task.clone(),
+                                assignment_token,
+                            });
+                            task_manager
+                                .record_assignment_with_token(
+                                    task_id,
+                                    worker_hotkey.clone(),
+                                    worker_id.clone(),
+                                    assignment_token,
+                                )
+                                .await;
+                        }
+                        RecordedGenerationTaskAssignmentAction::Requeue => {
+                            delivery.requeue_for_other_hotkeys()
+                        }
+                        RecordedGenerationTaskAssignmentAction::Retire => delivery.retire(),
+                    }
+                }
+            }
+        }
     }
 
     for task in &tasks {
         gateway_state.record_worker_event(WorkerEventRef {
-            task_id: Some(task.id),
+            task_id: Some(task.task.id),
             worker_id: Some(get_tasks.worker_id.as_ref()),
             action: "task_assigned",
-            task_kind: task_kind_label(task),
+            task_kind: task_kind_label(&task.task),
             reason: None,
         });
     }
@@ -613,8 +1093,16 @@ pub async fn get_load_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{PendingRateLimitRollbackGuard, RateLimitReservation};
-    use crate::raft::rate_limit::{ClientKey, DistributedRateLimiter};
+    use anyhow::anyhow;
+    use http::StatusCode;
+
+    use super::{
+        PendingRateLimitRollbackGuard, RateLimitReservation, registered_user_free_limits,
+        task_submission_rejection_to_server_error, unexpected_task_billing_error_to_server_error,
+    };
+    use crate::db::CreateGenerationTaskRejection;
+    use crate::http3::error::ServerError;
+    use crate::raft::rate_limit::{CheckAndIncrParams, ClientKey, DistributedRateLimiter};
     use crate::raft::store::{RateLimitDelta, Subject};
 
     #[tokio::test]
@@ -624,10 +1112,34 @@ mod tests {
             subject: Subject::User,
             id: 42u128,
         };
-        let epochs = (500u64, 50u64);
+        let day_epoch = 50u64;
 
-        assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
-        assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_err()
+        );
 
         {
             let reservation = RateLimitReservation::new(
@@ -635,9 +1147,8 @@ mod tests {
                 vec![RateLimitDelta {
                     subject: key.subject,
                     id: key.id,
-                    hour_epoch: epochs.0,
-                    day_epoch: epochs.1,
-                    add_hour: 1,
+                    day_epoch,
+                    add_active: 1,
                     add_day: 0,
                 }],
             );
@@ -649,7 +1160,17 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert!(
-            limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok(),
             "rollback guard should release pending local capacity"
         );
     }
@@ -661,19 +1182,42 @@ mod tests {
             subject: Subject::User,
             id: 99u128,
         };
-        let epochs = (800u64, 80u64);
+        let day_epoch = 80u64;
 
-        assert!(limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
-        assert!(!limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await);
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok()
+        );
+        assert!(
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_err()
+        );
 
         let reservation = RateLimitReservation::new(
             limiter.clone(),
             vec![RateLimitDelta {
                 subject: key.subject,
                 id: key.id,
-                hour_epoch: epochs.0,
-                day_epoch: epochs.1,
-                add_hour: 1,
+                day_epoch,
+                add_active: 1,
                 add_day: 0,
             }],
         );
@@ -681,8 +1225,100 @@ mod tests {
         guard.rollback_now().await;
 
         assert!(
-            limiter.check_and_incr(key, 1, 0, 0, 0, epochs).await,
+            limiter
+                .check_and_incr(CheckAndIncrParams {
+                    key,
+                    active_limit: 1,
+                    daily_limit: 0,
+                    cluster_active: 0,
+                    cluster_day: 0,
+                    day_epoch,
+                })
+                .await
+                .is_ok(),
             "explicit rollback should release pending local capacity"
         );
+    }
+
+    #[test]
+    fn zero_registered_free_limit_is_forwarded() {
+        assert_eq!(
+            registered_user_free_limits(Some((1, 0)), 0, 86_400_000)
+                .expect("zero registered free limit should parse"),
+            (Some(0), Some(86_400_000))
+        );
+    }
+
+    #[test]
+    fn positive_registered_free_settings_are_forwarded() {
+        assert_eq!(
+            registered_user_free_limits(Some((1, 0)), 25, 60_000)
+                .expect("positive registered free settings should parse"),
+            (Some(25), Some(60_000))
+        );
+    }
+
+    #[test]
+    fn very_large_registered_free_settings_are_clamped() {
+        assert_eq!(
+            registered_user_free_limits(Some((1, 0)), i32::MAX as u64 + 99, i64::MAX as u64 + 99,)
+                .expect("large registered free settings should clamp"),
+            (Some(i32::MAX), Some(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn missing_limits_fail_registered_free_mapping() {
+        match registered_user_free_limits(None, 5, 60_000) {
+            Err(ServerError::Internal(message)) => {
+                assert!(message.contains("Authenticated user limits are missing"));
+            }
+            other => panic!("expected internal error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unexpected_billing_errors_are_sanitized() {
+        let error = anyhow!("column foo does not exist");
+
+        match unexpected_task_billing_error_to_server_error(error) {
+            ServerError::Internal(message) => {
+                assert!(message.is_empty(), "internal errors should be sanitized");
+            }
+            other => panic!("expected internal server error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn daily_limit_rejections_are_rendered_as_structured_rate_limits() {
+        match task_submission_rejection_to_server_error(CreateGenerationTaskRejection {
+            error_code: "daily_limit".to_string(),
+            error_message: "Daily free limit exceeded on 2026-03-25.".to_string(),
+        }) {
+            ServerError::Json(status, payload) => {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(payload["error"], "daily_limit");
+                assert_eq!(
+                    payload["message"],
+                    "Daily free limit exceeded on 2026-03-25."
+                );
+            }
+            other => panic!("expected rate limit response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn insufficient_balance_rejections_are_rendered_as_payment_required() {
+        match task_submission_rejection_to_server_error(CreateGenerationTaskRejection {
+            error_code: "insufficient_balance".to_string(),
+            error_message: "Insufficient balance for account 42.".to_string(),
+        }) {
+            ServerError::Json(status, payload) => {
+                assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+                assert_eq!(payload["error"], "insufficient_balance");
+                assert_eq!(payload["message"], "Insufficient balance.");
+            }
+            other => panic!("expected payment required response, got {:?}", other),
+        }
     }
 }

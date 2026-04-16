@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
-use std::{fmt, path::Path, path::PathBuf};
+use std::{env, fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
@@ -22,6 +22,12 @@ pub struct BasicConfig {
     pub taskmanager_result_lifetime: u64,
     pub taskqueue_cleanup_interval: u64,
     pub taskqueue_task_ttl: u64,
+    #[serde(default = "default_generation_task_retention_sec")]
+    pub generation_task_retention_sec: u64,
+}
+
+fn default_generation_task_retention_sec() -> u64 {
+    86_400
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +105,8 @@ pub struct HTTPConfig {
     pub compression: bool,
     pub compression_lvl: u32,
     pub port: u16,
+    #[serde(default)]
+    pub transport: TransportMode,
     #[serde(default = "default_tls_versions")]
     pub tls_versions: Vec<String>,
     #[serde(default)]
@@ -107,26 +115,17 @@ pub struct HTTPConfig {
     pub max_concurrent_image_uploads: usize,
     // Rate limits
     pub basic_rate_limit: usize,
-    pub update_key_rate_limit: usize,
-    // /add_task: valid generic key (http.generic_key) global hourly cap,
-    // aggregated across all source IP addresses.
-    pub add_task_generic_key_global_hourly_rate_limit: usize,
-    // /add_task: valid generic key (http.generic_key) per-source-IP hourly cap.
-    pub add_task_generic_key_per_ip_hourly_rate_limit: usize,
-    // /add_task: valid non-company user key per-user hourly cap (distributed).
-    pub add_task_authenticated_per_user_hourly_rate_limit: usize,
-    // /add_task: unauthorized attempts per-source-IP hourly cap.
+    // /add_task: unauthorized attempts per-source-IP daily cap.
     // Unauthorized means missing/invalid/unknown API key.
     // There is no separate global cap for unauthorized traffic.
-    pub add_task_unauthorized_per_ip_hourly_rate_limit: usize,
-    // IP allowlist for rate limiting only; authentication still applies.
+    pub add_task_unauthorized_per_ip_daily_rate_limit: usize,
+    // Trusted IP allowlist that skips all /add_task rate limits, including distributed quotas.
+    // Authentication still applies. Use only for fully trusted sources.
     pub rate_limit_whitelist: HashSet<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
-    pub load_rate_limit: usize,
-    pub add_result_rate_limit: usize,
-    pub leader_rate_limit: usize,
-    pub metric_rate_limit: usize,
+    // Shared per-IP limiter for worker-facing endpoints: /add_result, /get_load, /get_leader.
+    pub worker_per_minute_rate_limit: usize,
     pub get_status_rate_limit: usize,
     #[serde(default)]
     pub worker_whitelist: HashSet<Hotkey>,
@@ -138,15 +137,34 @@ pub struct HTTPConfig {
     pub signature_freshness_threshold: u64,
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
+    // Fallback generic key used until the database-backed app_settings cache loads.
     pub generic_key: Option<Uuid>,
     // Secret used to key BLAKE3 for API key verification
     pub api_key_secret: String,
+    #[serde(default = "default_invalid_api_key_negative_cache_ttl_sec")]
+    pub invalid_api_key_negative_cache_ttl_sec: u64,
+    #[serde(default = "default_invalid_api_key_ip_miss_ttl_sec")]
+    pub invalid_api_key_ip_miss_ttl_sec: u64,
+    #[serde(default = "default_invalid_api_key_ip_cooldown_ttl_sec")]
+    pub invalid_api_key_ip_cooldown_ttl_sec: u64,
+    #[serde(default = "default_invalid_api_key_ip_cache_capacity")]
+    pub invalid_api_key_ip_cache_capacity: u64,
+    #[serde(default = "default_invalid_api_key_ip_miss_limit")]
+    pub invalid_api_key_ip_miss_limit: u64,
     // HTTP/3 client timeouts
     pub post_timeout_sec: u64,
     pub forward_timeout_sec: u64,
     pub get_timeout_sec: u64,
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    #[default]
+    Tls,
+    Plain,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,6 +195,8 @@ pub struct DbConfig {
     pub user: String,
     pub password: String,
     pub db: String,
+    #[serde(default)]
+    pub transport: TransportMode,
     pub sslcert: String,
     pub sslkey: String,
     pub sslrootcert: String,
@@ -190,6 +210,8 @@ pub struct DbConfig {
     pub events_flush_interval_sec: u64,
     #[serde(default = "default_events_copy_batch_size")]
     pub events_copy_batch_size: usize,
+    #[serde(default = "default_db_pool_size")]
+    pub pool_size: usize,
     #[serde(default = "default_events_queue_capacity")]
     pub events_queue_capacity: usize,
 }
@@ -206,6 +228,10 @@ fn default_events_copy_batch_size() -> usize {
     1000
 }
 
+fn default_db_pool_size() -> usize {
+    4
+}
+
 fn default_events_queue_capacity() -> usize {
     50_000
 }
@@ -216,6 +242,26 @@ fn default_max_concurrent_image_uploads() -> usize {
 
 fn default_distributed_rate_limiter_max_capacity() -> usize {
     4096
+}
+
+fn default_invalid_api_key_negative_cache_ttl_sec() -> u64 {
+    5 * 60
+}
+
+fn default_invalid_api_key_ip_miss_ttl_sec() -> u64 {
+    10 * 60
+}
+
+fn default_invalid_api_key_ip_cooldown_ttl_sec() -> u64 {
+    5 * 60
+}
+
+fn default_invalid_api_key_ip_cache_capacity() -> u64 {
+    200_000
+}
+
+fn default_invalid_api_key_ip_miss_limit() -> u64 {
+    50
 }
 
 fn default_max_rate_limit_deltas_per_batch() -> usize {
@@ -255,6 +301,8 @@ fn default_log_store_flush_interval_ms() -> u64 {
 fn default_tls_versions() -> Vec<String> {
     vec!["1.2".to_string(), "1.3".to_string()]
 }
+
+const ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV: &str = "GATEWAY_ALLOW_DANGEROUS_SKIP_VERIFICATION";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Certificate {
@@ -382,9 +430,41 @@ impl fmt::Display for NodeConfig {
         }
 
         mask_key_in_toml(&mut toml_str, &self.http.api_key_secret, 3);
+        mask_key_in_toml(&mut toml_str, &self.db.password, 0);
 
         write!(f, "{}", toml_str)
     }
+}
+
+pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
+    if config.http.transport == TransportMode::Plain {
+        tracing::warn!(
+            "HTTP transport is configured without TLS; only use this in local development"
+        );
+    }
+    if config.db.transport == TransportMode::Plain {
+        tracing::warn!(
+            "Database transport is configured without TLS; only use this in local development"
+        );
+    }
+    if config.cert.dangerous_skip_verification {
+        let allow_override = matches!(
+            env::var(ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV),
+            Ok(value)
+                if matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+        );
+        if !cfg!(debug_assertions) && !allow_override {
+            return Err(anyhow!(
+                "cert.dangerous_skip_verification can only be enabled in debug/test builds or when {}=1",
+                ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV
+            ));
+        }
+        tracing::warn!("TLS server verification is disabled; only use this in local development");
+    }
+    Ok(())
 }
 
 pub async fn read_config(path: Option<&String>) -> Result<NodeConfig> {
@@ -398,6 +478,7 @@ pub async fn read_config_from_path<P: AsRef<Path>>(path: P) -> Result<NodeConfig
         .model_config
         .validate()
         .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+    validate_node_config(&config)?;
     Ok(config)
 }
 

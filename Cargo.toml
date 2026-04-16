@@ -5,7 +5,7 @@ edition = "2024"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { version = "0.89.2", features = [
+salvo = { version = "0.91.1", features = [
     "quinn",
     "rustls",
     "rate-limiter",
@@ -17,7 +17,7 @@ spz-lib = { git = "https://github.com/404-Repo/spz-rs.git", rev = "227c6cb6cdc25
     "async",
 ] }
 multer = "3.1.0"
-tokio = { version = "1.50.0", features = [
+tokio = { version = "1.52.0", features = [
     "rt-multi-thread",
     "macros",
     "sync",
@@ -27,17 +27,17 @@ tokio = { version = "1.50.0", features = [
     "signal",
     "io-util",
 ] }
-tokio-postgres = { version = "0.7.16", features = [
+tokio-postgres = { version = "0.7.17", features = [
     "with-uuid-1",
     "with-chrono-0_4",
 ] }
-async_zip = { version = "0.0.18", features = ["deflate"] }
+async_zip = { version = "0.0.18", features = ["deflate", "tokio"] }
 futures = "0.3.32"
 futures-util = "0.3.32"
-tokio-util = "0.7.18"
-clap = "4.5.60"
+tokio-util = { version = "0.7.18", features = ["io"] }
+clap = "4.6.0"
 tracing = "0.1.44"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = "0.3.23"
 tracing-appender = "0.2.4"
 async-trait = "0.1.89"
 quinn = { version = "0.11.9", features = ["rustls", "runtime-tokio", "log"] }
@@ -45,13 +45,12 @@ h3 = { version = "0.0.8", features = ["tracing"] }
 h3-quinn = { version = "0.0.10" }
 http = "1.4.0"
 backon = "1.6.0"
-openraft = { version = "0.9.21", features = ["storage-v2", "serde"] }
+openraft = { version = "0.9.22", features = ["storage-v2", "serde"] }
 tokio-postgres-rustls = "0.13.0"
-rustls = { version = "0.23.37" }
-rustls-platform-verifier = "0.6.2"
-rustls-pki-types = { version = "1.14.0", features = ["std"] }
-toml = "0.9.8"
-uuid = { version = "1.22.0", features = ["v4", "serde"] }
+rustls = { version = "0.23.38" }
+rustls-platform-verifier = "0.7.0"
+toml = "1.1.2"
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 rmp-serde = "1.3.1"
@@ -59,35 +58,42 @@ anyhow = "1.0.102"
 bytes = "1.11.1"
 rcgen = { version = "0.14.7", features = ["pem"] }
 foldhash = "0.2.0"
-scc = "3.6.9"
-sdd = "4.7.3"
+portable-atomic = "1.13.1"
+scc = "3.7.0"
+sdd = "4.8.3"
 schnorrkel = "0.11.5"
 base64-simd = "0.8"
-parity-scale-codec = { version = "3.7.5", features = ["derive"] }
 blake2 = "0.10.6"
 bs58 = "0.5.1"
 prometheus = "0.14.0"
-blake3 = "1.8.3"
-moka = { version = "0.12.14", features = ["sync"] }
+blake3 = "1.8.4"
+moka = { version = "0.12.15", features = ["sync"] }
 mimalloc = { version = "0.1.48", default-features = false }
 regex = "1.12.3"
 image = "0.25.10"
 chrono = { version = "0.4", features = ["serde", "clock"] }
-itoa = "1.0.17"
+itoa = "1.0.18"
 zstd = "0.13"
 tempfile = "3.27.0"
 notify = "8.2.0"
-rand = "0.10.0"
+rand = "0.10.1"
 
 [dev-dependencies]
-hyper = "1.8.1"
+hyper = "1.9.0"
 http-body-util = "0.1.3"
 futures-lite = { version = "2.6.1", default-features = false, features = [
     "std",
 ] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "multipart"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 
 [features]
 test-support = []
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+test = false
 
 [[test]]
 name = "client_http_api"

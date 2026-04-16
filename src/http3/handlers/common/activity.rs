@@ -23,13 +23,14 @@ pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
         company_id = Some(company.id);
         company_name = Some(company.name.clone());
     }
+
     ctx.gateway_state.record_activity_event(ActivityEventRef {
         user_id: ctx.rate_ctx.user_id,
         user_email: ctx.rate_ctx.user_email.as_deref(),
         company_id,
         company_name: company_name.as_deref(),
         action,
-        tool: ctx.origin,
+        client_origin: ctx.origin,
         task_kind: ctx.task_kind,
         model: ctx.model,
         task_id: ctx.task_id,

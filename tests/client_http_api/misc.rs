@@ -1,7 +1,6 @@
 use http::StatusCode;
-use salvo::test::TestClient;
 
-use crate::support::{build_harness, build_harness_with_gateway_info, read_response};
+use crate::support::{TestClient, build_harness, build_harness_with_gateway_info, read_response};
 
 #[tokio::test]
 async fn get_load_success() {
@@ -32,10 +31,28 @@ async fn get_load_empty() {
 async fn get_version_success() {
     let h = build_harness().await;
     let res = TestClient::get("http://localhost/get_version")
+        .add_header("x-admin-key", h.admin_key.to_string(), true)
         .send(&h.service)
         .await;
     let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+}
+
+#[tokio::test]
+async fn metrics_success_without_admin_key() {
+    let h = build_harness().await;
+    let res = TestClient::get("http://localhost/metrics")
+        .send(&h.service)
+        .await;
+    let (status, headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some(prometheus::TEXT_FORMAT)
+    );
     assert!(!body.is_empty());
 }
 

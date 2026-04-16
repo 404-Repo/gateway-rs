@@ -526,7 +526,7 @@ impl TypeConfigLogPersistence {
     pub(crate) fn encode_state_as_bytes(state: &PersistedLogState) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(1024);
         Self::write_diff_header(&mut buf);
-        let record = DiffRecord::Full(state.clone());
+        let record = DiffRecordRef::Full(state);
         Self::append_record(&mut buf, &record)?;
         Ok(buf)
     }
@@ -587,6 +587,11 @@ enum DiffRecord {
     PurgeTo(LogId<NodeId>),
     TruncateFrom(u64),
     Append(Vec<Entry<TypeConfig>>),
+}
+
+#[derive(Serialize)]
+enum DiffRecordRef<'a> {
+    Full(&'a PersistedLogState),
 }
 
 #[cfg(test)]

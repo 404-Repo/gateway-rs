@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::config::{
     HTTPConfig, ImageConfig, ModelParamsConfig, NodeConfig, PromptConfig, read_config_from_path,
+    validate_node_config,
 };
 use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
@@ -255,6 +256,13 @@ fn warn_restart_required_changes(current: &NodeConfig, updated: &NodeConfig) {
         );
     }
 
+    if current.http.transport != updated.http.transport {
+        warn!(
+            "Runtime config changed HTTP transport mode from {:?} to {:?}; restart required",
+            current.http.transport, updated.http.transport
+        );
+    }
+
     if current.http.compression != updated.http.compression
         || current.http.compression_lvl != updated.http.compression_lvl
     {
@@ -272,6 +280,13 @@ fn warn_restart_required_changes(current: &NodeConfig, updated: &NodeConfig) {
         || current.cert.dangerous_skip_verification != updated.cert.dangerous_skip_verification
     {
         warn!("Runtime config changed TLS certificate settings; restart required to apply");
+    }
+
+    if current.db.transport != updated.db.transport {
+        warn!(
+            "Runtime config changed database transport mode from {:?} to {:?}; restart required",
+            current.db.transport, updated.db.transport
+        );
     }
 }
 
@@ -304,6 +319,7 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
         .model_config
         .validate()
         .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+    validate_node_config(&config)?;
 
     let prompt_regex = Regex::new(&config.prompt.allowed_pattern).map_err(|e| {
         anyhow!(
@@ -408,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_updates_http_limits_and_rate_policies() -> Result<()> {
+    async fn reload_updates_http_limits() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
 
@@ -417,45 +433,14 @@ mod tests {
 
         let before = store.snapshot();
         assert_eq!(before.http().request_size_limit, 4096);
-        assert_eq!(before.rate_limits().policies().user_hourly_limit, 5);
-        assert_eq!(
-            before.rate_limits().policies().generic_global_hourly_limit,
-            40
-        );
-        assert_eq!(
-            before.rate_limits().policies().generic_per_ip_hourly_limit,
-            5
-        );
 
-        let updated = BASE_CONFIG
-            .replace("request_size_limit = 4096", "request_size_limit = 8192")
-            .replace(
-                "add_task_authenticated_per_user_hourly_rate_limit = 5",
-                "add_task_authenticated_per_user_hourly_rate_limit = 11",
-            )
-            .replace(
-                "add_task_generic_key_global_hourly_rate_limit = 40",
-                "add_task_generic_key_global_hourly_rate_limit = 77",
-            )
-            .replace(
-                "add_task_generic_key_per_ip_hourly_rate_limit = 5",
-                "add_task_generic_key_per_ip_hourly_rate_limit = 9",
-            );
+        let updated = BASE_CONFIG.replace("request_size_limit = 4096", "request_size_limit = 8192");
         std::fs::write(file.path(), updated)?;
 
         assert!(store.reload_from_disk().await);
 
         let after = store.snapshot();
         assert_eq!(after.http().request_size_limit, 8192);
-        assert_eq!(after.rate_limits().policies().user_hourly_limit, 11);
-        assert_eq!(
-            after.rate_limits().policies().generic_global_hourly_limit,
-            77
-        );
-        assert_eq!(
-            after.rate_limits().policies().generic_per_ip_hourly_limit,
-            9
-        );
 
         Ok(())
     }

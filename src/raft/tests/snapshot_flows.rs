@@ -135,7 +135,6 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs();
-    let hour_epoch = now / 3600;
     let day_epoch = now / 86400;
     let global_key = rate_limit_key(Subject::GenericGlobal, 0u128);
     let company_key = rate_limit_key(Subject::Company, 404u128);
@@ -153,17 +152,15 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
                 RateLimitDelta {
                     subject: Subject::GenericGlobal,
                     id: 0u128,
-                    hour_epoch,
                     day_epoch,
-                    add_hour: 5,
-                    add_day: 0,
+                    add_active: 0,
+                    add_day: 5,
                 },
                 RateLimitDelta {
                     subject: Subject::Company,
                     id: 404u128,
-                    hour_epoch,
                     day_epoch,
-                    add_hour: 2,
+                    add_active: 0,
                     add_day: 1,
                 },
             ],
@@ -174,16 +171,12 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
 
     assert_state_machine_value(&state_machines, "pre_snapshot_key", "pre_snapshot_value").await;
     for sm in &state_machines {
-        let (global_hour, global_day) = sm
-            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
-            .await;
-        assert_eq!(global_hour, 5);
-        assert_eq!(global_day, 0);
+        let (global_active, global_day) = sm.get_rate_limit_usage(&global_key, day_epoch).await;
+        assert_eq!(global_active, 0);
+        assert_eq!(global_day, 5);
 
-        let (company_hour, company_day) = sm
-            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
-            .await;
-        assert_eq!(company_hour, 2);
+        let (company_active, company_day) = sm.get_rate_limit_usage(&company_key, day_epoch).await;
+        assert_eq!(company_active, 0);
         assert_eq!(company_day, 1);
     }
 
@@ -298,14 +291,12 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
         let new_node = state_machines
             .last()
             .expect("new node state machine should be present");
-        let (global_hour, global_day) = new_node
-            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
-            .await;
-        let (company_hour, company_day) = new_node
-            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
-            .await;
+        let (global_active, global_day) =
+            new_node.get_rate_limit_usage(&global_key, day_epoch).await;
+        let (company_active, company_day) =
+            new_node.get_rate_limit_usage(&company_key, day_epoch).await;
 
-        if global_hour == 5 && global_day == 0 && company_hour == 2 && company_day == 1 {
+        if global_active == 0 && global_day == 5 && company_active == 0 && company_day == 1 {
             break;
         }
 
@@ -343,16 +334,12 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
     assert_state_machine_value(&state_machines, "pre_snapshot_key", "pre_snapshot_value").await;
     assert_state_machine_value(&state_machines, "post_snapshot_key", "post_snapshot_value").await;
     for sm in &state_machines {
-        let (global_hour, global_day) = sm
-            .get_rate_limit_usage(&global_key, hour_epoch, day_epoch)
-            .await;
-        assert_eq!(global_hour, 5);
-        assert_eq!(global_day, 0);
+        let (global_active, global_day) = sm.get_rate_limit_usage(&global_key, day_epoch).await;
+        assert_eq!(global_active, 0);
+        assert_eq!(global_day, 5);
 
-        let (company_hour, company_day) = sm
-            .get_rate_limit_usage(&company_key, hour_epoch, day_epoch)
-            .await;
-        assert_eq!(company_hour, 2);
+        let (company_active, company_day) = sm.get_rate_limit_usage(&company_key, day_epoch).await;
+        assert_eq!(company_active, 0);
         assert_eq!(company_day, 1);
     }
 

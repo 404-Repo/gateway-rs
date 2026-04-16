@@ -1,5 +1,7 @@
 mod engine;
 mod policy;
 
-pub use engine::{ClientKey, ClusterUsageParams, DistributedRateLimiter};
-pub use policy::RateLimitService;
+pub use engine::{
+    CheckAndIncrParams, ClientKey, ClusterUsageParams, DistributedRateLimiter, RateLimitRejection,
+};
+pub use policy::{RateLimitPolicies, RateLimitService};

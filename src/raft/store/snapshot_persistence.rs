@@ -135,7 +135,7 @@ impl SnapshotPersistence {
         let state_machine = StateMachineData {
             last_applied_log: stored.meta.last_log_id,
             last_membership: stored.meta.last_membership.clone(),
-            data: payload.data,
+            data: super::SnapshotKv::from_owned_map(payload.data),
         };
         Ok((state_machine, payload.rate_limits, stored))
     }

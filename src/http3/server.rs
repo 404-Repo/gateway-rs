@@ -8,8 +8,8 @@ use salvo::prelude::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::api::Task;
-use crate::common::queue::DupQueue;
+use crate::common::queue::TaskQueue;
+use crate::config::TransportMode;
 use crate::config_runtime::RuntimeConfigStore;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
@@ -23,9 +23,8 @@ use crate::http3::handlers::core::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::rate_limits::{
-    basic_rate_limit, leader_rate_limit, load_rate_limit, metric_rate_limit,
-    prepare_rate_limit_context, read_rate_limit, result_rate_limit, status_rate_limit,
-    unauthorized_only_rate_limit, update_key_rate_limit,
+    UnauthorizedDailyLimiter, basic_rate_limit, prepare_rate_limit_context, status_rate_limit,
+    unauthorized_only_rate_limit, worker_rate_limit,
 };
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
@@ -97,10 +96,9 @@ async fn request_file_size_limit(
     ctrl: &mut FlowCtrl,
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
-    let cfg = state.config();
-    SecureMaxSize(cfg.http().request_file_size_limit as usize)
-        .handle(req, depot, res, ctrl)
-        .await;
+    let limit =
+        usize::try_from(state.gateway_state().request_file_size_limit()).unwrap_or(usize::MAX);
+    SecureMaxSize(limit).handle(req, depot, res, ctrl).await;
     Ok(())
 }
 
@@ -126,9 +124,9 @@ pub struct Http3Server {
 impl Http3Server {
     pub async fn run(
         config: Arc<RuntimeConfigStore>,
-        tls_config: RustlsConfig,
+        tls_config: Option<RustlsConfig>,
         gateway_state: GatewayState,
-        task_queue: DupQueue<Task>,
+        task_queue: TaskQueue,
         metrics: Metrics,
         shutdown: CancellationToken,
     ) -> Result<Self> {
@@ -145,29 +143,42 @@ impl Http3Server {
             gateway_state: gateway_state.clone(),
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
+            unauthorized_daily_limiter: Arc::new(UnauthorizedDailyLimiter::new()),
         });
 
         let router = Self::setup_router(state)?;
 
         let service = Service::new(router).catcher(Catcher::default().hoop(custom_response));
 
-        // QUIC requires TLS1.3 per spec.
-        const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
-
-        // Build TCP-specific TLS versions from config (defaults to 1.2,1.3) using static slices.
+        let transport = node_cfg.http.transport;
         let tcp_versions_static = map_tls_versions_to_static(&node_cfg.http.tls_versions);
-        let tls_config_tcp = tls_config.clone().tls_versions(tcp_versions_static);
-        let tls_config_quic = tls_config.tls_versions(TLS13_ONLY);
 
         let join_handle = tokio::spawn(async move {
-            let tcp_listener = TcpListener::new(addr).rustls(tls_config_tcp.clone());
-            let acceptor = QuinnListener::new(tls_config_quic, addr)
-                .join(tcp_listener)
-                .bind()
-                .await;
-            tokio::select! {
-                _ = shutdown.cancelled() => {},
-                _ = Server::new(acceptor).serve(service) => {},
+            match transport {
+                TransportMode::Tls => {
+                    // QUIC requires TLS1.3 per spec.
+                    const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+                    let tls_config = tls_config
+                        .expect("TLS config must be provided when HTTP transport uses TLS");
+                    let tls_config_tcp = tls_config.clone().tls_versions(tcp_versions_static);
+                    let tls_config_quic = tls_config.tls_versions(TLS13_ONLY);
+                    let tcp_listener = TcpListener::new(addr).rustls(tls_config_tcp);
+                    let acceptor = QuinnListener::new(tls_config_quic, addr)
+                        .join(tcp_listener)
+                        .bind()
+                        .await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {},
+                        _ = Server::new(acceptor).serve(service) => {},
+                    }
+                }
+                TransportMode::Plain => {
+                    let acceptor = TcpListener::new(addr).bind().await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {},
+                        _ = Server::new(acceptor).serve(service) => {},
+                    }
+                }
             }
         });
 
@@ -209,7 +220,7 @@ impl Http3Server {
             .push(
                 Router::with_path("/add_result")
                     .hoop(request_file_size_limit)
-                    .hoop(result_rate_limit)
+                    .hoop(worker_rate_limit)
                     .post(add_result_handler),
             )
             .push(
@@ -220,13 +231,13 @@ impl Http3Server {
             .push(
                 Router::with_path("/get_load")
                     .hoop(request_size_limit)
-                    .hoop(load_rate_limit)
+                    .hoop(worker_rate_limit)
                     .get(get_load_handler),
             )
             .push(
                 Router::with_path("/get_leader")
                     .hoop(request_size_limit)
-                    .hoop(leader_rate_limit)
+                    .hoop(worker_rate_limit)
                     .get(get_leader_handler),
             )
             .push(
@@ -239,6 +250,7 @@ impl Http3Server {
             .push(
                 Router::with_path("/get_version")
                     .hoop(request_size_limit)
+                    .hoop(admin_key_check)
                     .hoop(basic_rate_limit)
                     .get(version_handler),
             )
@@ -257,26 +269,22 @@ impl Http3Server {
                 Router::with_path("/get_status")
                     .hoop(request_size_limit)
                     .hoop(status_rate_limit)
-                    .hoop(api_or_generic_key_check)
                     .get(get_status_handler),
             )
             .push(
                 Router::with_path("/update_key")
                     .hoop(request_size_limit)
-                    .hoop(update_key_rate_limit)
                     .hoop(admin_key_check)
                     .post(generic_key_update_handler),
             )
             .push(
                 Router::with_path("/metrics")
                     .hoop(request_size_limit)
-                    .hoop(metric_rate_limit)
                     .get(metrics_handler),
             )
             .push(
                 Router::with_path("/get_key")
                     .hoop(request_size_limit)
-                    .hoop(read_rate_limit)
                     .hoop(admin_key_check)
                     .get(generic_key_read_handler),
             ))

@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use http::StatusCode;
-use salvo::test::TestClient;
 use uuid::Uuid;
 
 use gateway::crypto::hotkey::Hotkey;
 use gateway::test_support::{CompanyRateLimit, RateLimitContext};
 
 use crate::support::{
-    add_success_result, build_harness, default_rate_ctx, multipart_add_task, read_response,
-    tiny_png_bytes, wait_for_activity,
+    TestClient, add_success_result, build_harness, default_rate_ctx, multipart_add_task,
+    read_response, tiny_png_bytes, wait_for_activity,
 };
 
 #[tokio::test]
@@ -44,7 +43,7 @@ async fn records_client_activity_events() {
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::OK);
 
-    let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 2).await;
+    let rows = wait_for_activity(&h, 2).await;
     let actions: Vec<_> = rows.iter().map(|r| r.action.as_str()).collect();
     assert!(actions.contains(&"add_task"));
     assert!(actions.contains(&"get_result"));
@@ -53,18 +52,20 @@ async fn records_client_activity_events() {
         .iter()
         .find(|r| r.action == "add_task")
         .expect("add_task");
-    assert_eq!(add_task.task_kind, "txt3d");
+    assert_eq!(add_task.event_family, "other");
+    assert_eq!(add_task.task_kind.as_deref(), Some("txt3d"));
     assert_eq!(add_task.task_id, Some(task_id));
-    assert_eq!(add_task.tool, "api");
+    assert_eq!(add_task.client_origin, "api");
     assert_eq!(add_task.model.as_deref(), Some("404-3dgs"));
 
     let get_result = rows
         .iter()
         .find(|r| r.action == "get_result")
         .expect("get_result");
-    assert_eq!(get_result.task_kind, "unknown");
+    assert_eq!(get_result.event_family, "other");
+    assert_eq!(get_result.task_kind.as_deref(), Some("unknown"));
     assert_eq!(get_result.task_id, Some(task_id));
-    assert_eq!(get_result.tool, "api");
+    assert_eq!(get_result.client_origin, "api");
     assert!(get_result.model.is_none());
 }
 
@@ -77,21 +78,16 @@ async fn records_company_activity_with_image_task() {
         company: Some(CompanyRateLimit {
             id: company_id,
             name: Arc::from("Acme"),
-            hourly_limit: 100,
+            concurrent_limit: 100,
             daily_limit: 1000,
         }),
         ..RateLimitContext::default()
     };
     let h = build_harness(rate_ctx, None).await;
 
-    let company_key = Uuid::new_v4().to_string();
-    h.key_validator
-        .seed_company_key(&company_key, company_id, "Acme", 100, 1000)
-        .await;
-
     let (boundary, body) = multipart_add_task(None, Some(tiny_png_bytes().as_slice()));
     let res = TestClient::post("http://localhost/add_task")
-        .add_header("x-api-key", company_key, true)
+        .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header("x-client-origin", "blender", true)
         .add_header(
             "content-type",
@@ -107,14 +103,15 @@ async fn records_company_activity_with_image_task() {
     let task_id = payload.get("id").and_then(|v| v.as_str()).expect("id");
     let task_id = Uuid::parse_str(task_id).expect("uuid");
 
-    let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 1).await;
+    let rows = wait_for_activity(&h, 1).await;
     let add_task = rows
         .iter()
         .find(|r| r.action == "add_task")
         .expect("add_task");
-    assert_eq!(add_task.task_kind, "img3d");
+    assert_eq!(add_task.event_family, "other");
+    assert_eq!(add_task.task_kind.as_deref(), Some("img3d"));
     assert_eq!(add_task.task_id, Some(task_id));
-    assert_eq!(add_task.tool, "blender");
+    assert_eq!(add_task.client_origin, "blender");
     assert_eq!(add_task.company_id, Some(company_id));
     assert_eq!(add_task.company_name.as_deref(), Some("Acme"));
     assert_eq!(add_task.model.as_deref(), Some("404-3dgs"));
@@ -138,12 +135,13 @@ async fn records_generic_key_activity_event() {
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::OK);
 
-    let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 1).await;
+    let rows = wait_for_activity(&h, 1).await;
     let add_task = rows
         .iter()
         .find(|r| r.action == "add_task")
         .expect("add_task");
-    assert_eq!(add_task.tool, "blender");
+    assert_eq!(add_task.event_family, "other");
+    assert_eq!(add_task.client_origin, "blender");
     assert!(add_task.user_id.is_none());
     assert!(add_task.company_id.is_none());
 }
@@ -166,12 +164,13 @@ async fn records_generic_key_activity_event_for_unity_origin() {
     let (status, _headers, _body) = read_response(res).await;
     assert_eq!(status, StatusCode::OK);
 
-    let rows = wait_for_activity(&h.event_recorder, &h.event_sink, 1).await;
+    let rows = wait_for_activity(&h, 1).await;
     let add_task = rows
         .iter()
         .find(|r| r.action == "add_task")
         .expect("add_task");
-    assert_eq!(add_task.tool, "unity");
+    assert_eq!(add_task.event_family, "other");
+    assert_eq!(add_task.client_origin, "unity");
     assert!(add_task.user_id.is_none());
     assert!(add_task.company_id.is_none());
 }

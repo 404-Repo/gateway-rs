@@ -4,6 +4,11 @@ use prometheus::{
 };
 use scc::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const WORKER_METRICS_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+const WORKER_METRICS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Per-worker metrics
 pub struct MetricsEntry {
@@ -15,6 +20,7 @@ pub struct MetricsEntry {
     pub tasks_received: Counter,
     pub best_results_total: Gauge,
     pub tasks_in_progress: IntGauge,
+    last_touched_ms: AtomicU64,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,6 +67,7 @@ struct MetricsInner {
     tasks_in_progress: IntGaugeVec,
 
     map: HashMap<String, Arc<MetricsEntry>, RandomState>,
+    last_cleanup_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -183,6 +190,7 @@ impl Metrics {
             tasks_in_progress,
             requests_by_origin,
             map: HashMap::with_capacity_and_hasher(16, RandomState::default()),
+            last_cleanup_ms: AtomicU64::new(0),
         };
 
         Ok(Metrics {
@@ -213,7 +221,9 @@ impl Metrics {
     }
 
     async fn get_entry(&self, key: &str) -> Arc<MetricsEntry> {
+        let now_ms = current_time_millis();
         if let Some(e) = self.inner.map.read_async(key, |_, v| v.clone()).await {
+            e.touch(now_ms);
             e
         } else {
             let e = Arc::new(MetricsEntry {
@@ -225,6 +235,7 @@ impl Metrics {
                 tasks_received: self.inner.tasks_received.with_label_values(&[key]),
                 best_results_total: self.inner.best_results_total.with_label_values(&[key]),
                 tasks_in_progress: self.inner.tasks_in_progress.with_label_values(&[key]),
+                last_touched_ms: AtomicU64::new(now_ms),
             });
             let _ = self
                 .inner
@@ -233,6 +244,60 @@ impl Metrics {
                 .await;
             e
         }
+    }
+
+    pub async fn maybe_evict_stale_workers(&self) {
+        let now_ms = current_time_millis();
+        let last_cleanup_ms = self.inner.last_cleanup_ms.load(Ordering::Acquire);
+        let min_next_cleanup_ms =
+            last_cleanup_ms.saturating_add(duration_to_millis(WORKER_METRICS_CLEANUP_INTERVAL));
+        if now_ms < min_next_cleanup_ms {
+            return;
+        }
+        if self
+            .inner
+            .last_cleanup_ms
+            .compare_exchange(last_cleanup_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.evict_stale_workers_inner(now_ms, WORKER_METRICS_IDLE_TTL)
+            .await;
+    }
+
+    async fn evict_stale_workers_inner(&self, now_ms: u64, max_idle: Duration) {
+        let stale_before_ms = now_ms.saturating_sub(duration_to_millis(max_idle));
+        let completion_time_avg = self.inner.completion_time_avg.clone();
+        let completion_time_max = self.inner.completion_time_max.clone();
+        let completed_tasks = self.inner.completed_tasks.clone();
+        let failed_tasks = self.inner.failed_tasks.clone();
+        let timeout_failed_tasks = self.inner.timeout_failed_tasks.clone();
+        let tasks_received = self.inner.tasks_received.clone();
+        let best_results_total = self.inner.best_results_total.clone();
+        let tasks_in_progress = self.inner.tasks_in_progress.clone();
+
+        self.inner
+            .map
+            .retain_async(|key, entry| {
+                if entry.tasks_in_progress.get() > 0
+                    || entry.last_touched_ms.load(Ordering::Acquire) > stale_before_ms
+                {
+                    return true;
+                }
+
+                let labels = [key.as_str()];
+                let _ = completion_time_avg.remove_label_values(&labels);
+                let _ = completion_time_max.remove_label_values(&labels);
+                let _ = completed_tasks.remove_label_values(&labels);
+                let _ = failed_tasks.remove_label_values(&labels);
+                let _ = timeout_failed_tasks.remove_label_values(&labels);
+                let _ = tasks_received.remove_label_values(&labels);
+                let _ = best_results_total.remove_label_values(&labels);
+                let _ = tasks_in_progress.remove_label_values(&labels);
+                false
+            })
+            .await;
     }
 
     pub fn record_queue_time(&self, v: f64) {
@@ -282,6 +347,17 @@ impl Metrics {
         let entry = self.get_entry(key).await;
         TaskInProgressGuard::new(entry.tasks_in_progress.clone())
     }
+
+    #[cfg(test)]
+    pub async fn evict_stale_workers_for_test(&self, max_idle: Duration) {
+        self.evict_stale_workers_inner(current_time_millis(), max_idle)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub fn worker_entry_count(&self) -> usize {
+        self.inner.map.len()
+    }
 }
 
 pub struct TaskInProgressGuard {
@@ -298,5 +374,77 @@ impl TaskInProgressGuard {
 impl Drop for TaskInProgressGuard {
     fn drop(&mut self) {
         self.gauge.dec();
+    }
+}
+
+impl MetricsEntry {
+    fn touch(&self, now_ms: u64) {
+        self.last_touched_ms.store(now_ms, Ordering::Release);
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_to_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Metrics;
+
+    fn worker_metric_present(metrics: &Metrics, metric_name: &str, worker: &str) -> bool {
+        metrics.registry().gather().into_iter().any(|family| {
+            family.name() == metric_name
+                && family.metric.iter().any(|metric| {
+                    metric
+                        .label
+                        .iter()
+                        .any(|label| label.name() == "worker" && label.value() == worker)
+                })
+        })
+    }
+
+    #[tokio::test]
+    async fn evicts_stale_worker_metrics_from_registry() {
+        let metrics = Metrics::new(0.05).unwrap();
+
+        metrics.inc_tasks_received("worker-a", 1).await;
+        assert_eq!(metrics.worker_entry_count(), 1);
+        assert!(worker_metric_present(
+            &metrics,
+            "tasks_received_total",
+            "worker-a"
+        ));
+
+        metrics.evict_stale_workers_for_test(Duration::ZERO).await;
+
+        assert_eq!(metrics.worker_entry_count(), 0);
+        assert!(!worker_metric_present(
+            &metrics,
+            "tasks_received_total",
+            "worker-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn keeps_active_workers_while_tasks_are_in_progress() {
+        let metrics = Metrics::new(0.05).unwrap();
+
+        let guard = metrics.start_task("worker-b").await;
+        metrics.evict_stale_workers_for_test(Duration::ZERO).await;
+        assert_eq!(metrics.worker_entry_count(), 1);
+
+        drop(guard);
+        metrics.evict_stale_workers_for_test(Duration::ZERO).await;
+        assert_eq!(metrics.worker_entry_count(), 0);
     }
 }
