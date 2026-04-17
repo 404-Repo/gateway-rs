@@ -110,9 +110,6 @@ pub struct ApiKeyValidator {
     last_company_keys_sync_ms: AtomicU64,
     last_billing_owners_sync_ms: AtomicU64,
     gateway_settings: Arc<GatewayRuntimeSettingsStore>,
-    // TTL for revoked-key cleanup polling. The new gen schema retains revoked keys,
-    // so cleanup is a no-op but we keep the configuration surface unchanged.
-    deleted_keys_ttl_minutes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -154,7 +151,7 @@ impl ApiKeyValidator {
             unknown_key_ip_cooldown_ttl_sec,
             unknown_key_ip_cache_capacity,
             unknown_key_ip_miss_limit,
-            deleted_keys_ttl_minutes,
+            deleted_keys_ttl_minutes: _,
             fallback_generic_key,
         } = config;
         let gateway_settings = Arc::new(GatewayRuntimeSettingsStore::new(
@@ -196,7 +193,6 @@ impl ApiKeyValidator {
             last_company_keys_sync_ms: AtomicU64::new(0),
             last_billing_owners_sync_ms: AtomicU64::new(0),
             gateway_settings,
-            deleted_keys_ttl_minutes,
         })
     }
 
@@ -441,8 +437,6 @@ impl ApiKeyValidator {
             )?;
         }
 
-        let cutoff = now - (self.deleted_keys_ttl_minutes as i64 * 60_000);
-        let _ = self.db.cleanup_deleted_keys_before(cutoff).await;
         Ok(())
     }
 

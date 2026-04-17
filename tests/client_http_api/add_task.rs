@@ -12,10 +12,11 @@ use gateway::raft::rate_limit::RateLimitPolicies;
 use crate::common::GatewayHarnessOptions;
 use crate::support::{
     TestClient, add_task_prompt, add_task_prompt_with_api_key, build_harness,
-    build_harness_with_options, create_personal_api_key, fetch_generation_task_lifecycle,
-    lookup_api_key, multipart_body, read_response, revoke_api_key_without_timestamp,
-    set_gateway_runtime_settings, set_generic_rate_limit_policies, set_guest_free_settings,
-    set_registered_free_settings, tiny_png_bytes, top_up_personal_api_key_balance,
+    build_harness_with_options, fetch_generation_task_lifecycle, lookup_api_key, multipart_body,
+    read_response, revoke_api_key_without_timestamp, set_gateway_runtime_settings,
+    set_generic_rate_limit_policies, set_guest_free_settings, set_registered_free_settings,
+    tiny_png_bytes, top_up_personal_api_key_balance,
+    try_create_personal_api_key_without_timestamps,
     update_company_api_key_limits_without_timestamp,
     update_personal_api_key_limits_without_timestamp,
     update_personal_api_key_limits_without_timestamp_no_sync,
@@ -842,7 +843,9 @@ async fn add_task_company_key_limit_updates_take_effect_without_manual_updated_a
 #[tokio::test]
 async fn add_task_revoked_personal_key_is_rejected_after_sync_without_manual_updated_at() {
     let h = build_harness().await;
-    let api_key = create_personal_api_key(&h).await;
+    let api_key = try_create_personal_api_key_without_timestamps(&h, &h.user_api_key)
+        .await
+        .expect("create second personal api key without timestamps");
     top_up_personal_api_key_balance(&h, &api_key, 100_000).await;
 
     let _task_id = add_task_prompt_with_api_key(&h, &api_key, "robot", None).await;

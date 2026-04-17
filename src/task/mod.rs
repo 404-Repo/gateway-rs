@@ -372,6 +372,7 @@ impl TaskManager {
                                         let mut schedule_results_expiration = None;
                                         let mut timed_out_workers = Vec::new();
                                         let mut timed_out_task_kind = None;
+                                        let mut timed_out_elapsed_secs = None;
                                         match inner.tasks.entry_async(task_id).await {
                                             Entry::Occupied(mut entry) => {
                                                 let state = entry.get_mut();
@@ -425,6 +426,9 @@ impl TaskManager {
                                                         timed_out_workers.push((worker, worker_id));
                                                     }
                                                     timed_out_task_kind = Some(task_kind);
+                                                    timed_out_elapsed_secs = state
+                                                        .execution_start
+                                                        .map(|start| start.elapsed().as_secs_f64());
                                                     state.in_progress.clear();
                                                     state.prompt = None;
                                                     state.image = None;
@@ -494,6 +498,17 @@ impl TaskManager {
                                             Entry::Vacant(_) => {}
                                         }
                                         if let Some(task_kind) = timed_out_task_kind {
+                                            if let Some(elapsed_secs) = timed_out_elapsed_secs {
+                                                warn!(
+                                                    "Task {}, kind {}, timed out after {:.2}s",
+                                                    task_id, task_kind, elapsed_secs
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "Task {}, kind {}, timed out",
+                                                    task_id, task_kind
+                                                );
+                                            }
                                             for (worker, worker_id) in timed_out_workers {
                                                 inner.metrics.inc_timeout_failed(worker.as_ref()).await;
                                                 if let Some(recorder) = inner.worker_event_recorder.as_ref() {

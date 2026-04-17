@@ -36,7 +36,6 @@ pub(super) enum StmtKey {
     FullCompanyKeys,
     DeltaCompanyKeys,
     CompanyKeysForIds,
-    CleanupDeletedKeysBoth,
     FetchApiKeyBillingOwner,
     GenerationSubmitTask,
     GenerationRecordTaskAssignments,
@@ -70,7 +69,6 @@ const STARTUP_STMT_KEYS: &[StmtKey] = &[
     StmtKey::FullCompanyKeys,
     StmtKey::DeltaCompanyKeys,
     StmtKey::CompanyKeysForIds,
-    StmtKey::CleanupDeletedKeysBoth,
     StmtKey::FetchApiKeyBillingOwner,
 ];
 
@@ -579,15 +577,17 @@ impl MainPool {
             {
                 let bit = 1usize << index;
                 let prev = self.available_mask.fetch_and(!bit, Ordering::AcqRel);
-                if prev & bit != 0 {
-                    let slot = Arc::clone(&self.slots[index]);
-                    slot.mark_busy();
-                    return Ok(MainPoolLease {
-                        pool: Arc::clone(self),
-                        slot,
-                        released: false,
-                    });
+                if prev & bit == 0 {
+                    continue;
                 }
+
+                let slot = Arc::clone(&self.slots[index]);
+                slot.mark_busy();
+                return Ok(MainPoolLease {
+                    pool: Arc::clone(self),
+                    slot,
+                    released: false,
+                });
             }
 
             let notified = self.notify.notified();
@@ -888,7 +888,6 @@ impl Database {
             StmtKey::FullCompanyKeys => Self::Q_FULL_COMPANY_KEYS,
             StmtKey::DeltaCompanyKeys => Self::Q_DELTA_COMPANY_KEYS,
             StmtKey::CompanyKeysForIds => Self::Q_COMPANY_KEYS_FOR_IDS,
-            StmtKey::CleanupDeletedKeysBoth => Self::Q_CLEANUP_DELETED_KEYS_BOTH,
             StmtKey::FetchApiKeyBillingOwner => Self::Q_FETCH_API_KEY_BILLING_OWNER,
             StmtKey::GenerationSubmitTask => Self::Q_GENERATION_SUBMIT_TASK,
             StmtKey::GenerationRecordTaskAssignments => Self::Q_GENERATION_RECORD_TASK_ASSIGNMENTS,

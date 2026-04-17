@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use base64_simd::STANDARD;
 use foldhash::HashSet;
 use http::StatusCode;
@@ -491,6 +492,26 @@ pub(crate) async fn set_guest_free_settings(
     sync_db_caches(h).await;
 }
 
+pub(crate) async fn set_personal_api_key_create_limit(h: &TestHarness, limit: i32) {
+    let updated = h
+        .core
+        .db_client
+        .execute(
+            "UPDATE app_settings
+             SET personal_api_key_create_limit_per_day = $1,
+                 updated_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+             WHERE id = 1",
+            &[&limit],
+        )
+        .await
+        .expect("update personal api key creation limit");
+    assert_eq!(
+        updated, 1,
+        "expected exactly one app_settings row to update"
+    );
+    sync_db_caches(h).await;
+}
+
 pub(crate) async fn update_company_api_key_limits_without_timestamp(
     h: &TestHarness,
     api_key: &str,
@@ -568,6 +589,77 @@ pub(crate) async fn create_personal_api_key(h: &TestHarness) -> String {
         .await
         .expect("sync db caches");
     api_key
+}
+
+pub(crate) async fn try_create_personal_api_key_without_timestamps(
+    h: &TestHarness,
+    existing_api_key: &str,
+) -> anyhow::Result<String> {
+    let existing_hash = api_key_hash_bytes(h, existing_api_key);
+    let existing_row = h
+        .core
+        .db_client
+        .query_one(
+            "SELECT account_id, user_id
+             FROM api_keys
+             WHERE api_key_hash = $1
+               AND user_id IS NOT NULL
+               AND key_scope = 'personal'
+             LIMIT 1",
+            &[&&existing_hash[..]],
+        )
+        .await
+        .context("select existing personal api key owner")?;
+    let account_id: i64 = existing_row.get("account_id");
+    let user_id: i64 = existing_row.get("user_id");
+
+    let api_key = Uuid::new_v4().to_string();
+    let api_key_hash = api_key_hash_bytes(h, &api_key);
+    let api_key_partial: String = api_key.chars().take(8).collect();
+
+    h.core
+        .db_client
+        .execute(
+            "INSERT INTO api_keys (
+                account_id, key_scope, user_id, company_id, name, api_key_hash, api_key_encrypted,
+                api_key_partial, is_primary, created_by_user_id, last_used_at, revoked_at
+             ) VALUES (
+                $1, 'personal', $2, NULL, $3, $4, NULL, $5, FALSE, $2, NULL, NULL
+             )",
+            &[
+                &account_id,
+                &user_id,
+                &"gateway-test-user-key-without-timestamps",
+                &&api_key_hash[..],
+                &api_key_partial,
+            ],
+        )
+        .await
+        .context("insert personal api key without timestamps")?;
+
+    h.core
+        .gateway
+        .sync_db_caches_for_test()
+        .await
+        .context("sync db caches")?;
+
+    Ok(api_key)
+}
+
+pub(crate) async fn try_delete_api_key(h: &TestHarness, api_key: &str) -> anyhow::Result<u64> {
+    let key_hash = api_key_hash_bytes(h, api_key);
+    let deleted = h
+        .core
+        .db_client
+        .execute(
+            "DELETE FROM api_keys
+             WHERE api_key_hash = $1",
+            &[&&key_hash[..]],
+        )
+        .await
+        .context("delete api key")?;
+    sync_db_caches(h).await;
+    Ok(deleted)
 }
 
 pub(crate) async fn top_up_personal_api_key_balance(

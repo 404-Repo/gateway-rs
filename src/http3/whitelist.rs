@@ -27,7 +27,7 @@ async fn resolve_domains_best_effort(
 ) -> RateLimitWhitelistResolution {
     let mut ips = HashSet::new();
     let mut had_resolution_failures = false;
-    let mut resolutions = stream::iter(domains.into_iter())
+    let mut resolutions = stream::iter(domains)
         .map(|domain| async move {
             let result = lookup_all_host_ips(std::slice::from_ref(&domain)).await;
             (domain, result)
