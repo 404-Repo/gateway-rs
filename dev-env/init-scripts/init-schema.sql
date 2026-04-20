@@ -64,10 +64,12 @@ CREATE TABLE IF NOT EXISTS app_settings (
   gateway_generic_global_daily_limit INTEGER NOT NULL CHECK (gateway_generic_global_daily_limit >= 0),
   gateway_generic_per_ip_daily_limit INTEGER NOT NULL CHECK (gateway_generic_per_ip_daily_limit >= 0),
   gateway_generic_window_ms BIGINT NOT NULL CHECK (gateway_generic_window_ms > 0),
+  personal_api_key_create_limit_per_day INTEGER NOT NULL DEFAULT 10 CHECK (personal_api_key_create_limit_per_day >= 0),
   add_task_unauthorized_per_ip_daily_rate_limit INTEGER NOT NULL CHECK (add_task_unauthorized_per_ip_daily_rate_limit >= 0),
   rate_limit_whitelist TEXT[] NOT NULL,
   max_task_queue_len INTEGER NOT NULL CHECK (max_task_queue_len >= 0),
   request_file_size_limit BIGINT NOT NULL CHECK (request_file_size_limit >= 0),
+  stripe_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL
 );
@@ -86,10 +88,12 @@ BEGIN
     gateway_generic_global_daily_limit,
     gateway_generic_per_ip_daily_limit,
     gateway_generic_window_ms,
+    personal_api_key_create_limit_per_day,
     add_task_unauthorized_per_ip_daily_rate_limit,
     rate_limit_whitelist,
     max_task_queue_len,
     request_file_size_limit,
+    stripe_enabled,
     created_at,
     updated_at
   )
@@ -103,10 +107,12 @@ BEGIN
     250,
     10,
     86400000,
+    10,
     1200,
     ARRAY[]::TEXT[],
     500,
-    104857600,
+    157286400,
+    TRUE,
     v_now,
     v_now
   )
@@ -442,6 +448,91 @@ ON api_keys
 FOR EACH ROW
 EXECUTE FUNCTION gen_guard_primary_personal_api_key();
 
+CREATE OR REPLACE FUNCTION gen_guard_last_active_personal_api_key()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_active_non_primary_count BIGINT;
+  v_recent_key_count BIGINT;
+  v_limit INTEGER;
+  v_now BIGINT := FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+BEGIN
+  IF OLD.key_scope <> 'personal'
+     OR OLD.user_id IS NULL
+     OR OLD.is_primary = TRUE
+     OR OLD.revoked_at IS NOT NULL THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP <> 'DELETE' THEN
+    IF NEW.revoked_at IS NULL
+       OR NEW.revoked_at IS NOT DISTINCT FROM OLD.revoked_at THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+
+  PERFORM gen_advisory_xact_lock(
+    'api_keys_last_active_personal_key',
+    OLD.user_id::TEXT
+  );
+
+  SELECT COUNT(*)
+  INTO v_active_non_primary_count
+  FROM api_keys
+  WHERE user_id = OLD.user_id
+    AND key_scope = 'personal'
+    AND is_primary = FALSE
+    AND revoked_at IS NULL;
+
+  IF v_active_non_primary_count <= 1 THEN
+    SELECT COUNT(*)
+    INTO v_recent_key_count
+    FROM api_keys
+    WHERE user_id = OLD.user_id
+      AND key_scope = 'personal'
+      AND is_primary = FALSE
+      AND created_at > (v_now - 86400000);
+
+    SELECT personal_api_key_create_limit_per_day
+    INTO v_limit
+    FROM app_settings
+    WHERE id = 1;
+
+    v_limit := COALESCE(v_limit, 10);
+
+    IF v_recent_key_count >= v_limit THEN
+      RAISE EXCEPTION
+        USING
+          ERRCODE = 'ZK104',
+          MESSAGE = FORMAT(
+            'User %s must keep at least one non-primary active personal API key.',
+            OLD.user_id
+          );
+    END IF;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS api_keys_last_active_personal_guard ON api_keys;
+
+CREATE TRIGGER api_keys_last_active_personal_guard
+BEFORE UPDATE OF revoked_at OR DELETE
+ON api_keys
+FOR EACH ROW
+EXECUTE FUNCTION gen_guard_last_active_personal_api_key();
+
 CREATE OR REPLACE FUNCTION gen_enforce_active_personal_api_key_limit()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -490,6 +581,70 @@ CREATE TRIGGER api_keys_active_personal_limit_guard
 BEFORE INSERT OR UPDATE OF key_scope, user_id, revoked_at ON api_keys
 FOR EACH ROW
 EXECUTE FUNCTION gen_enforce_active_personal_api_key_limit();
+
+CREATE OR REPLACE FUNCTION gen_enforce_personal_api_key_creation_rate_limit()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_recent_key_count BIGINT;
+  v_limit INTEGER;
+  v_now BIGINT := FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT;
+BEGIN
+  IF NEW.key_scope <> 'personal'
+     OR NEW.user_id IS NULL
+     OR NEW.is_primary = TRUE THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.created_at IS NULL THEN
+    NEW.created_at := v_now;
+  END IF;
+
+  PERFORM gen_advisory_xact_lock(
+    'api_keys_personal_creation_rate_limit',
+    NEW.user_id::TEXT
+  );
+
+  SELECT COUNT(*)
+  INTO v_recent_key_count
+  FROM api_keys
+  WHERE user_id = NEW.user_id
+    AND key_scope = 'personal'
+    AND is_primary = FALSE
+    AND created_at > (NEW.created_at - 86400000);
+
+  SELECT personal_api_key_create_limit_per_day
+  INTO v_limit
+  FROM app_settings
+  WHERE id = 1;
+
+  v_limit := COALESCE(v_limit, 10);
+
+  IF v_recent_key_count >= v_limit THEN
+    RAISE EXCEPTION
+      USING
+        ERRCODE = 'ZK103',
+        MESSAGE = FORMAT(
+          'User %s cannot create more than %s personal API keys per rolling 24-hour window.',
+          NEW.user_id
+          , v_limit
+        );
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS api_keys_personal_creation_rate_limit_guard ON api_keys;
+
+CREATE TRIGGER api_keys_personal_creation_rate_limit_guard
+BEFORE INSERT
+ON api_keys
+FOR EACH ROW
+EXECUTE FUNCTION gen_enforce_personal_api_key_creation_rate_limit();
 
 CREATE OR REPLACE FUNCTION gen_enforce_active_company_api_key_limit()
 RETURNS trigger

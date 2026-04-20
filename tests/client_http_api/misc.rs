@@ -1,6 +1,10 @@
 use http::StatusCode;
 
-use crate::support::{TestClient, build_harness, build_harness_with_gateway_info, read_response};
+use crate::support::{
+    TestClient, build_harness, build_harness_with_gateway_info, read_response,
+    set_personal_api_key_create_limit, try_create_personal_api_key_without_timestamps,
+    try_delete_api_key,
+};
 
 #[tokio::test]
 async fn get_load_success() {
@@ -104,4 +108,39 @@ async fn add_task_size_limit_updates_after_runtime_reload() {
         status_after,
         StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE
     ));
+}
+
+#[tokio::test]
+async fn deleting_last_non_primary_personal_api_key_is_allowed_when_replacement_can_be_created() {
+    let h = build_harness().await;
+
+    let deleted = try_delete_api_key(&h, &h.user_api_key)
+        .await
+        .expect("deleting the last non-primary personal key should succeed when quota remains");
+    assert_eq!(deleted, 1, "expected exactly one api key row to delete");
+}
+
+#[tokio::test]
+async fn deleting_last_non_primary_personal_api_key_is_rejected_when_creation_quota_is_exhausted() {
+    let h = build_harness().await;
+    set_personal_api_key_create_limit(&h, 1).await;
+
+    let err = try_delete_api_key(&h, &h.user_api_key).await.expect_err(
+        "deleting the last non-primary personal key should fail when quota is exhausted",
+    );
+    let err_message = format!("{err:#}");
+    assert!(err_message.contains("must keep at least one non-primary active personal API key"));
+}
+
+#[tokio::test]
+async fn personal_api_key_creation_limit_applies_without_explicit_timestamps() {
+    let h = build_harness().await;
+    set_personal_api_key_create_limit(&h, 1).await;
+
+    let err = try_create_personal_api_key_without_timestamps(&h, &h.user_api_key)
+        .await
+        .expect_err("creation limit should apply before timestamp trigger fills created_at");
+
+    let err_message = format!("{err:#}");
+    assert!(err_message.contains("cannot create more than 1 personal API keys"));
 }

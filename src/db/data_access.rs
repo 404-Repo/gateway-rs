@@ -451,10 +451,6 @@ LEFT JOIN api_keys k
 GROUP BY c.company_id;
 "#;
 
-    pub(super) const Q_CLEANUP_DELETED_KEYS_BOTH: &'static str = r#"
-SELECT 0::BIGINT AS n1, 0::BIGINT AS n2;
-"#;
-
     pub(super) const COPY_ACTIVITY_EVENTS: &'static str = "\
 COPY activity_events (\
 task_id, \
@@ -622,19 +618,6 @@ created_at\
             .into_iter()
             .map(decode_company_key_hashes_row)
             .collect())
-    }
-
-    pub async fn cleanup_deleted_keys_before(&self, _cutoff: i64) -> Result<(u64, u64)> {
-        let rows = self
-            .query_prepared(StmtKey::CleanupDeletedKeysBoth, &[])
-            .await?;
-        let row = rows
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("Cleanup query returned no rows"))?;
-        let n1: i64 = row.get("n1");
-        let n2: i64 = row.get("n2");
-        Ok((n1 as u64, n2 as u64))
     }
 
     pub async fn fetch_gateway_settings(&self) -> Result<Option<GatewaySettingsRow>> {
