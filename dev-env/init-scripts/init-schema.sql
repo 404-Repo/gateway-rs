@@ -3180,12 +3180,10 @@ REVOKE ALL ON FUNCTION generation_purge_terminal_tasks(INTEGER, BIGINT) FROM PUB
 
 CREATE TABLE IF NOT EXISTS activity_events (
   id BIGSERIAL PRIMARY KEY,
-  task_id UUID REFERENCES generation_tasks(id) ON DELETE SET NULL,
-  account_id BIGINT REFERENCES accounts(id) ON DELETE SET NULL,
-  user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
-  company_id UUID REFERENCES companies(id) ON DELETE SET NULL,
-  api_key_id BIGINT REFERENCES api_keys(id) ON DELETE SET NULL,
-  session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+  task_id UUID,
+  account_id BIGINT,
+  user_id BIGINT,
+  company_id UUID,
   action TEXT NOT NULL,
   event_family TEXT NOT NULL DEFAULT 'other' CHECK (event_family IN ('auth', 'other')),
   client_origin TEXT NOT NULL DEFAULT 'website',
@@ -3211,10 +3209,6 @@ CREATE INDEX IF NOT EXISTS activity_events_user_created_idx
 CREATE INDEX IF NOT EXISTS activity_events_company_created_idx
   ON activity_events (company_id, created_at DESC)
   WHERE company_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS activity_events_session_id_idx
-  ON activity_events (session_id)
-  WHERE session_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS activity_events_action_created_idx
   ON activity_events (action, created_at DESC);
@@ -3255,7 +3249,7 @@ CREATE INDEX IF NOT EXISTS stripe_webhook_events_status_updated_idx
 
 CREATE TABLE IF NOT EXISTS worker_events (
   id BIGSERIAL PRIMARY KEY,
-  task_id UUID REFERENCES generation_tasks(id) ON DELETE SET NULL,
+  task_id UUID,
   worker_id TEXT,
   action TEXT NOT NULL,
   task_kind TEXT NOT NULL,

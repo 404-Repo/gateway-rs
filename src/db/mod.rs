@@ -8,6 +8,7 @@ mod task_lifecycle;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use tokio::sync::Mutex;
@@ -42,6 +43,7 @@ pub struct Database {
 pub struct ActivityEventRow {
     pub user_id: Option<i64>,
     pub user_email: Option<String>,
+    pub account_id: Option<i64>,
     pub company_id: Option<uuid::Uuid>,
     pub company_name: Option<String>,
     pub action: String,
@@ -60,8 +62,10 @@ pub struct WorkerEventRow {
     pub worker_id: Option<String>,
     pub action: String,
     pub task_kind: String,
+    pub model: Option<String>,
     pub reason: Option<String>,
     pub gateway_name: String,
+    pub metadata_json: Value,
     pub created_at: DateTime<Utc>,
 }
 

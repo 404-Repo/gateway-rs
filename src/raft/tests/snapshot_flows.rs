@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(3)?;
+    let (_network_guard, node_configs) = reserve_node_configs(3).await?;
 
     let storage_paths: Vec<NodeStoragePaths> = node_configs
         .iter()
@@ -109,7 +109,7 @@ async fn test_add_voter_node_after_snapshot_compaction() -> Result<()> {
 
     // Set up an initial three-node cluster with persistent storage so snapshots
     // produce on-disk artifacts and purge earlier log entries.
-    let node_configs = reserve_node_configs(4)?;
+    let (_network_guard, node_configs) = reserve_node_configs(4).await?;
     let initial_configs = node_configs[..3].to_vec();
     let new_node_id = node_configs[3].0;
     let new_node_addr = node_configs[3].1.as_str();

@@ -165,15 +165,11 @@ fn encode_activity_event_copy_row(buf: &mut Vec<u8>, row: &ActivityEventRow) {
     .to_string();
     append_copy_field(buf, row.task_id.map(|v| v.to_string()).as_deref());
     buf.push(b'\t');
-    append_copy_field(buf, None);
+    append_copy_field(buf, row.account_id.map(|v| v.to_string()).as_deref());
     buf.push(b'\t');
     append_copy_field(buf, row.user_id.map(|v| v.to_string()).as_deref());
     buf.push(b'\t');
     append_copy_field(buf, row.company_id.map(|v| v.to_string()).as_deref());
-    buf.push(b'\t');
-    append_copy_field(buf, None);
-    buf.push(b'\t');
-    append_copy_field(buf, None);
     buf.push(b'\t');
     append_copy_field(buf, Some(row.action.as_str()));
     buf.push(b'\t');
@@ -195,6 +191,7 @@ fn encode_activity_event_copy_row(buf: &mut Vec<u8>, row: &ActivityEventRow) {
 }
 
 fn encode_worker_event_copy_row(buf: &mut Vec<u8>, row: &WorkerEventRow) {
+    let metadata_json = row.metadata_json.to_string();
     append_copy_field(buf, row.task_id.map(|v| v.to_string()).as_deref());
     buf.push(b'\t');
     append_copy_field(buf, row.worker_id.as_deref());
@@ -203,13 +200,13 @@ fn encode_worker_event_copy_row(buf: &mut Vec<u8>, row: &WorkerEventRow) {
     buf.push(b'\t');
     append_copy_field(buf, Some(row.task_kind.as_str()));
     buf.push(b'\t');
-    append_copy_field(buf, None);
+    append_copy_field(buf, row.model.as_deref());
     buf.push(b'\t');
     append_copy_field(buf, row.reason.as_deref());
     buf.push(b'\t');
     append_copy_field(buf, Some(row.gateway_name.as_str()));
     buf.push(b'\t');
-    append_copy_field(buf, Some("{}"));
+    append_copy_field(buf, Some(metadata_json.as_str()));
     buf.push(b'\t');
     let created_at = row.created_at.timestamp_millis().to_string();
     append_copy_field(buf, Some(created_at.as_str()));
@@ -457,8 +454,6 @@ task_id, \
 account_id, \
 user_id, \
 company_id, \
-api_key_id, \
-session_id, \
 action, \
 event_family, \
 client_origin, \

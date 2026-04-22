@@ -29,6 +29,7 @@ const GATEWAY_PREFIX: &str = "404_GATEWAY_";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActivityEventRecord {
+    pub(crate) account_id: Option<i64>,
     pub(crate) user_id: Option<i64>,
     pub(crate) company_id: Option<Uuid>,
     pub(crate) company_name: Option<String>,
@@ -46,7 +47,9 @@ pub(crate) struct WorkerEventRecord {
     pub(crate) worker_id: Option<String>,
     pub(crate) action: String,
     pub(crate) task_kind: String,
+    pub(crate) model: Option<String>,
     pub(crate) reason: Option<String>,
+    pub(crate) metadata_json: Value,
 }
 
 fn ensure_crypto_provider() {
@@ -394,6 +397,84 @@ pub(crate) async fn wait_for_worker(
         .expect("fetch worker events")
 }
 
+pub(crate) async fn analytics_foreign_key_columns(harness: &EventHarness) -> Vec<(String, String)> {
+    let rows = harness
+        .core
+        .db_client
+        .query(
+            "SELECT tc.table_name, kcu.column_name
+             FROM information_schema.table_constraints AS tc
+             JOIN information_schema.key_column_usage AS kcu
+               ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+              AND tc.table_name = kcu.table_name
+             WHERE tc.constraint_type = 'FOREIGN KEY'
+               AND tc.table_schema = 'public'
+               AND tc.table_name IN ('activity_events', 'worker_events')
+             ORDER BY tc.table_name ASC, kcu.ordinal_position ASC, kcu.column_name ASC",
+            &[],
+        )
+        .await
+        .expect("query analytics foreign keys");
+    rows.into_iter()
+        .map(|row| (row.get("table_name"), row.get("column_name")))
+        .collect()
+}
+
+pub(crate) async fn purge_terminal_generation_task_in_db(harness: &EventHarness, task_id: Uuid) {
+    let completed_before_ms = current_timestamp() as i64 * 1000;
+    let rows = harness
+        .core
+        .db_client
+        .query(
+            "SELECT task_id
+             FROM generation_purge_terminal_tasks($1, $2)",
+            &[&100_i32, &completed_before_ms],
+        )
+        .await
+        .expect("purge terminal generation tasks");
+    assert!(
+        rows.iter()
+            .any(|row| row.get::<_, Uuid>("task_id") == task_id),
+        "expected generation_purge_terminal_tasks to purge task {task_id}"
+    );
+}
+
+pub(crate) async fn timeout_generation_task_in_db(harness: &EventHarness, task_id: Uuid) {
+    let now = current_timestamp() as i64 * 1000;
+    let updated = harness
+        .core
+        .db_client
+        .execute(
+            "UPDATE generation_tasks
+             SET deadline_at = $2
+             WHERE id = $1",
+            &[&task_id, &(now - 1)],
+        )
+        .await
+        .expect("move generation task deadline into the past");
+    assert_eq!(
+        updated, 1,
+        "expected exactly one generation task row to update"
+    );
+
+    let rows = harness
+        .core
+        .db_client
+        .query(
+            "SELECT task_id
+             FROM generation_expire_tasks($1, $2)",
+            &[&100_i32, &now],
+        )
+        .await
+        .expect("expire generation tasks");
+    assert!(
+        rows.iter()
+            .any(|row| row.get::<_, Uuid>("task_id") == task_id),
+        "expected generation_expire_tasks to expire task {task_id}"
+    );
+}
+
 pub(crate) async fn add_success_result(
     task_manager: &TaskManager,
     task_id: Uuid,
@@ -511,7 +592,7 @@ async fn fetch_activity_events(
     let rows = harness
         .db_client
         .query(
-            "SELECT task_id, user_id, company_id, action, event_family, client_origin, task_kind, model, metadata_json::TEXT AS metadata_json FROM activity_events ORDER BY created_at ASC, id ASC",
+            "SELECT task_id, account_id, user_id, company_id, action, event_family, client_origin, task_kind, model, metadata_json::TEXT AS metadata_json FROM activity_events ORDER BY created_at ASC, id ASC",
             &[],
         )
         .await
@@ -522,6 +603,7 @@ async fn fetch_activity_events(
             let metadata: Value = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
             Ok(ActivityEventRecord {
                 task_id: row.get("task_id"),
+                account_id: row.get("account_id"),
                 user_id: row.get("user_id"),
                 company_id: row.get("company_id"),
                 company_name: metadata
@@ -542,19 +624,25 @@ async fn fetch_worker_events(harness: &GatewayRuntimeHarness) -> Result<Vec<Work
     let rows = harness
         .db_client
         .query(
-            "SELECT task_id, worker_id, action, task_kind, reason FROM worker_events ORDER BY created_at ASC, id ASC",
+            "SELECT task_id, worker_id, action, task_kind, model, reason, metadata_json::TEXT AS metadata_json FROM worker_events ORDER BY created_at ASC, id ASC",
             &[],
         )
         .await
         .context("query worker events")?;
     Ok(rows
         .into_iter()
-        .map(|row| WorkerEventRecord {
-            task_id: row.get("task_id"),
-            worker_id: row.get("worker_id"),
-            action: row.get("action"),
-            task_kind: row.get("task_kind"),
-            reason: row.get("reason"),
+        .map(|row| {
+            let metadata_text: String = row.get("metadata_json");
+            let metadata_json: Value = serde_json::from_str(&metadata_text).unwrap_or(Value::Null);
+            WorkerEventRecord {
+                task_id: row.get("task_id"),
+                worker_id: row.get("worker_id"),
+                action: row.get("action"),
+                task_kind: row.get("task_kind"),
+                model: row.get("model"),
+                reason: row.get("reason"),
+                metadata_json,
+            }
         })
         .collect())
 }

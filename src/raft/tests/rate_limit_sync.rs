@@ -15,7 +15,7 @@ struct RateLimitSyncCluster {
 }
 
 async fn setup_rate_limit_sync_cluster() -> Result<RateLimitSyncCluster> {
-    let node_configs = reserve_node_configs(3)?;
+    let (_network_guard, node_configs) = reserve_node_configs(3).await?;
     let node_clients = make_node_clients(node_configs.len());
     let (_config, _pcfg, raft_nodes, state_machines, server_handles) =
         setup_connected_cluster(&node_configs, node_clients, None).await?;

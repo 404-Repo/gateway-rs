@@ -4,7 +4,7 @@ use super::*;
 async fn test_leader_failover() -> anyhow::Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(5)?;
+    let (_network_guard, node_configs) = reserve_node_configs(5).await?;
     let node_clients = make_node_clients(node_configs.len());
 
     let (_config, _pcfg, mut raft_nodes, mut state_machines, mut server_handles) =

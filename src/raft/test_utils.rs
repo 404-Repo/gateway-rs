@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::Instant;
 use std::{io::ErrorKind, time::Duration as StdDuration};
 
 use anyhow::{Result, bail};
 use foldhash::fast::RandomState;
 use openraft::{BasicNode, LogId};
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -19,6 +20,7 @@ use crate::raft::{LogStore, Network, NodeId, Raft, StateMachineStore, TypeConfig
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static TRACING: Once = Once::new();
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
+static NETWORK_BIND_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 pub(crate) fn unique_path(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -38,6 +40,12 @@ pub(crate) fn ensure_crypto_provider_for_tests() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         crate::raft::init_crypto_provider().expect("crypto provider init must succeed");
     });
+}
+
+pub(crate) fn network_bind_lock() -> Arc<Mutex<()>> {
+    NETWORK_BIND_LOCK
+        .get_or_init(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 pub(crate) fn membership_from(

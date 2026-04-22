@@ -801,6 +801,12 @@ async fn model_persists_until_result_retrieval() {
         task_manager.get_model(task_id).await.as_deref(),
         Some("404-3dgs")
     );
+    let activity_metadata = task_manager
+        .get_activity_metadata(task_id)
+        .await
+        .expect("activity metadata should exist");
+    assert_eq!(activity_metadata.task_kind, "txt3d");
+    assert_eq!(activity_metadata.model.as_deref(), Some("404-3dgs"));
 
     let results_bundle = task_manager
         .get_result(task_id)

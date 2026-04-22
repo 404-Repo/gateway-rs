@@ -39,6 +39,7 @@ use uuid::Uuid;
 const LOCALHOST: &str = "127.0.0.1";
 const TEST_DOMAIN: &str = "localhost";
 const PROMPT_JSON: &str = r#"{"prompt":"mechanic robot"}"#;
+const GENERIC_WINDOW_MS: u64 = 86_400_000;
 
 #[derive(Default)]
 struct BlockingCreateStore {
@@ -125,6 +126,13 @@ impl TaskLifecycleStore for BlockingCreateStore {
         &self,
         _task_id: Uuid,
     ) -> Result<Option<GenerationTaskStatusSnapshot>> {
+        Ok(None)
+    }
+
+    async fn get_generation_task_generic_key_hash(
+        &self,
+        _task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
         Ok(None)
     }
 }
@@ -339,12 +347,17 @@ async fn build_gateway_node(
     })
 }
 
-async fn setup_cross_gateway_harness() -> Result<CrossGatewayHarness> {
+async fn setup_cross_gateway_harness(
+    generic_key_concurrent_limit: Option<usize>,
+) -> Result<CrossGatewayHarness> {
     init_tracing();
     ensure_crypto_provider();
 
-    let base_config = load_base_config();
-    let node_configs = reserve_node_configs(3)?;
+    let mut base_config = load_base_config();
+    if let Some(limit) = generic_key_concurrent_limit {
+        base_config.http.generic_key_concurrent_limit = limit;
+    }
+    let (_network_guard, node_configs) = reserve_node_configs(3).await?;
     let node_clients = make_node_clients(node_configs.len());
     let (_config, _pcfg, raft_nodes, state_machines, raft_servers) =
         setup_connected_cluster(&node_configs, node_clients, None).await?;
@@ -452,6 +465,7 @@ async fn assert_cross_gateway_limit_rejection(
     api_key: &str,
     subject: Subject,
     subject_id: u128,
+    expected_message: Option<&str>,
 ) -> Result<()> {
     let (_leader_id, leader_index) = wait_for_consistent_leader_index(
         &harness.raft_nodes,
@@ -507,6 +521,12 @@ async fn assert_cross_gateway_limit_rejection(
         payload.get("error").and_then(|value| value.as_str()),
         Some("concurrent_limit")
     );
+    if let Some(expected_message) = expected_message {
+        assert_eq!(
+            payload.get("message").and_then(|value| value.as_str()),
+            Some(expected_message)
+        );
+    }
     assert_eq!(
         harness.blocking_store.create_calls(),
         1,
@@ -524,7 +544,7 @@ async fn assert_cross_gateway_limit_rejection(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn second_gateway_rejects_same_user_before_create_generation_task() -> Result<()> {
-    let harness = setup_cross_gateway_harness().await?;
+    let harness = setup_cross_gateway_harness(None).await?;
     let api_key = Uuid::new_v4().to_string();
     let user_id = 42i64;
     for node in &harness.nodes {
@@ -538,13 +558,14 @@ async fn second_gateway_rejects_same_user_before_create_generation_task() -> Res
         &api_key,
         Subject::User,
         u128::from(user_id as u64),
+        Some("User concurrent task limit exceeded."),
     )
     .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn second_gateway_rejects_same_company_before_create_generation_task() -> Result<()> {
-    let harness = setup_cross_gateway_harness().await?;
+    let harness = setup_cross_gateway_harness(None).await?;
     let api_key = Uuid::new_v4().to_string();
     let company_id = Uuid::new_v4();
     for node in &harness.nodes {
@@ -553,6 +574,36 @@ async fn second_gateway_rejects_same_company_before_create_generation_task() -> 
             .await;
     }
 
-    assert_cross_gateway_limit_rejection(&harness, &api_key, Subject::Company, company_id.as_u128())
-        .await
+    assert_cross_gateway_limit_rejection(
+        &harness,
+        &api_key,
+        Subject::Company,
+        company_id.as_u128(),
+        Some("Acme concurrent task limit exceeded."),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn second_gateway_rejects_same_generic_key_before_create_generation_task() -> Result<()> {
+    let harness = setup_cross_gateway_harness(Some(1)).await?;
+    let generic_key = harness.nodes[0]
+        .key_validator
+        .generic_key()
+        .expect("generic key");
+    let api_key = generic_key.to_string();
+    for node in &harness.nodes {
+        node.key_validator
+            .gateway_settings()
+            .seed_generic_key_limits(Some(generic_key), 10, 10, GENERIC_WINDOW_MS);
+    }
+
+    assert_cross_gateway_limit_rejection(
+        &harness,
+        &api_key,
+        Subject::GenericGlobal,
+        0,
+        Some("Generic key concurrent task limit exceeded."),
+    )
+    .await
 }

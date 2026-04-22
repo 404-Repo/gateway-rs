@@ -177,6 +177,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2417,6 +2426,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2932,9 +2942,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.46"
+version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc89deee4af0429081d2a518c0431ae068222a5a262a3bc6ff4d8535ec2e02fe"
+checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
 dependencies = [
  "cc",
 ]
@@ -2965,9 +2975,9 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "local-ip-address"
-version = "0.6.11"
+version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4a59a0cb1c7f84471ad5cd38d768c2a29390d17f1ff2827cdf49bc53e8ac70b"
+checksum = "d7b0187df4e614e42405b49511b82ff7a1774fbd9a816060ee465067847cac22"
 dependencies = [
  "libc",
  "neli",
@@ -3056,9 +3066,9 @@ dependencies = [
 
 [[package]]
 name = "mimalloc"
-version = "0.1.49"
+version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aca3c01a711f395b4257b81674c0e90e8dd1f1e62c4b7db45f684cc7a4fcb18a"
+checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -3461,9 +3471,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openraft"
-version = "0.9.22"
+version = "0.9.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2f40b0e23149ea8673591325bff055939f7a59f4f9a28476f0854282444ab3"
+checksum = "80d35e2f60cdf9bcfc39a020966091017c6dc2a4b43b355a22ca3e76106f4a0a"
 dependencies = [
  "anyerror",
  "byte-unit",
@@ -3484,9 +3494,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.9.22"
+version = "0.9.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b0033052d96bc535b99ea1f38973fad984ed658940bbd27ff59c377cada11c"
+checksum = "bbbf0342d747a8da209c8e1d3ca8f788100966669412aaacb449409205931251"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -4589,9 +4599,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4619,9 +4629,9 @@ checksum = "bd8d438861332c3b1ac396c77bd9cac620ea1ff347efb63c05a83d8f0a593899"
 
 [[package]]
 name = "salvo"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77fab67d0b522290dd88006cb84b4462d83d6a7125c71da6826cd333618ab21b"
+checksum = "18c769247c3d1f0334876337eb5044e8954d7546ee8814adef31eb9b6343a569"
 dependencies = [
  "salvo-acme",
  "salvo-compression",
@@ -4633,9 +4643,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-acme"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a43a49607643e6b21e5b628d1ebc19fe251aebe501167433cfb587ef94e3843"
+checksum = "db676595526cc23d157e31adf89bb32640f7cbb1ca2b19d83449eb6ff037cff5"
 dependencies = [
  "certon",
  "futures-util",
@@ -4648,9 +4658,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-compression"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6076264c095d07f0c1574f09e273ade1fede70df8223d9c4c8a5c5a95cc2c7e"
+checksum = "d3148cb9a9cd371e594a7aae6cb922818cc102e0d1825cf3014c7befa3a05791"
 dependencies = [
  "brotli",
  "bytes",
@@ -4683,9 +4693,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-proxy"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e56a0e8fc349f25e0eecc410ea71feee3f1312bdbbf5fb31ad889a47d8285645"
+checksum = "12106182d3a59907a07f8cab1502de7a96e5acd5b899b66397975ac01e3f9c48"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -4702,9 +4712,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-rate-limiter"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb9acd4dc6cc1753f8b1a2135608e8a0ba46fa004721064d4ba5fa94763b4309"
+checksum = "4bd48fb32aefb9909e2916874826bf9fe7d98e6bfb0b305f6b0aebdc4e17f41f"
 dependencies = [
  "moka",
  "salvo_core",
@@ -4716,9 +4726,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-serde-util"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8ea8e3129e2ce49e13b7e278dbce21edb777fcb161b4975da5b372457de0487"
+checksum = "9158501312da84612279015f3c7793e40c80b8fd6628823fba9bf1bcaad197e6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4727,10 +4737,11 @@ dependencies = [
 
 [[package]]
 name = "salvo_core"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99029932828083aeb4cebd8e0e977323382423b0c305dfb4dc7b8473034467d8"
+checksum = "1193415bc0b50b041bf5b3a1e2d066332d9be4bb6a31b6775e6b3afddb3d6926"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "brotli",
@@ -4780,9 +4791,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_extra"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "672456a8d426b13efd7cfc574ffb408cd9ba91e7d4e7d963360d906d6817dee6"
+checksum = "c09fedc4b2c0195e250b2e27e7888faa32245d0c4ec93e178273c16b178c26ce"
 dependencies = [
  "base64 0.22.1",
  "etag",
@@ -4802,9 +4813,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_macros"
-version = "0.91.1"
+version = "0.92.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b082312da8e9a8f45d767d78ded6688005eb582272e5fc858d235d696aa02cb"
+checksum = "2e48a1b12532532f2193aaf0fec67a8f31542fb2b5f46108328297629011697f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -6350,6 +6361,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6699,9 +6719,9 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
+checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
 dependencies = [
  "memchr",
 ]

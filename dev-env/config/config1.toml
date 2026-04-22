@@ -26,7 +26,7 @@ basic_rate_limit = 30
 # 1) Missing/invalid/unknown API key on /add_task:
 #    add_task_unauthorized_per_ip_daily_rate_limit (per source IP, daily)
 # 2) Valid generic key (http.generic_key):
-#    uses SQL-backed guest rolling-window limits from gen's app_settings row
+#    uses gateway-configured shared concurrency plus SQL-backed guest rolling-window limits
 # 3) Valid non-company user key:
 #    uses DB-configured per-user concurrent and daily limits
 # There is no separate unauthorized-global cap; unauthorized traffic is per-IP only.
@@ -46,6 +46,8 @@ signature_freshness_threshold = 30
 max_task_queue_len = 500
 admin_key = "b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 generic_key = "6eca4068-3be6-4d30-b828-f63cda3bc35b"
+# Shared active-task cap for the generic key across all source IPs.
+generic_key_concurrent_limit = 2
 api_key_secret = "CHANGE_ME_IN_PRODUCTION_58392047"
 invalid_api_key_negative_cache_ttl_sec = 300
 invalid_api_key_ip_miss_ttl_sec = 600

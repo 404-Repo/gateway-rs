@@ -353,4 +353,30 @@ impl GatewayRuntimeSettingsStore {
             registered_window_ms: current.registered_window_ms,
         });
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub fn seed_generic_key_limits(
+        &self,
+        generic_key: Option<Uuid>,
+        generic_global_daily_limit: u64,
+        generic_per_ip_daily_limit: u64,
+        generic_window_ms: u64,
+    ) {
+        let current = self.cached_gateway_settings();
+        self.store_gateway_settings(CachedGatewaySettings {
+            generic_key,
+            generic_global_daily_limit,
+            generic_per_ip_daily_limit,
+            generic_window_ms,
+            add_task_unauthorized_per_ip_daily_rate_limit: current
+                .add_task_unauthorized_per_ip_daily_rate_limit,
+            max_task_queue_len: current.max_task_queue_len,
+            request_file_size_limit: current.request_file_size_limit,
+            guest_generation_limit: current.guest_generation_limit,
+            guest_window_ms: current.guest_window_ms,
+            registered_generation_limit: current.registered_generation_limit,
+            registered_window_ms: current.registered_window_ms,
+        });
+    }
 }

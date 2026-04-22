@@ -7,7 +7,7 @@ use openraft::Membership;
 async fn test_three_node_cluster() -> Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(3)?;
+    let (_network_guard, node_configs) = reserve_node_configs(3).await?;
     let node_clients = make_node_clients(node_configs.len());
 
     let (_config, _pcfg, raft_nodes, state_machines, _server_handles) =
@@ -60,7 +60,7 @@ async fn test_three_node_cluster() -> Result<()> {
 async fn test_vote_mode_all_initialized() -> Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(3)?;
+    let (_network_guard, node_configs) = reserve_node_configs(3).await?;
     let node_clients = make_node_clients(node_configs.len());
 
     let (_config, _pcfg, raft_nodes, state_machines, _server_handles) =

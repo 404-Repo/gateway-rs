@@ -152,6 +152,9 @@ pub trait TaskLifecycleStore: Send + Sync + 'static {
         &self,
         task_id: Uuid,
     ) -> Result<Option<GenerationTaskStatusSnapshot>>;
+
+    async fn get_generation_task_generic_key_hash(&self, task_id: Uuid)
+    -> Result<Option<[u8; 16]>>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -214,6 +217,13 @@ impl TaskLifecycleStore for NoopTaskLifecycleStore {
         &self,
         _task_id: Uuid,
     ) -> Result<Option<GenerationTaskStatusSnapshot>> {
+        Ok(None)
+    }
+
+    async fn get_generation_task_generic_key_hash(
+        &self,
+        _task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
         Ok(None)
     }
 }
@@ -333,6 +343,18 @@ SELECT
   task_row.result_json->>'worker_id' AS result_worker_id
 FROM generation_tasks AS task_row
 WHERE task_row.id = $1
+LIMIT 1;
+"#;
+
+    pub(super) const Q_GENERATION_TASK_GENERIC_KEY_HASH: &'static str = r#"
+SELECT reservation_row.guest_key_hash
+FROM generation_tasks AS task_row
+INNER JOIN generation_reservations AS reservation_row
+  ON reservation_row.id = task_row.reservation_id
+WHERE task_row.id = $1
+  AND task_row.client_origin = 'guest_generic'
+  AND reservation_row.billing_mode = 'guest_free'
+  AND reservation_row.guest_key_hash IS NOT NULL
 LIMIT 1;
 "#;
 
@@ -613,6 +635,28 @@ LIMIT 1;
             result_worker_id: row.get("result_worker_id"),
         }))
     }
+
+    pub async fn get_generation_task_generic_key_hash(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
+        let params: [&(dyn ToSql + Sync); 1] = [&task_id];
+        let row = self
+            .query_prepared(StmtKey::GenerationTaskGenericKeyHash, &params)
+            .await?
+            .into_iter()
+            .next();
+
+        Ok(row.and_then(|row| {
+            let bytes: Vec<u8> = row.get("guest_key_hash");
+            if bytes.len() != 16 {
+                return None;
+            }
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&bytes);
+            Some(hash)
+        }))
+    }
 }
 
 #[async_trait]
@@ -672,6 +716,13 @@ impl TaskLifecycleStore for Database {
         task_id: Uuid,
     ) -> Result<Option<GenerationTaskStatusSnapshot>> {
         Database::get_generation_task_status_snapshot(self, task_id).await
+    }
+
+    async fn get_generation_task_generic_key_hash(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
+        Database::get_generation_task_generic_key_hash(self, task_id).await
     }
 }
 
@@ -819,6 +870,24 @@ impl TaskLifecycleStore for TaskLifecycleStoreHandle {
             #[cfg(test)]
             TaskLifecycleStoreHandle::Shared(store) => {
                 store.get_generation_task_status_snapshot(task_id).await
+            }
+        }
+    }
+
+    async fn get_generation_task_generic_key_hash(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
+        match self {
+            TaskLifecycleStoreHandle::Database(db) => {
+                db.get_generation_task_generic_key_hash(task_id).await
+            }
+            TaskLifecycleStoreHandle::Noop(store) => {
+                store.get_generation_task_generic_key_hash(task_id).await
+            }
+            #[cfg(test)]
+            TaskLifecycleStoreHandle::Shared(store) => {
+                store.get_generation_task_generic_key_hash(task_id).await
             }
         }
     }

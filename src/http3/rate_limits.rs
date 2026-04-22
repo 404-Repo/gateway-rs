@@ -58,6 +58,13 @@ impl RateLimitReservation {
         Self { deltas, limiter }
     }
 
+    fn batch_from_mutations_with_request_id(
+        request_id: u128,
+        mutations: Vec<RateLimitMutation>,
+    ) -> Option<RateLimitMutationBatch> {
+        (!mutations.is_empty()).then(|| RateLimitMutationBatch::new(request_id, mutations))
+    }
+
     fn batch_from_mutations(mutations: Vec<RateLimitMutation>) -> Option<RateLimitMutationBatch> {
         RateLimitMutationBatch::with_generated_request_id(mutations)
     }
@@ -121,12 +128,23 @@ impl RateLimitReservation {
         Self::batch_from_mutations(self.refund_mutations())
     }
 
+    pub fn refund_batch_with_request_id(&self, request_id: u128) -> Option<RateLimitMutationBatch> {
+        Self::batch_from_mutations_with_request_id(request_id, self.refund_mutations())
+    }
+
     pub fn success_mutations(&self) -> Vec<RateLimitMutation> {
         self.active_release_mutations()
     }
 
     pub fn success_batch(&self) -> Option<RateLimitMutationBatch> {
         Self::batch_from_mutations(self.success_mutations())
+    }
+
+    pub fn success_batch_with_request_id(
+        &self,
+        request_id: u128,
+    ) -> Option<RateLimitMutationBatch> {
+        Self::batch_from_mutations_with_request_id(request_id, self.success_mutations())
     }
 
     pub fn active_release_mutations(&self) -> Vec<RateLimitMutation> {
@@ -269,6 +287,8 @@ impl Default for UnauthorizedDailyLimiter {
 fn user_subject_id(user_id: i64) -> u128 {
     u128::from(user_id.max(0) as u64)
 }
+
+const GENERIC_GLOBAL_SUBJECT_ID: u128 = 0;
 
 impl RateLimitContext {
     pub fn has_authorized_key(&self) -> bool {
@@ -664,6 +684,15 @@ pub async fn reserve_add_task_rate_limit(
             daily_limit,
             scope_label: "User",
             require_day_match: daily_limit > 0,
+        });
+    } else if ctx.key_is_uuid && ctx.is_generic_key {
+        subjects.push(SubjectParams {
+            subject: Subject::GenericGlobal,
+            id: GENERIC_GLOBAL_SUBJECT_ID,
+            active_limit: cfg.http().generic_key_concurrent_limit as u64,
+            daily_limit: 0,
+            scope_label: "Generic key",
+            require_day_match: false,
         });
     }
 

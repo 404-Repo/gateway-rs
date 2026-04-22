@@ -139,6 +139,9 @@ pub struct HTTPConfig {
     pub admin_key: Uuid,
     // Fallback generic key used until the database-backed app_settings cache loads.
     pub generic_key: Option<Uuid>,
+    // Shared concurrent active task cap for the generic key. Set 0 to disable the active-slot cap.
+    #[serde(default = "default_generic_key_concurrent_limit")]
+    pub generic_key_concurrent_limit: usize,
     // Secret used to key BLAKE3 for API key verification
     pub api_key_secret: String,
     #[serde(default = "default_invalid_api_key_negative_cache_ttl_sec")]
@@ -242,6 +245,10 @@ fn default_max_concurrent_image_uploads() -> usize {
 
 fn default_distributed_rate_limiter_max_capacity() -> usize {
     4096
+}
+
+fn default_generic_key_concurrent_limit() -> usize {
+    2
 }
 
 fn default_invalid_api_key_negative_cache_ttl_sec() -> u64 {
@@ -517,5 +524,35 @@ pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
         Ok(json_path.to_path_buf())
     } else {
         Err(anyhow!("No configuration file found"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeConfig;
+
+    fn read_config_single() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("dev-env/config/config-single.toml");
+        std::fs::read_to_string(path).expect("read config-single.toml")
+    }
+
+    #[test]
+    fn http_config_defaults_generic_key_concurrent_limit_when_missing() {
+        let config_text = read_config_single().replace("generic_key_concurrent_limit = 2\n", "");
+        let config: NodeConfig =
+            toml::from_str(&config_text).expect("parse config without override");
+        assert_eq!(config.http.generic_key_concurrent_limit, 2);
+    }
+
+    #[test]
+    fn http_config_reads_generic_key_concurrent_limit_override() {
+        let config_text = read_config_single().replacen(
+            "generic_key_concurrent_limit = 2",
+            "generic_key_concurrent_limit = 3",
+            1,
+        );
+        let config: NodeConfig = toml::from_str(&config_text).expect("parse config with override");
+        assert_eq!(config.http.generic_key_concurrent_limit, 3);
     }
 }
