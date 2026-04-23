@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use salvo::prelude::*;
+use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -206,7 +207,12 @@ pub async fn get_tasks_handler(
             worker_id: Some(get_tasks.worker_id.as_ref()),
             action: "task_assigned",
             task_kind: task_kind_label(&task.task),
+            model: task.task.model.as_deref(),
             reason: None,
+            metadata_json: Some(json!({
+                "worker_hotkey": get_tasks.worker_hotkey.as_ref(),
+                "assignment_token": task.assignment_token,
+            })),
         });
     }
 

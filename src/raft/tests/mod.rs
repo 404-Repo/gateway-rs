@@ -7,7 +7,7 @@ use crate::raft::StateMachineStore;
 use crate::raft::client::RClientBuilder;
 use crate::raft::test_utils::{
     ensure_crypto_provider_for_tests, init_tracing, make_node_clients, membership_from,
-    reserve_udp_addresses, start_test_rserver, unique_path, wait_for_log_commit,
+    network_bind_lock, reserve_udp_addresses, start_test_rserver, unique_path, wait_for_log_commit,
     wait_for_node_to_be_voter, wait_for_snapshot_file,
 };
 use crate::{
@@ -177,15 +177,21 @@ mod cluster_setup {
 
     pub(super) type OwnedNodeConfig = (u64, String);
 
-    pub(super) fn reserve_node_configs(node_count: usize) -> Result<Vec<OwnedNodeConfig>> {
+    pub(super) async fn reserve_node_configs(
+        node_count: usize,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Vec<OwnedNodeConfig>)> {
+        let network_guard = network_bind_lock().lock_owned().await;
         let (node_addrs, node_addr_reservations) = reserve_udp_addresses(node_count)?;
         drop(node_addr_reservations);
 
-        Ok(node_addrs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, addr)| (idx as u64 + 1, addr))
-            .collect())
+        Ok((
+            network_guard,
+            node_addrs
+                .into_iter()
+                .enumerate()
+                .map(|(idx, addr)| (idx as u64 + 1, addr))
+                .collect(),
+        ))
     }
 
     pub(super) fn node_config_refs(node_configs: &[OwnedNodeConfig]) -> Vec<(u64, &str)> {

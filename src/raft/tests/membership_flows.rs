@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 async fn test_add_node_to_three_node_cluster() -> Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(4)?;
+    let (_network_guard, node_configs) = reserve_node_configs(4).await?;
     let initial_configs = node_configs[..3].to_vec();
     let new_node_id = node_configs[3].0;
     let new_node_addr = node_configs[3].1.as_str();
@@ -77,7 +77,7 @@ async fn test_add_node_to_three_node_cluster() -> Result<()> {
 async fn test_add_voter_node_to_three_node_cluster_change_membership() -> Result<()> {
     init_tracing();
 
-    let node_configs = reserve_node_configs(4)?;
+    let (_network_guard, node_configs) = reserve_node_configs(4).await?;
     let initial_configs = node_configs[..3].to_vec();
     let new_node_id = node_configs[3].0;
     let new_node_addr = node_configs[3].1.as_str();

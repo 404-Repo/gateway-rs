@@ -44,6 +44,7 @@ pub(super) enum StmtKey {
     GenerationPurgeTerminalTasks,
     GenerationTaskAccountId,
     GenerationTaskStatusSnapshot,
+    GenerationTaskGenericKeyHash,
 }
 
 const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -898,6 +899,7 @@ impl Database {
             StmtKey::GenerationPurgeTerminalTasks => Self::Q_GENERATION_PURGE_TERMINAL_TASKS,
             StmtKey::GenerationTaskAccountId => Self::Q_GENERATION_TASK_ACCOUNT_ID,
             StmtKey::GenerationTaskStatusSnapshot => Self::Q_GENERATION_TASK_STATUS_SNAPSHOT,
+            StmtKey::GenerationTaskGenericKeyHash => Self::Q_GENERATION_TASK_GENERIC_KEY_HASH,
         }
     }
 

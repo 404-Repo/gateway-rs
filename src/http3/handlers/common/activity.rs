@@ -15,6 +15,11 @@ pub struct TaskActivityContext<'a> {
 }
 
 pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
+    let account_id = ctx
+        .rate_ctx
+        .billing_owner
+        .as_ref()
+        .map(|owner| owner.account_id);
     let mut company_id = None;
     let mut company_name: Option<Arc<str>> = None;
     if ctx.rate_ctx.is_company_key
@@ -27,6 +32,7 @@ pub fn record_task_activity(ctx: TaskActivityContext<'_>, action: &str) {
     ctx.gateway_state.record_activity_event(ActivityEventRef {
         user_id: ctx.rate_ctx.user_id,
         user_email: ctx.rate_ctx.user_email.as_deref(),
+        account_id,
         company_id,
         company_name: company_name.as_deref(),
         action,

@@ -32,9 +32,10 @@ use crate::http3::server::Http3Server;
 use crate::metrics::Metrics;
 use crate::raft::client::RClient;
 use crate::raft::client::RClientBuilder;
-use crate::raft::store::RateLimitMutationBatch;
 use crate::raft::store::Request;
 use crate::raft::store::Response;
+use crate::raft::store::{RateLimitMutation, RateLimitMutationBatch, Subject};
+use crate::task::rate_limit_completion_request_id;
 use crate::task::{TaskManager, TaskManagerInit};
 use anyhow::Result;
 use anyhow::bail;
@@ -76,6 +77,24 @@ pub type StateMachineStore = store::StateMachineStore;
 pub type Raft = openraft::Raft<TypeConfig>;
 
 pub(crate) const SNAPSHOT_COMPRESSION_LVL: i32 = 1;
+const GENERIC_GLOBAL_SUBJECT_ID: u128 = 0;
+
+fn generic_task_recovery_rate_limit_batch(
+    task_id: uuid::Uuid,
+    _guest_key_hash: [u8; 16],
+) -> RateLimitMutationBatch {
+    let day_epoch = crate::raft::rate_limit::DistributedRateLimiter::current_day_epoch();
+    RateLimitMutationBatch::new(
+        rate_limit_completion_request_id(task_id),
+        vec![RateLimitMutation {
+            subject: Subject::GenericGlobal,
+            id: GENERIC_GLOBAL_SUBJECT_ID,
+            day_epoch,
+            active_delta: -1,
+            day_delta: 0,
+        }],
+    )
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum GatewayMode {
@@ -374,6 +393,37 @@ impl Gateway {
             {
                 Ok(expired_task_ids) => {
                     if !expired_task_ids.is_empty() {
+                        for task_id in &expired_task_ids {
+                            match gateway_state
+                                .get_generation_task_generic_key_hash(*task_id)
+                                .await
+                            {
+                                Ok(Some(guest_key_hash)) => {
+                                    let batch = generic_task_recovery_rate_limit_batch(
+                                        *task_id,
+                                        guest_key_hash,
+                                    );
+                                    if let Err(err) = gateway_state
+                                        .submit_rate_limit_mutation_batch(&batch, None)
+                                        .await
+                                    {
+                                        error!(
+                                            task_id = %task_id,
+                                            error = ?err,
+                                            "Failed to reconcile generic concurrent rate limit after task timeout"
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    error!(
+                                        task_id = %task_id,
+                                        error = ?err,
+                                        "Failed to load generic rate limit key for expired task"
+                                    );
+                                }
+                            }
+                        }
                         info!(
                             "Expired {} overdue generation tasks in the billing database",
                             expired_task_ids.len()

@@ -31,6 +31,7 @@ use uuid::Uuid;
 pub struct ActivityEventRef<'a> {
     pub user_id: Option<i64>,
     pub user_email: Option<&'a str>,
+    pub account_id: Option<i64>,
     pub company_id: Option<Uuid>,
     pub company_name: Option<&'a str>,
     pub action: &'a str,
@@ -45,7 +46,9 @@ pub struct WorkerEventRef<'a> {
     pub worker_id: Option<&'a str>,
     pub action: &'a str,
     pub task_kind: &'a str,
+    pub model: Option<&'a str>,
     pub reason: Option<&'a str>,
+    pub metadata_json: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -701,6 +704,16 @@ where
             .await
     }
 
+    pub async fn get_generation_task_generic_key_hash(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<[u8; 16]>> {
+        self.internal
+            .task_lifecycle_store
+            .get_generation_task_generic_key_hash(task_id)
+            .await
+    }
+
     pub fn cluster_name_matches(&self, cluster_name: &str) -> bool {
         self.internal
             .config
@@ -720,6 +733,7 @@ where
         self.internal.event_recorder.record_activity(
             event.user_id,
             event.user_email,
+            event.account_id,
             event.company_id,
             event.company_name,
             event.action,
@@ -736,7 +750,9 @@ where
             event.worker_id,
             event.action,
             event.task_kind,
+            event.model,
             event.reason,
+            event.metadata_json.as_ref(),
         );
     }
 

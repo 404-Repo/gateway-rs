@@ -1,4 +1,4 @@
-use std::net::{TcpListener, UdpSocket};
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,6 +56,18 @@ impl TestService {
         Self {
             base_url,
             client: HttpClient::new(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_local_address(&self, addr: IpAddr) -> Self {
+        let client = HttpClient::builder()
+            .local_address(addr)
+            .build()
+            .expect("build local-address test client");
+        Self {
+            base_url: self.base_url.clone(),
+            client,
         }
     }
 
@@ -182,6 +194,7 @@ pub(crate) struct GatewayHarnessOptions {
     pub(crate) taskmanager_cleanup_interval_secs: Option<u64>,
     pub(crate) taskmanager_result_lifetime_secs: Option<u64>,
     pub(crate) api_keys_update_interval_secs: Option<u64>,
+    pub(crate) generic_key_concurrent_limit: Option<usize>,
 }
 
 impl Default for GatewayHarnessOptions {
@@ -192,6 +205,7 @@ impl Default for GatewayHarnessOptions {
             taskmanager_cleanup_interval_secs: None,
             taskmanager_result_lifetime_secs: None,
             api_keys_update_interval_secs: None,
+            generic_key_concurrent_limit: None,
         }
     }
 }
@@ -237,6 +251,94 @@ pub(crate) struct GatewayRuntimeStart {
     pub(crate) default_user_api_key: String,
     pub(crate) default_company_api_key: String,
     pub(crate) company_id: Uuid,
+}
+
+impl GatewayRuntimeStart {
+    #[allow(dead_code)]
+    pub(crate) async fn restart(self) -> Self {
+        let GatewayRuntimeStart {
+            harness,
+            runtime_config: _runtime_config,
+            config_path,
+            generic_key,
+            admin_key,
+            default_user_api_key,
+            default_company_api_key,
+            company_id,
+        } = self;
+        let harness = std::mem::ManuallyDrop::new(harness);
+        let old_service = unsafe { std::ptr::read(&harness.service) };
+        let config = unsafe { std::ptr::read(&harness.config) };
+        let old_gateway = unsafe { std::ptr::read(&harness.gateway) };
+        let db_client = unsafe { std::ptr::read(&harness.db_client) };
+        let db_connection_task = unsafe { std::ptr::read(&harness._db_connection_task) };
+        let db_lease = unsafe { std::ptr::read(&harness._db_lease) };
+        let config_file = unsafe { std::ptr::read(&harness._config_file) };
+        let temp_dir = unsafe { std::ptr::read(&harness._temp_dir) };
+        let old_shutdown = unsafe { std::ptr::read(&harness._shutdown) };
+
+        drop(old_gateway);
+        drop(old_shutdown);
+        drop(old_service);
+
+        let mut config = (*config).clone();
+        config.http.port = reserve_tcp_port().expect("reserve restarted HTTP port");
+        config.network.server_port = reserve_udp_port().expect("reserve restarted raft port");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize restarted test config"),
+        )
+        .expect("write restarted test config");
+
+        let runtime_config = Arc::new(
+            RuntimeConfigStore::new(config_path.clone(), config.clone())
+                .await
+                .expect("restart runtime config"),
+        );
+        let shutdown = CancellationToken::new();
+        let gateway = gateway::raft::start_gateway(
+            GatewayMode::Single,
+            Arc::clone(&runtime_config),
+            shutdown.clone(),
+        )
+        .await
+        .expect("restart gateway");
+
+        let service = TestService::new(format!("http://127.0.0.1:{}", config.http.port));
+        wait_for_http_ready(&service)
+            .await
+            .expect("wait for restarted HTTP server");
+        gateway
+            .sync_db_caches_for_test()
+            .await
+            .expect("sync restarted db caches");
+        if config.basic.update_gateway_info_ms < 60_000 {
+            wait_for_gateway_info(&service)
+                .await
+                .expect("wait for restarted gateway info");
+        }
+
+        Self {
+            harness: GatewayRuntimeHarness {
+                service,
+                config: Arc::new(config),
+                gateway,
+                db_client,
+                _db_connection_task: db_connection_task,
+                _db_lease: db_lease,
+                _config_file: config_file,
+                _temp_dir: temp_dir,
+                _shutdown: shutdown,
+            },
+            runtime_config,
+            config_path,
+            generic_key,
+            admin_key,
+            default_user_api_key,
+            default_company_api_key,
+            company_id,
+        }
+    }
 }
 
 struct SharedPostgresEnv {
@@ -435,6 +537,9 @@ impl GatewayRuntimeHarness {
         }
         if let Some(result_lifetime_secs) = options.taskmanager_result_lifetime_secs {
             config.basic.taskmanager_result_lifetime = result_lifetime_secs;
+        }
+        if let Some(generic_key_concurrent_limit) = options.generic_key_concurrent_limit {
+            config.http.generic_key_concurrent_limit = generic_key_concurrent_limit;
         }
 
         let generic_key = config.http.generic_key.expect("generic key");

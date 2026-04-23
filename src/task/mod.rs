@@ -4,6 +4,7 @@ use foldhash::HashSet;
 use foldhash::fast::RandomState;
 use scc::{HashMap, hash_map::Entry};
 use serde::Serialize;
+use serde_json::json;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
@@ -19,10 +20,15 @@ use crate::common::rate_limit_buffer::RateLimitMutationBuffer;
 use crate::crypto::hotkey::Hotkey;
 use crate::db::EventRecorder;
 use crate::http3::rate_limits::RateLimitReservation;
-use crate::metrics::{Metrics, TaskInProgressGuard};
+use crate::metrics::{Metrics, TaskInProgressGuard, TaskKind};
 
 const TASK_TIMED_OUT_REASON: &str = "Task timed out";
 const PENDING_RESULT_COMMIT_GRACE: Duration = Duration::from_secs(5);
+const RATE_LIMIT_COMPLETION_REQUEST_ID_XOR: u128 = 0x7b2f_4d91_a6c3_e805_19fe_42ac_55d0_3b71;
+
+pub(crate) fn rate_limit_completion_request_id(task_id: Uuid) -> u128 {
+    task_id.as_u128() ^ RATE_LIMIT_COMPLETION_REQUEST_ID_XOR
+}
 
 struct TaskManagerInnerInit {
     initial_capacity: usize,
@@ -59,6 +65,7 @@ struct TaskState {
     task_expires_at: Option<Instant>,
     last_result_instant: Option<Instant>,
     results_expires_at: Option<Instant>,
+    task_kind: TaskKind,
     prompt: Option<Arc<String>>,
     image: Option<Bytes>,
     model: Option<String>,
@@ -74,6 +81,14 @@ struct TaskState {
     seed: Option<i32>,
     finished_results_count: usize,
     rate_limit_reservation: Option<RateLimitReservation>,
+}
+
+fn task_kind_from_task(task: &crate::api::Task) -> TaskKind {
+    if task.image.is_some() {
+        TaskKind::ImageTo3D
+    } else {
+        TaskKind::TextTo3D
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -134,6 +149,7 @@ impl TaskState {
             task_expires_at: Some(now + result_lifetime),
             last_result_instant: None,
             results_expires_at: None,
+            task_kind: task_kind_from_task(task),
             prompt: task.prompt.as_ref().map(Arc::clone),
             image: task.image.clone(),
             model: task.model.clone(),
@@ -174,6 +190,11 @@ pub enum TaskStatus {
 
 pub struct TaskResultBundle {
     pub results: Vec<AddTaskResultRequest>,
+    pub model: Option<String>,
+}
+
+pub struct TaskActivityMetadata {
+    pub task_kind: &'static str,
     pub model: Option<String>,
 }
 
@@ -372,6 +393,7 @@ impl TaskManager {
                                         let mut schedule_results_expiration = None;
                                         let mut timed_out_workers = Vec::new();
                                         let mut timed_out_task_kind = None;
+                                        let mut timed_out_model = None;
                                         let mut timed_out_elapsed_secs = None;
                                         match inner.tasks.entry_async(task_id).await {
                                             Entry::Occupied(mut entry) => {
@@ -410,13 +432,7 @@ impl TaskManager {
                                                         )));
                                                         continue;
                                                     }
-                                                    let task_kind = if state.image.is_some() {
-                                                        "img3d"
-                                                    } else if state.prompt.is_some() {
-                                                        "txt3d"
-                                                    } else {
-                                                        "unknown"
-                                                    };
+                                                    let task_kind = state.task_kind.label();
                                                     let assigned_workers = std::mem::take(&mut state.assigned_workers);
                                                     let mut assigned_worker_ids =
                                                         std::mem::take(&mut state.assigned_worker_ids);
@@ -426,6 +442,7 @@ impl TaskManager {
                                                         timed_out_workers.push((worker, worker_id));
                                                     }
                                                     timed_out_task_kind = Some(task_kind);
+                                                    timed_out_model = state.model.clone();
                                                     timed_out_elapsed_secs = state
                                                         .execution_start
                                                         .map(|start| start.elapsed().as_secs_f64());
@@ -512,12 +529,17 @@ impl TaskManager {
                                             for (worker, worker_id) in timed_out_workers {
                                                 inner.metrics.inc_timeout_failed(worker.as_ref()).await;
                                                 if let Some(recorder) = inner.worker_event_recorder.as_ref() {
+                                                    let metadata = json!({
+                                                        "worker_hotkey": worker.as_ref(),
+                                                    });
                                                     recorder.record_worker_event(
                                                         Some(task_id),
                                                         worker_id.as_deref(),
                                                         "timeout",
                                                         task_kind,
+                                                        timed_out_model.as_deref(),
                                                         None,
+                                                        Some(&metadata),
                                                     );
                                                 }
                                             }
@@ -526,7 +548,7 @@ impl TaskManager {
                                             inner.schedule_results_expiration(task_id, when);
                                         }
                                         if let Some((reservation, success)) = completed_reservation {
-                                            Self::emit_completion(inner.as_ref(), reservation, success)
+                                            Self::emit_completion(inner.as_ref(), task_id, reservation, success)
                                                 .await;
                                         }
                                     }
@@ -577,7 +599,7 @@ impl TaskManager {
             }
         };
         if let Some((reservation, success)) = completed_reservation {
-            Self::emit_completion(self.inner.as_ref(), reservation, success).await;
+            Self::emit_completion(self.inner.as_ref(), task_id, reservation, success).await;
         }
         if let Some(when) = results_expires_at {
             self.inner.schedule_results_expiration(task_id, when);
@@ -646,7 +668,7 @@ impl TaskManager {
                 Entry::Vacant(_) => return Err(AddResultError::NotAssigned),
             };
         if let Some((reservation, success)) = completed_reservation {
-            Self::emit_completion(self.inner.as_ref(), reservation, success).await;
+            Self::emit_completion(self.inner.as_ref(), task_id, reservation, success).await;
         }
         if let Some(when) = results_expires_at {
             self.inner.schedule_results_expiration(task_id, when);
@@ -722,6 +744,7 @@ impl TaskManager {
         match self.inner.tasks.entry_async(task.id).await {
             Entry::Occupied(mut entry) => {
                 let state = entry.get_mut();
+                state.task_kind = task_kind_from_task(task);
                 state.prompt = task.prompt.as_ref().map(Arc::clone);
                 state.image = task.image.clone();
                 state.model = task.model.clone();
@@ -752,30 +775,42 @@ impl TaskManager {
 
     async fn emit_completion(
         inner: &TaskManagerInner,
+        task_id: Uuid,
         reservation: RateLimitReservation,
         success: bool,
     ) {
+        let request_id = rate_limit_completion_request_id(task_id);
         if success {
             reservation.rollback_pending_success().await;
-            if let Some(batch) = reservation.success_batch() {
+            if let Some(batch) = reservation.success_batch_with_request_id(request_id) {
                 inner.rate_limit_mutation_queue.push(batch).await;
             }
             return;
         }
 
         reservation.rollback_pending().await;
-        if let Some(batch) = reservation.refund_batch() {
+        if let Some(batch) = reservation.refund_batch_with_request_id(request_id) {
             inner.rate_limit_mutation_queue.push(batch).await;
         }
     }
 
-    #[cfg(test)]
     pub async fn get_model(&self, task_id: Uuid) -> Option<String> {
         self.inner
             .tasks
             .get_async(&task_id)
             .await
             .and_then(|entry| entry.model.clone())
+    }
+
+    pub async fn get_activity_metadata(&self, task_id: Uuid) -> Option<TaskActivityMetadata> {
+        self.inner
+            .tasks
+            .get_async(&task_id)
+            .await
+            .map(|entry| TaskActivityMetadata {
+                task_kind: entry.task_kind.label(),
+                model: entry.model.clone(),
+            })
     }
 
     pub async fn record_assignment(&self, task_id: Uuid, worker: Hotkey, worker_id: Arc<str>) {

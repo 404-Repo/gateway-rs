@@ -198,14 +198,17 @@ pub async fn get_result_handler(
     let task_manager = gateway_state.task_manager();
     let rate_ctx = depot.require::<RateLimitContext>()?;
     authorize_task_read_access(&gateway_state, rate_ctx, get_task.id).await?;
-    let task_kind = "unknown";
+    let activity_metadata = task_manager.get_activity_metadata(get_task.id).await;
+    let (task_kind, task_model) = activity_metadata
+        .map(|metadata| (metadata.task_kind, metadata.model))
+        .unwrap_or(("unknown", None));
     record_task_activity(
         TaskActivityContext {
             gateway_state: &gateway_state,
             rate_ctx,
             origin: record_origin,
             task_kind,
-            model: None,
+            model: task_model.as_deref(),
             task_id: Some(get_task.id),
         },
         "get_result",

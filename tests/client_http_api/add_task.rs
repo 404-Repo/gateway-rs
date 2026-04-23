@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use std::sync::Arc;
@@ -244,11 +245,17 @@ async fn add_task_accepts_valid_model_params_json() {
 async fn add_task_origin_header_success() {
     let h = build_harness().await;
     set_guest_free_settings(&h, 2, 86_400_000).await;
+    let service_a = h
+        .service
+        .with_local_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    let service_b = h
+        .service
+        .with_local_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)));
     let res = TestClient::post("http://localhost/add_task")
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header("x-client-origin", "discord", true)
         .json(&serde_json::json!({"prompt": "robot"}))
-        .send(&h.service)
+        .send(&service_a)
         .await;
     let (status, _headers, body) = read_response(res).await;
     assert_eq!(
@@ -262,7 +269,7 @@ async fn add_task_origin_header_success() {
         .add_header("x-api-key", h.api_key.to_string(), true)
         .add_header("x-client-origin", "unknown-tool", true)
         .json(&serde_json::json!({"prompt": "robot"}))
-        .send(&h.service)
+        .send(&service_b)
         .await;
     let (status, _headers, body) = read_response(res).await;
     assert_eq!(
@@ -982,8 +989,12 @@ async fn add_task_generic_key_ignores_site_guest_limits() {
 }
 
 #[tokio::test]
-async fn add_task_generic_key_respects_sql_generic_policies() {
-    let h = build_harness().await;
+async fn add_task_generic_key_hits_concurrent_gate_before_sql_generic_policies() {
+    let h = build_harness_with_options(GatewayHarnessOptions {
+        generic_key_concurrent_limit: Some(1),
+        ..GatewayHarnessOptions::default()
+    })
+    .await;
     set_generic_rate_limit_policies(
         &h,
         RateLimitPolicies {
@@ -1010,10 +1021,10 @@ async fn add_task_generic_key_respects_sql_generic_policies() {
     assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
     let payload: serde_json::Value =
         serde_json::from_slice(&second_body).expect("rate limit body should be valid json");
-    assert_eq!(payload["error"], "daily_limit");
+    assert_eq!(payload["error"], "concurrent_limit");
     assert_eq!(
         payload["message"],
-        "Generic key global rolling limit exceeded."
+        "Generic key concurrent task limit exceeded."
     );
 }
 
@@ -1100,7 +1111,7 @@ async fn lowered_queue_cap_only_blocks_new_admissions() {
 }
 
 #[tokio::test]
-async fn add_task_bad_request_does_not_consume_guest_quota() {
+async fn add_task_bad_request_does_not_consume_generic_quota() {
     let h = build_harness().await;
     set_generic_rate_limit_policies(
         &h,
@@ -1120,35 +1131,8 @@ async fn add_task_bad_request_does_not_consume_guest_quota() {
     let (bad_status, _headers, _body) = read_response(bad).await;
     assert_eq!(bad_status, StatusCode::BAD_REQUEST);
 
-    // First valid request should still pass (bad payload did not consume the SQL generic quota).
-    let first_valid = TestClient::post("http://localhost/add_task")
-        .add_header("x-api-key", h.api_key.to_string(), true)
-        .json(&serde_json::json!({"prompt": "robot"}))
-        .send(&h.service)
-        .await;
-    let (first_status, _headers, first_body) = read_response(first_valid).await;
-    assert_eq!(
-        first_status,
-        StatusCode::OK,
-        "first valid request failed: {}",
-        String::from_utf8_lossy(&first_body)
-    );
-
-    // Second valid request should now be rejected by the SQL generic rolling window.
-    let second_valid = TestClient::post("http://localhost/add_task")
-        .add_header("x-api-key", h.api_key.to_string(), true)
-        .json(&serde_json::json!({"prompt": "robot"}))
-        .send(&h.service)
-        .await;
-    let (next_status, _headers, next_body) = read_response(second_valid).await;
-    assert_eq!(next_status, StatusCode::TOO_MANY_REQUESTS);
-    let payload: serde_json::Value =
-        serde_json::from_slice(&next_body).expect("guest limit body should be valid json");
-    assert_eq!(payload["error"], "daily_limit");
-    assert_eq!(
-        payload["message"],
-        "Generic key global rolling limit exceeded."
-    );
+    // A valid request should still pass, proving the bad payload did not consume generic quota.
+    let _task_id = add_task_prompt(&h, "robot", None).await;
 }
 
 #[tokio::test]

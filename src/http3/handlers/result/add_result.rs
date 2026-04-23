@@ -200,6 +200,7 @@ pub async fn add_result_handler(
         }
     };
     let reason = outcome.reason.as_deref();
+    let task_model = manager.get_model(task_id).await;
 
     gateway_state.record_worker_event(WorkerEventRef {
         task_id: Some(task_id),
@@ -210,7 +211,13 @@ pub async fn add_result_handler(
             "result_failure"
         },
         task_kind: task_kind.label(),
+        model: task_model.as_deref(),
         reason,
+        metadata_json: Some(serde_json::json!({
+            "worker_hotkey": worker_hotkey_ref.as_ref(),
+            "assignment_token": assignment_token,
+            "replayed_durable_result": replayed_durable_result,
+        })),
     });
 
     let elapsed_secs = manager.get_time(task_id).await;

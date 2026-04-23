@@ -5,7 +5,7 @@ edition = "2024"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { version = "0.91.1", features = [
+salvo = { version = "0.92.0", features = [
     "quinn",
     "rustls",
     "rate-limiter",
@@ -45,7 +45,7 @@ h3 = { version = "0.0.8", features = ["tracing"] }
 h3-quinn = { version = "0.0.10" }
 http = "1.4.0"
 backon = "1.6.0"
-openraft = { version = "0.9.22", features = ["storage-v2", "serde"] }
+openraft = { version = "0.9.24", features = ["storage-v2", "serde"] }
 tokio-postgres-rustls = "0.13.0"
 rustls = { version = "0.23.38" }
 rustls-platform-verifier = "0.7.0"
@@ -60,7 +60,7 @@ rcgen = { version = "0.14.7", features = ["pem"] }
 foldhash = "0.2.0"
 portable-atomic = "1.13.1"
 scc = "3.7.0"
-sdd = "4.8.3"
+sdd = "4.8.6"
 schnorrkel = "0.11.5"
 base64-simd = "0.8"
 blake2 = "0.10.6"
@@ -68,7 +68,7 @@ bs58 = "0.5.1"
 prometheus = "0.14.0"
 blake3 = "1.8.4"
 moka = { version = "0.12.15", features = ["sync"] }
-mimalloc = { version = "0.1.48", default-features = false }
+mimalloc = { version = "0.1.50", default-features = false }
 regex = "1.12.3"
 image = "0.25.10"
 chrono = { version = "0.4", features = ["serde", "clock"] }
