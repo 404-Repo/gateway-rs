@@ -2,10 +2,14 @@ use anyhow::{Result, anyhow};
 use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
-use std::{env, fmt, path::Path, path::PathBuf};
+use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
+use crate::config_env::{
+    ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV, dangerous_skip_verification_allowed,
+    parse_config_from_contents,
+};
 pub use crate::config_model::{ModelConfig, ModelOutput, ModelResolveError};
 use crate::crypto::hotkey::Hotkey;
 
@@ -309,7 +313,14 @@ fn default_tls_versions() -> Vec<String> {
     vec!["1.2".to_string(), "1.3".to_string()]
 }
 
-const ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV: &str = "GATEWAY_ALLOW_DANGEROUS_SKIP_VERIFICATION";
+fn validate_loaded_config(config: NodeConfig) -> Result<NodeConfig> {
+    config
+        .model_config
+        .validate()
+        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+    validate_node_config(&config)?;
+    Ok(config)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Certificate {
@@ -455,14 +466,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         );
     }
     if config.cert.dangerous_skip_verification {
-        let allow_override = matches!(
-            env::var(ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV),
-            Ok(value)
-                if matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-        );
+        let allow_override = dangerous_skip_verification_allowed();
         if !cfg!(debug_assertions) && !allow_override {
             return Err(anyhow!(
                 "cert.dangerous_skip_verification can only be enabled in debug/test builds or when {}=1",
@@ -481,28 +485,12 @@ pub async fn read_config(path: Option<&String>) -> Result<NodeConfig> {
 
 pub async fn read_config_from_path<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
     let config = read_config_from_file(path.as_ref()).await?;
-    config
-        .model_config
-        .validate()
-        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
-    validate_node_config(&config)?;
-    Ok(config)
+    validate_loaded_config(config)
 }
 
-async fn read_config_from_file<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
+async fn read_config_from_file(path: &Path) -> Result<NodeConfig> {
     let contents = tokio::fs::read_to_string(&path).await?;
-
-    match path.as_ref().extension().and_then(|ext| ext.to_str()) {
-        Some("toml") => {
-            let config: NodeConfig = toml::from_str(&contents)?;
-            Ok(config)
-        }
-        Some("json") => {
-            let config: NodeConfig = serde_json::from_str(&contents)?;
-            Ok(config)
-        }
-        _ => Err(anyhow!("Unsupported file format")),
-    }
+    parse_config_from_contents(path, &contents)
 }
 
 pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {

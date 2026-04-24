@@ -119,7 +119,8 @@ impl RuntimeConfigStore {
     }
 
     pub async fn reload_from_disk(&self) -> bool {
-        self.reload_inner().await
+        self.apply_reloaded_config(read_config_from_path(&self.path).await)
+            .await
     }
 
     pub fn start_watcher(
@@ -201,8 +202,16 @@ impl RuntimeConfigStore {
         })
     }
 
-    async fn reload_inner(&self) -> bool {
-        let cfg = match read_config_from_path(&self.path).await {
+    #[cfg(test)]
+    async fn reload_from_disk_with_env_overrides(&self, overrides: &[(&str, &str)]) -> bool {
+        self.apply_reloaded_config(
+            crate::config_env::read_config_from_path_with_overrides(&self.path, overrides).await,
+        )
+        .await
+    }
+
+    async fn apply_reloaded_config(&self, cfg_result: Result<NodeConfig>) -> bool {
+        let cfg = match cfg_result {
             Ok(cfg) => cfg,
             Err(err) => {
                 warn!(
@@ -354,6 +363,10 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
 mod tests {
     use super::RuntimeConfigStore;
     use crate::config::NodeConfig;
+    use crate::config_env::{
+        ADMIN_KEY_ENV, API_KEY_SECRET_ENV, DB_HOST_ENV, DB_NAME_ENV, DB_PASSWORD_ENV, DB_USER_ENV,
+        read_config_from_path_with_overrides,
+    };
     use anyhow::Result;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -364,6 +377,36 @@ mod tests {
 
     fn parse_node_config() -> Result<NodeConfig> {
         Ok(toml::from_str::<NodeConfig>(BASE_CONFIG)?)
+    }
+
+    fn remove_line(config_text: &str, line: &str) -> String {
+        config_text.replacen(&format!("{line}\n"), "", 1)
+    }
+
+    fn remove_env_backed_fields(config_text: &str) -> String {
+        let config_text = remove_line(
+            config_text,
+            "admin_key = \"b6c8597a-00e9-493a-b6cd-5dfc7244d46b\"",
+        );
+        let config_text = remove_line(
+            &config_text,
+            "api_key_secret = \"CHANGE_ME_IN_PRODUCTION_58392047\"",
+        );
+        let config_text = remove_line(&config_text, "host = \"db\"");
+        let config_text = remove_line(&config_text, "user = \"postgres\"");
+        let config_text = remove_line(&config_text, "password = \"api_keys_!54321\"");
+        remove_line(&config_text, "db = \"api_keys_db\"")
+    }
+
+    fn env_backed_overrides() -> [(&'static str, &'static str); 6] {
+        [
+            (API_KEY_SECRET_ENV, "env-secret-for-hashing"),
+            (ADMIN_KEY_ENV, "11111111-1111-1111-1111-111111111111"),
+            (DB_HOST_ENV, "env-db-host"),
+            (DB_USER_ENV, "env-db-user"),
+            (DB_PASSWORD_ENV, "env-db-password"),
+            (DB_NAME_ENV, "env-db-name"),
+        ]
     }
 
     #[tokio::test]
@@ -441,6 +484,40 @@ mod tests {
 
         let after = store.snapshot();
         assert_eq!(after.http().request_size_limit, 8192);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_from_disk_uses_env_overrides_for_missing_fields() -> Result<()> {
+        let file = Builder::new().suffix(".toml").tempfile()?;
+        let overrides = env_backed_overrides();
+        let initial_config = remove_env_backed_fields(BASE_CONFIG);
+        std::fs::write(file.path(), &initial_config)?;
+
+        let initial = read_config_from_path_with_overrides(file.path(), &overrides).await?;
+        let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
+
+        let updated =
+            initial_config.replace("max_task_queue_len = 500", "max_task_queue_len = 901");
+        std::fs::write(file.path(), updated)?;
+
+        assert!(store.reload_from_disk_with_env_overrides(&overrides).await);
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.http().max_task_queue_len, 901);
+        assert_eq!(
+            snapshot.node().http.api_key_secret,
+            "env-secret-for-hashing"
+        );
+        assert_eq!(
+            snapshot.node().http.admin_key.to_string(),
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(snapshot.node().db.host, "env-db-host");
+        assert_eq!(snapshot.node().db.user, "env-db-user");
+        assert_eq!(snapshot.node().db.password, "env-db-password");
+        assert_eq!(snapshot.node().db.db, "env-db-name");
 
         Ok(())
     }

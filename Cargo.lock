@@ -14,7 +14,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
 dependencies = [
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "generic-array",
 ]
 
@@ -930,7 +930,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "inout",
 ]
 
@@ -1185,9 +1185,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-common"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bfb12502f3fc46cca1bb51ac28df9d618d813cdc3d2f25b9fe775a34af26bb3"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "rand_core 0.6.4",
@@ -1431,7 +1431,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "const-oid 0.9.6",
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "subtle",
 ]
 
@@ -2006,9 +2006,9 @@ dependencies = [
 
 [[package]]
 name = "generic-array"
-version = "0.14.9"
+version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bb6743198531e02858aeaea5398fcc883e71851fcbcb5a2f773e2fb6cb1edf2"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
@@ -2920,9 +2920,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.185"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -4513,9 +4513,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4629,9 +4629,9 @@ checksum = "bd8d438861332c3b1ac396c77bd9cac620ea1ff347efb63c05a83d8f0a593899"
 
 [[package]]
 name = "salvo"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c769247c3d1f0334876337eb5044e8954d7546ee8814adef31eb9b6343a569"
+checksum = "7ca8c1bb8827ee7e10c0fae7ff5c095507babb79f39febceb03cf771ac76213a"
 dependencies = [
  "salvo-acme",
  "salvo-compression",
@@ -4643,9 +4643,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-acme"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db676595526cc23d157e31adf89bb32640f7cbb1ca2b19d83449eb6ff037cff5"
+checksum = "64cd7df7358eb320b8f8636376a50078b066b6667c74bfac7620a7bbc35619c9"
 dependencies = [
  "certon",
  "futures-util",
@@ -4658,9 +4658,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-compression"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3148cb9a9cd371e594a7aae6cb922818cc102e0d1825cf3014c7befa3a05791"
+checksum = "6abca2f0a00019c6f52a42263549a039bd5efa8320a0e290286f024925444089"
 dependencies = [
  "brotli",
  "bytes",
@@ -4693,9 +4693,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-proxy"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12106182d3a59907a07f8cab1502de7a96e5acd5b899b66397975ac01e3f9c48"
+checksum = "6d45a1b01cae40bfd354611915dbf79fac57a27f8d2ff81a4e5f45da85da1781"
 dependencies = [
  "fastrand",
  "futures-util",
@@ -4712,9 +4712,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-rate-limiter"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bd48fb32aefb9909e2916874826bf9fe7d98e6bfb0b305f6b0aebdc4e17f41f"
+checksum = "43c2d33b1cdc8628fbeceec4102c720c73c6d7f5fe3b0e61e53db2b0fe5a00fb"
 dependencies = [
  "moka",
  "salvo_core",
@@ -4726,9 +4726,9 @@ dependencies = [
 
 [[package]]
 name = "salvo-serde-util"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9158501312da84612279015f3c7793e40c80b8fd6628823fba9bf1bcaad197e6"
+checksum = "e6cc7c4323064b130588f6579f6f36044e768e56c444e849832faeabae60461c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4737,9 +4737,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_core"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1193415bc0b50b041bf5b3a1e2d066332d9be4bb6a31b6775e6b3afddb3d6926"
+checksum = "d1513484b68b9ed190482976b10f6d84ea12d03d4b21cbc103bce50de975b7e4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4791,9 +4791,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_extra"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c09fedc4b2c0195e250b2e27e7888faa32245d0c4ec93e178273c16b178c26ce"
+checksum = "992177641bd8daf747277c32e5c15e9134313d22e7313faa42fca6240ef8b2ef"
 dependencies = [
  "base64 0.22.1",
  "etag",
@@ -4813,9 +4813,9 @@ dependencies = [
 
 [[package]]
 name = "salvo_macros"
-version = "0.92.0"
+version = "0.92.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e48a1b12532532f2193aaf0fec67a8f31542fb2b5f46108328297629011697f"
+checksum = "d6b6e4741b68ea9a61314725d4fe808850e540b5f497cfcf0ec0c2c50eadc88b"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -5997,7 +5997,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
 dependencies = [
- "crypto-common 0.1.6",
+ "crypto-common 0.1.7",
  "subtle",
 ]
 

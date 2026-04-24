@@ -5,7 +5,7 @@ edition = "2024"
 build = "src/build.rs"
 
 [dependencies]
-salvo = { version = "0.92.0", features = [
+salvo = { version = "0.92.1", features = [
     "quinn",
     "rustls",
     "rate-limiter",
@@ -47,7 +47,7 @@ http = "1.4.0"
 backon = "1.6.0"
 openraft = { version = "0.9.24", features = ["storage-v2", "serde"] }
 tokio-postgres-rustls = "0.13.0"
-rustls = { version = "0.23.38" }
+rustls = { version = "0.23.39" }
 rustls-platform-verifier = "0.7.0"
 toml = "1.1.2"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
