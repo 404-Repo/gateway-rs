@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::common::queue::TaskQueue;
@@ -66,7 +65,4 @@ impl HttpState {
         &self.unauthorized_daily_limiter
     }
 
-    pub fn is_cluster_ip(&self, ip: &IpAddr) -> bool {
-        self.config().cluster_ips().contains(ip)
-    }
 }
