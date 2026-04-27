@@ -58,4 +58,3 @@ pub async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(),
         ))
     }
 }
-

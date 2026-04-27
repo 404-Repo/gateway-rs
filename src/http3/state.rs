@@ -64,5 +64,4 @@ impl HttpState {
     pub fn unauthorized_daily_limiter(&self) -> &Arc<UnauthorizedDailyLimiter> {
         &self.unauthorized_daily_limiter
     }
-
 }
