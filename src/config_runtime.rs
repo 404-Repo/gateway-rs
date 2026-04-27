@@ -20,8 +20,7 @@ use crate::config::{
 use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
 use crate::http3::whitelist::{
-    RateLimitWhitelist, resolve_cluster_peer_ips, resolve_rate_limit_whitelist,
-    resolve_egress_ips,
+    RateLimitWhitelist, resolve_cluster_peer_ips, resolve_egress_ips, resolve_rate_limit_whitelist,
 };
 use crate::raft::rate_limit::RateLimitService;
 
@@ -492,8 +491,14 @@ mod tests {
         assert!(store.reload_from_disk_with_env_overrides(&overrides).await);
         let snapshot = store.snapshot();
         assert_eq!(snapshot.http().max_task_queue_len, 901);
-        assert_eq!(snapshot.node().http.api_key_secret, "env-secret-for-hashing");
-        assert_eq!(snapshot.node().http.admin_key.to_string(), "11111111-1111-1111-1111-111111111111");
+        assert_eq!(
+            snapshot.node().http.api_key_secret,
+            "env-secret-for-hashing"
+        );
+        assert_eq!(
+            snapshot.node().http.admin_key.to_string(),
+            "11111111-1111-1111-1111-111111111111"
+        );
         assert_eq!(snapshot.node().db.host, "env-db-host");
         assert_eq!(snapshot.node().db.user, "env-db-user");
         assert_eq!(snapshot.node().db.password, "env-db-password");

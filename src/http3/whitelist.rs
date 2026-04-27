@@ -172,10 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn egress_ips_resolves_literal_ips_directly() {
-        let entries = vec![
-            "127.0.0.1".to_string(),
-            "192.168.1.1".to_string(),
-        ];
+        let entries = vec!["127.0.0.1".to_string(), "192.168.1.1".to_string()];
         let resolved = resolve_egress_ips(&entries).await;
         assert_eq!(resolved.len(), 2);
         assert!(resolved.contains(&"127.0.0.1".parse().unwrap()));

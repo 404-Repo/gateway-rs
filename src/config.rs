@@ -218,28 +218,74 @@ pub struct DbConfig {
     pub events_queue_capacity: usize,
 }
 
-fn default_deleted_keys_ttl_minutes() -> u64 { 60 }
-fn default_events_flush_interval_sec() -> u64 { 5 }
-fn default_events_copy_batch_size() -> usize { 1000 }
-fn default_db_pool_size() -> usize { 4 }
-fn default_events_queue_capacity() -> usize { 50_000 }
-fn default_max_concurrent_image_uploads() -> usize { 1024 }
-fn default_distributed_rate_limiter_max_capacity() -> usize { 4096 }
-fn default_generic_key_concurrent_limit() -> usize { 2 }
-fn default_invalid_api_key_negative_cache_ttl_sec() -> u64 { 5 * 60 }
-fn default_invalid_api_key_ip_miss_ttl_sec() -> u64 { 10 * 60 }
-fn default_invalid_api_key_ip_cooldown_ttl_sec() -> u64 { 5 * 60 }
-fn default_invalid_api_key_ip_cache_capacity() -> u64 { 200_000 }
-fn default_invalid_api_key_ip_miss_limit() -> u64 { 50 }
-fn default_max_rate_limit_deltas_per_batch() -> usize { 16_384 }
-fn default_model_params_max_len() -> usize { 1024 }
-fn default_model_params_config() -> ModelParamsConfig { ModelParamsConfig { max_len: default_model_params_max_len() } }
-fn default_snapshot_dir() -> String { "data/snapshots".to_string() }
-fn default_max_snapshots_to_keep() -> usize { 5 }
-fn default_compaction_threshold_bytes() -> u64 { 4 * 1024 * 1024 }
-fn default_compaction_ops() -> u64 { 4096 }
-fn default_log_store_flush_interval_ms() -> u64 { 200 }
-fn default_tls_versions() -> Vec<String> { vec!["1.2".to_string(), "1.3".to_string()] }
+fn default_deleted_keys_ttl_minutes() -> u64 {
+    60
+}
+fn default_events_flush_interval_sec() -> u64 {
+    5
+}
+fn default_events_copy_batch_size() -> usize {
+    1000
+}
+fn default_db_pool_size() -> usize {
+    4
+}
+fn default_events_queue_capacity() -> usize {
+    50_000
+}
+fn default_max_concurrent_image_uploads() -> usize {
+    1024
+}
+fn default_distributed_rate_limiter_max_capacity() -> usize {
+    4096
+}
+fn default_generic_key_concurrent_limit() -> usize {
+    2
+}
+fn default_invalid_api_key_negative_cache_ttl_sec() -> u64 {
+    5 * 60
+}
+fn default_invalid_api_key_ip_miss_ttl_sec() -> u64 {
+    10 * 60
+}
+fn default_invalid_api_key_ip_cooldown_ttl_sec() -> u64 {
+    5 * 60
+}
+fn default_invalid_api_key_ip_cache_capacity() -> u64 {
+    200_000
+}
+fn default_invalid_api_key_ip_miss_limit() -> u64 {
+    50
+}
+fn default_max_rate_limit_deltas_per_batch() -> usize {
+    16_384
+}
+fn default_model_params_max_len() -> usize {
+    1024
+}
+fn default_model_params_config() -> ModelParamsConfig {
+    ModelParamsConfig {
+        max_len: default_model_params_max_len(),
+    }
+}
+fn default_snapshot_dir() -> String {
+    "data/snapshots".to_string()
+}
+fn default_max_snapshots_to_keep() -> usize {
+    5
+}
+fn default_compaction_threshold_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+fn default_compaction_ops() -> u64 {
+    4096
+}
+fn default_log_store_flush_interval_ms() -> u64 {
+    200
+}
+fn default_tls_versions() -> Vec<String> {
+    vec!["1.2".to_string(), "1.3".to_string()]
+}
 
 fn validate_loaded_config(config: NodeConfig) -> Result<NodeConfig> {
     config
@@ -371,10 +417,14 @@ impl fmt::Display for NodeConfig {
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     if config.http.transport == TransportMode::Plain {
-        tracing::warn!("HTTP transport is configured without TLS; only use this in local development");
+        tracing::warn!(
+            "HTTP transport is configured without TLS; only use this in local development"
+        );
     }
     if config.db.transport == TransportMode::Plain {
-        tracing::warn!("Database transport is configured without TLS; only use this in local development");
+        tracing::warn!(
+            "Database transport is configured without TLS; only use this in local development"
+        );
     }
     if config.cert.dangerous_skip_verification {
         let allow_override = dangerous_skip_verification_allowed();
