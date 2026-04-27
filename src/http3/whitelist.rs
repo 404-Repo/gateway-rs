@@ -98,6 +98,32 @@ pub async fn resolve_cluster_peer_ips(
         .ips
 }
 
+/// Resolve a list of IPs or hostnames into a set of IpAddr.
+/// Used for cluster_peer_egress_ips: NAT egress IPs that should be
+/// whitelisted in cluster_ips without being used as Raft peer endpoints.
+/// Entries that are already valid IP addresses are inserted directly;
+/// hostnames are resolved via DNS. Resolution failures are logged but
+/// do not prevent other entries from being added.
+pub async fn resolve_egress_ips(entries: &[String]) -> HashSet<IpAddr> {
+    let mut ips = HashSet::new();
+    let mut domains: Vec<String> = Vec::new();
+
+    for entry in entries {
+        if let Ok(ip) = entry.parse::<IpAddr>() {
+            ips.insert(ip);
+        } else {
+            domains.push(entry.clone());
+        }
+    }
+
+    if !domains.is_empty() {
+        let resolved = resolve_domains_best_effort(domains, "cluster peer egress").await;
+        ips.extend(resolved.ips);
+    }
+
+    ips
+}
+
 pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
     let remote_ip = match req.remote_addr() {
         salvo::conn::SocketAddr::IPv4(addr) => Some(IpAddr::V4(*addr.ip())),
@@ -113,7 +139,7 @@ pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_cluster_peer_ips, resolve_rate_limit_whitelist};
+    use super::{resolve_cluster_peer_ips, resolve_egress_ips, resolve_rate_limit_whitelist};
     use foldhash::HashSet as FoldHashSet;
 
     #[tokio::test]
@@ -142,5 +168,36 @@ mod tests {
             !resolved.is_empty(),
             "expected at least localhost to resolve"
         );
+    }
+
+    #[tokio::test]
+    async fn egress_ips_resolves_literal_ips_directly() {
+        let entries = vec![
+            "127.0.0.1".to_string(),
+            "192.168.1.1".to_string(),
+        ];
+        let resolved = resolve_egress_ips(&entries).await;
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&"127.0.0.1".parse().unwrap()));
+        assert!(resolved.contains(&"192.168.1.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn egress_ips_resolves_hostnames_best_effort() {
+        let entries = vec![
+            "localhost".to_string(),
+            "definitely-invalid-hostname.invalid".to_string(),
+        ];
+        let resolved = resolve_egress_ips(&entries).await;
+        assert!(
+            !resolved.is_empty(),
+            "expected at least localhost to resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_ips_empty_input_returns_empty_set() {
+        let resolved = resolve_egress_ips(&[]).await;
+        assert!(resolved.is_empty());
     }
 }
