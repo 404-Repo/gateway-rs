@@ -14,7 +14,7 @@ use crate::config_runtime::RuntimeConfigStore;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::handlers::admin::{
-    admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
+    admin_key_check, generic_key_read_handler, generic_key_update_handler,
 };
 use crate::http3::handlers::core::{
     api_or_generic_key_check, get_leader_handler, id_handler, metrics_handler, version_handler,
@@ -243,7 +243,6 @@ impl Http3Server {
             .push(
                 Router::with_path("/write")
                     .hoop(raft_write_size_limit)
-                    .hoop(cluster_check)
                     .hoop(admin_key_check)
                     .post(write_handler),
             )

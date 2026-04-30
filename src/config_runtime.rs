@@ -20,7 +20,7 @@ use crate::config::{
 use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
 use crate::http3::whitelist::{
-    RateLimitWhitelist, resolve_cluster_peer_ips, resolve_rate_limit_whitelist,
+    RateLimitWhitelist, resolve_cluster_peer_ips, resolve_egress_ips, resolve_rate_limit_whitelist,
 };
 use crate::raft::rate_limit::RateLimitService;
 
@@ -149,7 +149,6 @@ impl RuntimeConfigStore {
                         let current_mtime = modified_millis_from_path(&poll_path).await;
                         if current_mtime.is_some() && current_mtime != last_polled_mtime {
                             let _ = store.reload_from_disk().await;
-                            // Advance marker even on invalid config to avoid warning spam.
                             last_polled_mtime = current_mtime;
                         }
                     }
@@ -339,8 +338,17 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
     })?;
 
     let whitelist_ips = resolve_rate_limit_whitelist(&config.http.rate_limit_whitelist).await;
-    let cluster_ips =
+
+    // Resolve cluster_ips from node_dns_names (used for Raft peer connections)
+    let mut cluster_ips =
         resolve_cluster_peer_ips(&config.network.domain, &config.network.node_dns_names).await;
+
+    // Merge in cluster_peer_egress_ips (NAT egress IPs) if configured.
+    // These are NOT used for Raft peer connections — only for cluster_check whitelist.
+    if !config.network.cluster_peer_egress_ips.is_empty() {
+        let egress_ips = resolve_egress_ips(&config.network.cluster_peer_egress_ips).await;
+        cluster_ips.extend(egress_ips);
+    }
 
     let rate_limit_service = RateLimitService::new(&config.http);
     let rate_limiters = RateLimiters::new(&config.http);
@@ -413,14 +421,11 @@ mod tests {
     async fn reload_from_disk_is_atomic_and_updates_snapshot() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         let before = store.snapshot();
         assert_eq!(before.http().max_task_queue_len, 500);
         assert!(before.prompt_regex().is_match("HELLO 123"));
-
         let updated = BASE_CONFIG
             .replace("max_task_queue_len = 500", "max_task_queue_len = 777")
             .replace(
@@ -428,18 +433,13 @@ mod tests {
                 "allowed_pattern = \"^[a-z]+$\"",
             );
         std::fs::write(file.path(), updated)?;
-
         assert!(store.reload_from_disk().await);
-
-        // Old view keeps pointing to the old snapshot even after the swap.
         assert_eq!(before.http().max_task_queue_len, 500);
         assert!(before.prompt_regex().is_match("HELLO 123"));
-
         let after = store.snapshot();
         assert_eq!(after.http().max_task_queue_len, 777);
         assert!(after.prompt_regex().is_match("hello"));
         assert!(!after.prompt_regex().is_match("HELLO 123"));
-
         Ok(())
     }
 
@@ -447,22 +447,17 @@ mod tests {
     async fn invalid_reload_keeps_previous_snapshot() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         let invalid = BASE_CONFIG.replace(
             "allowed_pattern = \"^[A-Za-z0-9 .,'():;/?!+%-]+$\"",
             "allowed_pattern = \"[\"",
         );
         std::fs::write(file.path(), invalid)?;
-
         assert!(!store.reload_from_disk().await);
-
         let snapshot = store.snapshot();
         assert_eq!(snapshot.http().max_task_queue_len, 500);
         assert!(snapshot.prompt_regex().is_match("HELLO 123"));
-
         Ok(())
     }
 
@@ -470,21 +465,15 @@ mod tests {
     async fn reload_updates_http_limits() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         let before = store.snapshot();
         assert_eq!(before.http().request_size_limit, 4096);
-
         let updated = BASE_CONFIG.replace("request_size_limit = 4096", "request_size_limit = 8192");
         std::fs::write(file.path(), updated)?;
-
         assert!(store.reload_from_disk().await);
-
         let after = store.snapshot();
         assert_eq!(after.http().request_size_limit, 8192);
-
         Ok(())
     }
 
@@ -494,16 +483,12 @@ mod tests {
         let overrides = env_backed_overrides();
         let initial_config = remove_env_backed_fields(BASE_CONFIG);
         std::fs::write(file.path(), &initial_config)?;
-
         let initial = read_config_from_path_with_overrides(file.path(), &overrides).await?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         let updated =
             initial_config.replace("max_task_queue_len = 500", "max_task_queue_len = 901");
         std::fs::write(file.path(), updated)?;
-
         assert!(store.reload_from_disk_with_env_overrides(&overrides).await);
-
         let snapshot = store.snapshot();
         assert_eq!(snapshot.http().max_task_queue_len, 901);
         assert_eq!(
@@ -518,7 +503,6 @@ mod tests {
         assert_eq!(snapshot.node().db.user, "env-db-user");
         assert_eq!(snapshot.node().db.password, "env-db-password");
         assert_eq!(snapshot.node().db.db, "env-db-name");
-
         Ok(())
     }
 
@@ -526,13 +510,10 @@ mod tests {
     async fn malformed_reload_keeps_previous_snapshot() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         std::fs::write(file.path(), "this is not valid toml = [")?;
         assert!(!store.reload_from_disk().await);
-
         let snapshot = store.snapshot();
         assert_eq!(snapshot.http().max_task_queue_len, 500);
         assert!(snapshot.prompt_regex().is_match("HELLO 123"));
@@ -543,13 +524,10 @@ mod tests {
     async fn missing_file_reload_keeps_previous_snapshot() -> Result<()> {
         let file = Builder::new().suffix(".toml").tempfile()?;
         std::fs::write(file.path(), BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
-
         std::fs::remove_file(file.path())?;
         assert!(!store.reload_from_disk().await);
-
         let snapshot = store.snapshot();
         assert_eq!(snapshot.http().max_task_queue_len, 500);
         assert!(snapshot.prompt_regex().is_match("HELLO 123"));
@@ -561,14 +539,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("runtime-config.toml");
         std::fs::write(&path, BASE_CONFIG)?;
-
         let initial = parse_node_config()?;
         let store = Arc::new(RuntimeConfigStore::new(path.clone(), initial).await?);
         let _watcher = store.start_watcher(tokio::runtime::Handle::current())?;
-
         let updated = BASE_CONFIG.replace("max_task_queue_len = 500", "max_task_queue_len = 888");
         std::fs::write(&path, updated)?;
-
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if store.snapshot().http().max_task_queue_len == 888 {
@@ -579,7 +554,6 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
         Ok(())
     }
 }
