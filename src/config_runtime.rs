@@ -339,16 +339,11 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
 
     let whitelist_ips = resolve_rate_limit_whitelist(&config.http.rate_limit_whitelist).await;
 
-    // Resolve cluster_ips from node_dns_names (used for Raft peer connections)
-    let mut cluster_ips =
-        resolve_cluster_peer_ips(&config.network.domain, &config.network.node_dns_names).await;
-
-    // Merge in cluster_peer_egress_ips (NAT egress IPs) if configured.
-    // These are NOT used for Raft peer connections — only for cluster_check whitelist.
-    if !config.network.cluster_peer_egress_ips.is_empty() {
-        let egress_ips = resolve_egress_ips(&config.network.cluster_peer_egress_ips).await;
-        cluster_ips.extend(egress_ips);
-    }
+    let cluster_ips = if config.network.cluster_peer_egress_ips.is_empty() {
+        resolve_cluster_peer_ips(&config.network.domain, &config.network.node_dns_names).await
+    } else {
+        resolve_egress_ips(&config.network.cluster_peer_egress_ips).await
+    };
 
     let rate_limit_service = RateLimitService::new(&config.http);
     let rate_limiters = RateLimiters::new(&config.http);
@@ -369,13 +364,14 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
 
 #[cfg(test)]
 mod tests {
-    use super::RuntimeConfigStore;
+    use super::{RuntimeConfigStore, build_runtime_snapshot};
     use crate::config::NodeConfig;
     use crate::config_env::{
         ADMIN_KEY_ENV, API_KEY_SECRET_ENV, DB_HOST_ENV, DB_NAME_ENV, DB_PASSWORD_ENV, DB_USER_ENV,
         read_config_from_path_with_overrides,
     };
     use anyhow::Result;
+    use std::net::IpAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -415,6 +411,37 @@ mod tests {
             (DB_PASSWORD_ENV, "env-db-password"),
             (DB_NAME_ENV, "env-db-name"),
         ]
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_cluster_peer_egress_ips_when_configured() -> Result<()> {
+        let mut config = parse_node_config()?;
+        config.network.domain = "self.local".to_string();
+        config.network.node_dns_names = vec!["localhost".to_string()];
+        config.network.cluster_peer_egress_ips = vec!["192.0.2.10".to_string()];
+
+        let snapshot = build_runtime_snapshot(config).await?;
+
+        assert_eq!(snapshot.cluster_ips.len(), 1);
+        assert!(
+            snapshot
+                .cluster_ips
+                .contains(&"192.0.2.10".parse::<IpAddr>()?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_falls_back_to_node_dns_names_without_egress_ips() -> Result<()> {
+        let mut config = parse_node_config()?;
+        config.network.domain = "self.local".to_string();
+        config.network.node_dns_names = vec!["localhost".to_string()];
+        config.network.cluster_peer_egress_ips.clear();
+
+        let snapshot = build_runtime_snapshot(config).await?;
+
+        assert!(!snapshot.cluster_ips.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

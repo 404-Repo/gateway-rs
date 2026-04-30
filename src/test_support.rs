@@ -6,8 +6,8 @@ pub use crate::http3::handlers::result::{get_result_handler, get_status_handler}
 pub use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 pub use crate::http3::rate_limits::CompanyRateLimit;
 pub use crate::http3::rate_limits::{
-    RateLimitContext, RateLimiters, UnauthorizedDailyLimiter, basic_rate_limit,
-    prepare_rate_limit_context,
+    AdminKeyFailureLimiter, RateLimitContext, RateLimiters, UnauthorizedDailyLimiter,
+    basic_rate_limit, prepare_rate_limit_context,
 };
 pub use crate::http3::response::custom_response;
 pub use crate::http3::state::{HttpState, HttpStateInit};
@@ -213,6 +213,12 @@ pub async fn build_shared_harness_core(
         task_queue: task_queue.clone(),
         metrics,
         unauthorized_daily_limiter: Arc::new(UnauthorizedDailyLimiter::new()),
+        admin_key_failure_limiter: Arc::new(AdminKeyFailureLimiter::new(
+            config.http.invalid_api_key_ip_miss_ttl_sec,
+            config.http.invalid_api_key_ip_cooldown_ttl_sec,
+            config.http.invalid_api_key_ip_cache_capacity,
+            config.http.invalid_api_key_ip_miss_limit,
+        )),
     });
 
     SharedHarnessCore {

@@ -43,10 +43,9 @@ pub struct NetworkConfig {
     pub server_port: u16,
     pub node_id: u64,
     pub node_dns_names: Vec<String>,
-    /// Additional IPs or hostnames whose resolved IPs are added to cluster_ips.
-    /// Use this to whitelist Cloud NAT egress IPs so that cluster_check passes
-    /// for cross-region Raft traffic without affecting Raft peer connection targets.
-    /// These are NOT used for Raft peer connections — only for the cluster_ips whitelist.
+    /// Optional IPs or hostnames used for the runtime cluster IP set.
+    /// When empty, node_dns_names are resolved instead so local/dev DNS keeps working.
+    /// Use this for stable Cloud NAT egress IPs in Kubernetes where pod IPs are ephemeral.
     #[serde(default)]
     pub cluster_peer_egress_ips: Vec<String>,
     pub node_id_discovery_sleep: u64,

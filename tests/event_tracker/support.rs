@@ -8,7 +8,6 @@ use schnorrkel::{ExpansionMode, MiniSecretKey, context::signing_context};
 use serde_json::Value;
 use uuid::Uuid;
 
-use gateway::api::request::AddTaskResultRequest;
 use gateway::crypto::crypto_provider::ApiKeyHasher;
 use gateway::crypto::hotkey::Hotkey;
 use gateway::task::TaskManager;
@@ -473,29 +472,6 @@ pub(crate) async fn timeout_generation_task_in_db(harness: &EventHarness, task_i
             .any(|row| row.get::<_, Uuid>("task_id") == task_id),
         "expected generation_expire_tasks to expire task {task_id}"
     );
-}
-
-pub(crate) async fn add_success_result(
-    task_manager: &TaskManager,
-    task_id: Uuid,
-    worker: Hotkey,
-    asset: Vec<u8>,
-) {
-    task_manager
-        .record_assignment(task_id, worker.clone(), worker.to_string().into())
-        .await;
-    let result = AddTaskResultRequest {
-        worker_hotkey: worker.clone(),
-        worker_id: Arc::<str>::from(worker.to_string()),
-        assignment_token: Uuid::nil(),
-        asset: Some(asset.into()),
-        reason: None,
-        instant: std::time::Instant::now(),
-    };
-    task_manager
-        .add_result(task_id, result)
-        .await
-        .expect("add result");
 }
 
 pub(crate) async fn record_assignment_in_memory_and_db(

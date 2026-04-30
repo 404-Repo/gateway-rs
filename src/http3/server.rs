@@ -23,8 +23,8 @@ use crate::http3::handlers::core::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::rate_limits::{
-    UnauthorizedDailyLimiter, basic_rate_limit, prepare_rate_limit_context, status_rate_limit,
-    unauthorized_only_rate_limit, worker_rate_limit,
+    AdminKeyFailureLimiter, UnauthorizedDailyLimiter, basic_rate_limit, prepare_rate_limit_context,
+    status_rate_limit, unauthorized_only_rate_limit, worker_rate_limit,
 };
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
@@ -144,6 +144,12 @@ impl Http3Server {
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
             unauthorized_daily_limiter: Arc::new(UnauthorizedDailyLimiter::new()),
+            admin_key_failure_limiter: Arc::new(AdminKeyFailureLimiter::new(
+                node_cfg.http.invalid_api_key_ip_miss_ttl_sec,
+                node_cfg.http.invalid_api_key_ip_cooldown_ttl_sec,
+                node_cfg.http.invalid_api_key_ip_cache_capacity,
+                node_cfg.http.invalid_api_key_ip_miss_limit,
+            )),
         });
 
         let router = Self::setup_router(state)?;
@@ -242,8 +248,8 @@ impl Http3Server {
             )
             .push(
                 Router::with_path("/write")
-                    .hoop(raft_write_size_limit)
                     .hoop(admin_key_check)
+                    .hoop(raft_write_size_limit)
                     .post(write_handler),
             )
             .push(

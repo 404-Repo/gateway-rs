@@ -1,4 +1,5 @@
-FROM rust:1.93.1-alpine3.23 AS builder
+ARG RUST_VERSION=1.95.0
+FROM rust:${RUST_VERSION}-alpine3.23 AS builder
 
 RUN apk add --no-cache build-base alpine-sdk musl-dev openssl linux-headers
 

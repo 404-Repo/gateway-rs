@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::common::queue::TaskQueue;
 use crate::config_runtime::{RuntimeConfigStore, RuntimeConfigView};
-use crate::http3::rate_limits::UnauthorizedDailyLimiter;
+use crate::http3::rate_limits::{AdminKeyFailureLimiter, UnauthorizedDailyLimiter};
 use crate::metrics::Metrics;
 use crate::raft::gateway_state::GatewayState;
 
@@ -13,6 +13,7 @@ pub struct HttpState {
     task_queue: TaskQueue,
     metrics: Metrics,
     unauthorized_daily_limiter: Arc<UnauthorizedDailyLimiter>,
+    admin_key_failure_limiter: Arc<AdminKeyFailureLimiter>,
 }
 
 pub struct HttpStateInit {
@@ -21,6 +22,7 @@ pub struct HttpStateInit {
     pub task_queue: TaskQueue,
     pub metrics: Metrics,
     pub unauthorized_daily_limiter: Arc<UnauthorizedDailyLimiter>,
+    pub admin_key_failure_limiter: Arc<AdminKeyFailureLimiter>,
 }
 
 impl HttpState {
@@ -31,6 +33,7 @@ impl HttpState {
             task_queue,
             metrics,
             unauthorized_daily_limiter,
+            admin_key_failure_limiter,
         } = init;
         Self {
             config,
@@ -38,6 +41,7 @@ impl HttpState {
             task_queue,
             metrics,
             unauthorized_daily_limiter,
+            admin_key_failure_limiter,
         }
     }
 
@@ -63,5 +67,9 @@ impl HttpState {
 
     pub fn unauthorized_daily_limiter(&self) -> &Arc<UnauthorizedDailyLimiter> {
         &self.unauthorized_daily_limiter
+    }
+
+    pub fn admin_key_failure_limiter(&self) -> &Arc<AdminKeyFailureLimiter> {
+        &self.admin_key_failure_limiter
     }
 }
