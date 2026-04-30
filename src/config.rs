@@ -2,10 +2,14 @@ use anyhow::{Result, anyhow};
 use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
-use std::{env, fmt, path::Path, path::PathBuf};
+use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
+use crate::config_env::{
+    ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV, dangerous_skip_verification_allowed,
+    parse_config_from_contents,
+};
 pub use crate::config_model::{ModelConfig, ModelOutput, ModelResolveError};
 use crate::crypto::hotkey::Hotkey;
 
@@ -39,6 +43,11 @@ pub struct NetworkConfig {
     pub server_port: u16,
     pub node_id: u64,
     pub node_dns_names: Vec<String>,
+    /// Optional IPs or hostnames used for the runtime cluster IP set.
+    /// When empty, node_dns_names are resolved instead so local/dev DNS keeps working.
+    /// Use this for stable Cloud NAT egress IPs in Kubernetes where pod IPs are ephemeral.
+    #[serde(default)]
+    pub cluster_peer_egress_ips: Vec<String>,
     pub node_id_discovery_sleep: u64,
     pub node_id_discovery_retries: usize,
     pub name: String,
@@ -115,21 +124,14 @@ pub struct HTTPConfig {
     pub max_concurrent_image_uploads: usize,
     // Rate limits
     pub basic_rate_limit: usize,
-    // /add_task: unauthorized attempts per-source-IP daily cap.
-    // Unauthorized means missing/invalid/unknown API key.
-    // There is no separate global cap for unauthorized traffic.
     pub add_task_unauthorized_per_ip_daily_rate_limit: usize,
-    // Trusted IP allowlist that skips all /add_task rate limits, including distributed quotas.
-    // Authentication still applies. Use only for fully trusted sources.
     pub rate_limit_whitelist: HashSet<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
-    // Shared per-IP limiter for worker-facing endpoints: /add_result, /get_load, /get_leader.
     pub worker_per_minute_rate_limit: usize,
     pub get_status_rate_limit: usize,
     #[serde(default)]
     pub worker_whitelist: HashSet<Hotkey>,
-    // Size limit for the request
     pub add_task_size_limit: u64,
     pub request_size_limit: u64,
     pub request_file_size_limit: u64,
@@ -137,12 +139,9 @@ pub struct HTTPConfig {
     pub signature_freshness_threshold: u64,
     pub max_task_queue_len: usize,
     pub admin_key: Uuid,
-    // Fallback generic key used until the database-backed app_settings cache loads.
     pub generic_key: Option<Uuid>,
-    // Shared concurrent active task cap for the generic key. Set 0 to disable the active-slot cap.
     #[serde(default = "default_generic_key_concurrent_limit")]
     pub generic_key_concurrent_limit: usize,
-    // Secret used to key BLAKE3 for API key verification
     pub api_key_secret: String,
     #[serde(default = "default_invalid_api_key_negative_cache_ttl_sec")]
     pub invalid_api_key_negative_cache_ttl_sec: u64,
@@ -154,7 +153,6 @@ pub struct HTTPConfig {
     pub invalid_api_key_ip_cache_capacity: u64,
     #[serde(default = "default_invalid_api_key_ip_miss_limit")]
     pub invalid_api_key_ip_miss_limit: u64,
-    // HTTP/3 client timeouts
     pub post_timeout_sec: u64,
     pub forward_timeout_sec: u64,
     pub get_timeout_sec: u64,
@@ -222,94 +220,80 @@ pub struct DbConfig {
 fn default_deleted_keys_ttl_minutes() -> u64 {
     60
 }
-
 fn default_events_flush_interval_sec() -> u64 {
     5
 }
-
 fn default_events_copy_batch_size() -> usize {
     1000
 }
-
 fn default_db_pool_size() -> usize {
     4
 }
-
 fn default_events_queue_capacity() -> usize {
     50_000
 }
-
 fn default_max_concurrent_image_uploads() -> usize {
     1024
 }
-
 fn default_distributed_rate_limiter_max_capacity() -> usize {
     4096
 }
-
 fn default_generic_key_concurrent_limit() -> usize {
     2
 }
-
 fn default_invalid_api_key_negative_cache_ttl_sec() -> u64 {
     5 * 60
 }
-
 fn default_invalid_api_key_ip_miss_ttl_sec() -> u64 {
     10 * 60
 }
-
 fn default_invalid_api_key_ip_cooldown_ttl_sec() -> u64 {
     5 * 60
 }
-
 fn default_invalid_api_key_ip_cache_capacity() -> u64 {
     200_000
 }
-
 fn default_invalid_api_key_ip_miss_limit() -> u64 {
     50
 }
-
 fn default_max_rate_limit_deltas_per_batch() -> usize {
     16_384
 }
-
 fn default_model_params_max_len() -> usize {
     1024
 }
-
 fn default_model_params_config() -> ModelParamsConfig {
     ModelParamsConfig {
         max_len: default_model_params_max_len(),
     }
 }
-
 fn default_snapshot_dir() -> String {
     "data/snapshots".to_string()
 }
-
 fn default_max_snapshots_to_keep() -> usize {
     5
 }
-
 fn default_compaction_threshold_bytes() -> u64 {
     4 * 1024 * 1024
 }
-
 fn default_compaction_ops() -> u64 {
     4096
 }
-
 fn default_log_store_flush_interval_ms() -> u64 {
     200
 }
-
 fn default_tls_versions() -> Vec<String> {
     vec!["1.2".to_string(), "1.3".to_string()]
 }
 
-const ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV: &str = "GATEWAY_ALLOW_DANGEROUS_SKIP_VERIFICATION";
+fn validate_loaded_config(config: NodeConfig) -> Result<NodeConfig> {
+    config
+        .model_config
+        .validate()
+        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
+    validate_node_config(&config)?;
+    Ok(config)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Certificate {
@@ -338,15 +322,10 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum LogLevel {
-    /// Designates very low priority, often extremely verbose, information.
     Trace = 0,
-    /// Designates lower priority information.
     Debug = 1,
-    /// Designates useful information.
     Info = 2,
-    /// Designates hazardous situations.
     Warn = 3,
-    /// Designates very serious errors.
     Error = 4,
 }
 
@@ -402,15 +381,12 @@ impl FromStr for LogLevel {
 
 fn mask_string(s: &str, visible: usize) -> String {
     let char_count = s.chars().count();
-
     if char_count <= visible {
         return "*".repeat(char_count);
     }
-
     let mut result = String::with_capacity(s.len());
     result.extend(s.chars().take(visible));
     result.extend(std::iter::repeat_n('*', char_count - visible));
-
     result
 }
 
@@ -425,20 +401,15 @@ impl fmt::Display for NodeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut masked = self.clone();
         masked.raft.cluster_name = mask_string(&masked.raft.cluster_name, 3);
-
         let mut toml_str = toml::to_string_pretty(&masked).map_err(|_| fmt::Error)?;
-
         let admin_key_str = self.http.admin_key.to_string();
         mask_key_in_toml(&mut toml_str, &admin_key_str, 6);
-
         if let Some(key) = self.http.generic_key {
             let generic_key_str = key.to_string();
             mask_key_in_toml(&mut toml_str, &generic_key_str, 6);
         }
-
         mask_key_in_toml(&mut toml_str, &self.http.api_key_secret, 3);
         mask_key_in_toml(&mut toml_str, &self.db.password, 0);
-
         write!(f, "{}", toml_str)
     }
 }
@@ -455,14 +426,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         );
     }
     if config.cert.dangerous_skip_verification {
-        let allow_override = matches!(
-            env::var(ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV),
-            Ok(value)
-                if matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-        );
+        let allow_override = dangerous_skip_verification_allowed();
         if !cfg!(debug_assertions) && !allow_override {
             return Err(anyhow!(
                 "cert.dangerous_skip_verification can only be enabled in debug/test builds or when {}=1",
@@ -481,28 +445,12 @@ pub async fn read_config(path: Option<&String>) -> Result<NodeConfig> {
 
 pub async fn read_config_from_path<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
     let config = read_config_from_file(path.as_ref()).await?;
-    config
-        .model_config
-        .validate()
-        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
-    validate_node_config(&config)?;
-    Ok(config)
+    validate_loaded_config(config)
 }
 
-async fn read_config_from_file<P: AsRef<Path>>(path: P) -> Result<NodeConfig> {
+async fn read_config_from_file(path: &Path) -> Result<NodeConfig> {
     let contents = tokio::fs::read_to_string(&path).await?;
-
-    match path.as_ref().extension().and_then(|ext| ext.to_str()) {
-        Some("toml") => {
-            let config: NodeConfig = toml::from_str(&contents)?;
-            Ok(config)
-        }
-        Some("json") => {
-            let config: NodeConfig = serde_json::from_str(&contents)?;
-            Ok(config)
-        }
-        _ => Err(anyhow!("Unsupported file format")),
-    }
+    parse_config_from_contents(path, &contents)
 }
 
 pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
@@ -514,10 +462,8 @@ pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
             return Err(anyhow!("Provided configuration file path does not exist"));
         }
     }
-
     let toml_path = Path::new("config.toml");
     let json_path = Path::new("config.json");
-
     if toml_path.exists() {
         Ok(toml_path.to_path_buf())
     } else if json_path.exists() {
@@ -554,5 +500,12 @@ mod tests {
         );
         let config: NodeConfig = toml::from_str(&config_text).expect("parse config with override");
         assert_eq!(config.http.generic_key_concurrent_limit, 3);
+    }
+
+    #[test]
+    fn network_config_defaults_cluster_peer_egress_ips_when_missing() {
+        let config_text = read_config_single();
+        let config: NodeConfig = toml::from_str(&config_text).expect("parse config");
+        assert!(config.network.cluster_peer_egress_ips.is_empty());
     }
 }

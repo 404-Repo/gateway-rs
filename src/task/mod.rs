@@ -179,6 +179,7 @@ pub struct TaskManager {
 pub enum TaskStatus {
     #[default]
     NoResult,
+    InProgress,
     Failure {
         reason: Arc<str>,
     },
@@ -218,6 +219,7 @@ impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TaskStatus::NoResult => f.write_str("NoResult"),
+            TaskStatus::InProgress => f.write_str("InProgress"),
             TaskStatus::Success { .. } => f.write_str("Success"),
             TaskStatus::Failure { .. } => f.write_str("Failure"),
             TaskStatus::PartialResult(n) => write!(f, "PartialResult({})", n),
@@ -693,6 +695,9 @@ impl TaskManager {
             !state.assigned_workers.is_empty() || state.task_expires_at.is_some();
 
         if state.results.is_empty() {
+            if !state.assigned_workers.is_empty() {
+                return TaskStatus::InProgress;
+            }
             if !can_still_receive_more_results
                 && let Some(reason) = state.last_failure_reason.clone()
             {

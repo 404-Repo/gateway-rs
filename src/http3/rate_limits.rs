@@ -284,6 +284,47 @@ impl Default for UnauthorizedDailyLimiter {
     }
 }
 
+#[derive(Clone)]
+pub struct AdminKeyFailureLimiter {
+    misses: Cache<Arc<str>, Arc<AtomicU64>, RandomState>,
+    cooldowns: Cache<Arc<str>, (), RandomState>,
+    miss_limit: u64,
+}
+
+impl AdminKeyFailureLimiter {
+    pub fn new(miss_ttl_sec: u64, cooldown_ttl_sec: u64, capacity: u64, miss_limit: u64) -> Self {
+        Self {
+            misses: Cache::builder()
+                .max_capacity(capacity.max(1))
+                .time_to_live(Duration::from_secs(miss_ttl_sec.max(1)))
+                .build_with_hasher(RandomState::default()),
+            cooldowns: Cache::builder()
+                .max_capacity(capacity.max(1))
+                .time_to_live(Duration::from_secs(cooldown_ttl_sec.max(1)))
+                .build_with_hasher(RandomState::default()),
+            miss_limit: miss_limit.max(1),
+        }
+    }
+
+    pub async fn is_blocked(&self, source_key: &Arc<str>) -> bool {
+        self.cooldowns.get(source_key).await.is_some()
+    }
+
+    pub async fn record_miss(&self, source_key: Arc<str>) -> bool {
+        let misses = self
+            .misses
+            .get_with(source_key.clone(), async { Arc::new(AtomicU64::new(0)) })
+            .await;
+        let attempts = misses.fetch_add(1, Ordering::AcqRel) + 1;
+        if attempts >= self.miss_limit {
+            self.cooldowns.insert(source_key, ()).await;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn user_subject_id(user_id: i64) -> u128 {
     u128::from(user_id.max(0) as u64)
 }

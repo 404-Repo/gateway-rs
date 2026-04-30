@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::request::GatewayInfoExtRef;
 use crate::api::response::GatewayInfo;
 use crate::common::cert::generate_and_create_keycert;
 use crate::common::queue::TaskQueue;
@@ -350,12 +351,28 @@ async fn build_gateway_node(
 async fn setup_cross_gateway_harness(
     generic_key_concurrent_limit: Option<usize>,
 ) -> Result<CrossGatewayHarness> {
+    setup_cross_gateway_harness_inner(generic_key_concurrent_limit, None).await
+}
+
+async fn setup_cross_gateway_harness_with_admin_key_miss_limit(
+    admin_key_miss_limit: u64,
+) -> Result<CrossGatewayHarness> {
+    setup_cross_gateway_harness_inner(None, Some(admin_key_miss_limit)).await
+}
+
+async fn setup_cross_gateway_harness_inner(
+    generic_key_concurrent_limit: Option<usize>,
+    admin_key_miss_limit: Option<u64>,
+) -> Result<CrossGatewayHarness> {
     init_tracing();
     ensure_crypto_provider();
 
     let mut base_config = load_base_config();
     if let Some(limit) = generic_key_concurrent_limit {
         base_config.http.generic_key_concurrent_limit = limit;
+    }
+    if let Some(limit) = admin_key_miss_limit {
+        base_config.http.invalid_api_key_ip_miss_limit = limit;
     }
     let (_network_guard, node_configs) = reserve_node_configs(3).await?;
     let node_clients = make_node_clients(node_configs.len());
@@ -437,6 +454,28 @@ async fn post_add_task(
             Some(Duration::from_secs(5)),
         )
         .await
+}
+
+async fn post_gateway_write(
+    client: &Http3Client,
+    http_port: u16,
+    payload: Bytes,
+    admin_key: &str,
+) -> Result<(StatusCode, Bytes)> {
+    let url = format!("https://{TEST_DOMAIN}:{http_port}/write");
+    let headers = [("x-admin-key", admin_key)];
+    client
+        .post(&url, payload, Some(&headers), Some(Duration::from_secs(5)))
+        .await
+}
+
+fn random_non_admin_key(admin_key: Uuid) -> Uuid {
+    loop {
+        let candidate = Uuid::new_v4();
+        if candidate != admin_key {
+            return candidate;
+        }
+    }
 }
 
 async fn wait_for_active_replication(
@@ -539,6 +578,112 @@ async fn assert_cross_gateway_limit_rejection(
     assert_eq!(first_status, StatusCode::OK);
     let first_payload: serde_json::Value = serde_json::from_slice(first_body.as_ref())?;
     assert!(first_payload.get("id").is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn random_admin_key_cannot_write_fourth_node_into_cluster() -> Result<()> {
+    let harness = setup_cross_gateway_harness(None).await?;
+    let (_leader_id, leader_index) = wait_for_consistent_leader_index(
+        &harness.raft_nodes,
+        &harness.node_configs,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let leader = &harness.nodes[leader_index];
+    let cfg = leader._runtime_config.snapshot();
+    let valid_admin_key = cfg.http().admin_key;
+    let random_admin_key = random_non_admin_key(valid_admin_key);
+    let rogue_node_id = 4;
+    let info = GatewayInfoExtRef {
+        node_id: rogue_node_id,
+        domain: TEST_DOMAIN,
+        ip: LOCALHOST,
+        name: "rogue-node",
+        http_port: leader.http_port,
+        available_tasks: 0,
+        cluster_name: cfg.node().raft.cluster_name.as_str(),
+        last_task_acquisition: 0,
+        last_update: 0,
+    };
+    let payload = Bytes::from(rmp_serde::to_vec(&info)?);
+    let random_admin_key = random_admin_key.to_string();
+
+    let (status, body) = post_gateway_write(
+        &leader.client,
+        leader.http_port,
+        payload,
+        random_admin_key.as_str(),
+    )
+    .await?;
+
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "body: {}",
+        String::from_utf8_lossy(body.as_ref())
+    );
+    assert!(
+        leader.gateway_state.gateway(rogue_node_id).await.is_err(),
+        "rogue node info must not be committed with a random admin key",
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn repeated_random_admin_key_writes_are_rejected_before_body_parse() -> Result<()> {
+    let harness = setup_cross_gateway_harness_with_admin_key_miss_limit(2).await?;
+    let (_leader_id, leader_index) = wait_for_consistent_leader_index(
+        &harness.raft_nodes,
+        &harness.node_configs,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let leader = &harness.nodes[leader_index];
+    let cfg = leader._runtime_config.snapshot();
+    let random_admin_key = random_non_admin_key(cfg.http().admin_key).to_string();
+
+    let (first_status, first_body) = post_gateway_write(
+        &leader.client,
+        leader.http_port,
+        Bytes::from_static(b"not-msgpack"),
+        random_admin_key.as_str(),
+    )
+    .await?;
+    assert_eq!(
+        first_status,
+        StatusCode::UNAUTHORIZED,
+        "bad-key write should fail on admin key before body parsing; body: {}",
+        String::from_utf8_lossy(first_body.as_ref())
+    );
+
+    let (second_status, second_body) = post_gateway_write(
+        &leader.client,
+        leader.http_port,
+        Bytes::from_static(b"still-not-msgpack"),
+        random_admin_key.as_str(),
+    )
+    .await?;
+    assert_eq!(
+        second_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "body: {}",
+        String::from_utf8_lossy(second_body.as_ref())
+    );
+    let payload: serde_json::Value = serde_json::from_slice(second_body.as_ref())?;
+    assert_eq!(
+        payload.get("error").and_then(|value| value.as_str()),
+        Some("invalid_admin_key_rate_limit")
+    );
+
+    let (third_status, _third_body) = post_gateway_write(
+        &leader.client,
+        leader.http_port,
+        Bytes::from_static(b"still-not-msgpack-again"),
+        random_admin_key.as_str(),
+    )
+    .await?;
+    assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
     Ok(())
 }
 
