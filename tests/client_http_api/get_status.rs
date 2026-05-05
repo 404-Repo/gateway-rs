@@ -3,7 +3,7 @@ use http::StatusCode;
 use crate::support::{
     HOTKEY_SEED_BASE, TestClient, add_failure_result, add_success_result,
     add_success_result_with_worker_id, add_task_prompt, add_task_prompt_with_api_key,
-    build_harness, create_personal_api_key, hotkey_from_seed, read_response,
+    build_harness, create_personal_api_key, hotkey_from_seed, read_response, sign_worker,
     top_up_personal_api_key_balance,
 };
 
@@ -77,6 +77,53 @@ async fn get_status_no_result() {
     assert_eq!(
         payload.get("status").and_then(|v| v.as_str()),
         Some("NoResult")
+    );
+}
+
+#[tokio::test]
+async fn get_status_in_progress_after_worker_takes_task() {
+    let h = build_harness().await;
+    let task_id = add_task_prompt(&h, "robot", None).await;
+    let (worker_hotkey, timestamp, signature) = sign_worker([8u8; 32]);
+
+    let get_tasks = TestClient::post("http://localhost/get_tasks")
+        .json(&serde_json::json!({
+            "worker_hotkey": worker_hotkey.to_string(),
+            "worker_id": "worker-in-progress",
+            "signature": signature,
+            "timestamp": timestamp,
+            "requested_task_count": 1,
+            "model": "404-3dgs"
+        }))
+        .send(&h.service)
+        .await;
+    let (get_tasks_status, _headers, get_tasks_body) = read_response(get_tasks).await;
+    assert_eq!(
+        get_tasks_status,
+        StatusCode::OK,
+        "get_tasks body: {}",
+        String::from_utf8_lossy(&get_tasks_body)
+    );
+    let get_tasks_payload: serde_json::Value =
+        serde_json::from_slice(&get_tasks_body).expect("get_tasks json");
+    assert_eq!(
+        get_tasks_payload
+            .get("tasks")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let res = TestClient::get(format!("http://localhost/get_status?id={task_id}"))
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+    assert_eq!(
+        payload.get("status").and_then(|v| v.as_str()),
+        Some("InProgress")
     );
 }
 

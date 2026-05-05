@@ -376,7 +376,7 @@ mod tests {
 
         let rows = sink.worker_rows().await;
         assert_eq!(rows.len(), 1);
-        assert!(sink.attempts.load(Ordering::Relaxed) >= sink.fail_until + 1);
+        assert!(sink.attempts.load(Ordering::Relaxed) > sink.fail_until);
         assert_eq!(
             rows[0].metadata_json["worker_hotkey"].as_str(),
             Some("hotkey-1")

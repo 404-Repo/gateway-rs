@@ -14,7 +14,7 @@ use crate::config_runtime::RuntimeConfigStore;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::handlers::admin::{
-    admin_key_check, cluster_check, generic_key_read_handler, generic_key_update_handler,
+    admin_key_check, generic_key_read_handler, generic_key_update_handler,
 };
 use crate::http3::handlers::core::{
     api_or_generic_key_check, get_leader_handler, id_handler, metrics_handler, version_handler,
@@ -23,8 +23,8 @@ use crate::http3::handlers::core::{
 use crate::http3::handlers::result::{add_result_handler, get_result_handler, get_status_handler};
 use crate::http3::handlers::task::{add_task_handler, get_load_handler, get_tasks_handler};
 use crate::http3::rate_limits::{
-    UnauthorizedDailyLimiter, basic_rate_limit, prepare_rate_limit_context, status_rate_limit,
-    unauthorized_only_rate_limit, worker_rate_limit,
+    AdminKeyFailureLimiter, UnauthorizedDailyLimiter, basic_rate_limit, prepare_rate_limit_context,
+    status_rate_limit, unauthorized_only_rate_limit, worker_rate_limit,
 };
 use crate::http3::response::custom_response;
 use crate::http3::state::{HttpState, HttpStateInit};
@@ -144,6 +144,12 @@ impl Http3Server {
             task_queue: task_queue.clone(),
             metrics: metrics.clone(),
             unauthorized_daily_limiter: Arc::new(UnauthorizedDailyLimiter::new()),
+            admin_key_failure_limiter: Arc::new(AdminKeyFailureLimiter::new(
+                node_cfg.http.invalid_api_key_ip_miss_ttl_sec,
+                node_cfg.http.invalid_api_key_ip_cooldown_ttl_sec,
+                node_cfg.http.invalid_api_key_ip_cache_capacity,
+                node_cfg.http.invalid_api_key_ip_miss_limit,
+            )),
         });
 
         let router = Self::setup_router(state)?;
@@ -242,9 +248,8 @@ impl Http3Server {
             )
             .push(
                 Router::with_path("/write")
-                    .hoop(raft_write_size_limit)
-                    .hoop(cluster_check)
                     .hoop(admin_key_check)
+                    .hoop(raft_write_size_limit)
                     .post(write_handler),
             )
             .push(

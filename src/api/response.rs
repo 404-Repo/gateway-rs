@@ -86,6 +86,15 @@ mod tests {
     }
 
     #[test]
+    fn converts_in_progress() {
+        let resp: GetTaskStatusResponse = TaskStatus::InProgress.into();
+        assert_eq!(resp.status, "InProgress");
+        assert!(resp.reason.is_none());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{\"status\":\"InProgress\"}");
+    }
+
+    #[test]
     fn converts_success() {
         let resp: GetTaskStatusResponse = TaskStatus::Success {
             worker_id: Arc::<str>::from("worker-123"),

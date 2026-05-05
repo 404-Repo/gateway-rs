@@ -96,6 +96,7 @@ fn task_status_from_snapshot(task: &GenerationTaskStatusSnapshot) -> TaskStatus 
         "running" if task.finished_results_count > 0 => {
             TaskStatus::PartialResult(task.success_count.max(0) as usize)
         }
+        "running" => TaskStatus::InProgress,
         _ => TaskStatus::NoResult,
     }
 }
@@ -437,6 +438,14 @@ mod tests {
         assert!(matches!(
             task_status_from_snapshot(&snapshot("running", 2, 1)),
             TaskStatus::PartialResult(1)
+        ));
+    }
+
+    #[test]
+    fn snapshot_running_without_finished_results_is_in_progress() {
+        assert!(matches!(
+            task_status_from_snapshot(&snapshot("running", 0, 0)),
+            TaskStatus::InProgress
         ));
     }
 

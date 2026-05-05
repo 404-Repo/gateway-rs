@@ -170,7 +170,7 @@ async fn submit_generic_task_with_now(
                 &global_limit,
                 &per_ip_limit,
                 &window_ms,
-                &&key_hash[..],
+                &key_hash,
             ],
         )
         .await

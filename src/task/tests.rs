@@ -77,6 +77,33 @@ async fn pop_only_mutation(queue: &RateLimitMutationBuffer) -> RateLimitMutation
 }
 
 #[tokio::test]
+async fn assigned_task_without_results_is_in_progress() {
+    let task_manager = TaskManager::new(
+        4,
+        2,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let task_id = Uuid::new_v4();
+    let worker = Hotkey::from_bytes(&[50u8; 32]);
+
+    task_manager.add_task(sample_task(task_id)).await;
+    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker.to_string().into())
+        .await;
+
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::InProgress
+    );
+}
+
+#[tokio::test]
 async fn single_success_stays_partial_until_expected_results_are_exhausted() {
     let task_manager = TaskManager::new(
         4,
@@ -170,7 +197,10 @@ async fn staged_result_is_invisible_until_committed() {
         .await
         .unwrap();
 
-    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::InProgress
+    );
     assert!(
         task_manager.get_result(task_id).await.is_none(),
         "staged results must stay invisible until durable finalize succeeds"
@@ -228,7 +258,10 @@ async fn rollback_staged_result_allows_retry() {
     task_manager.rollback_staged_result(task_id, &worker).await;
 
     assert!(task_manager.is_assigned(task_id, &worker).await);
-    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::InProgress
+    );
     assert!(task_manager.get_result(task_id).await.is_none());
 
     let outcome = task_manager
@@ -338,7 +371,10 @@ async fn staged_result_defers_timeout_until_commit() {
         task_manager.is_assigned(task_id, &worker).await,
         "timeout cleanup must defer while a staged result is waiting to commit"
     );
-    assert_eq!(task_manager.get_status(task_id).await, TaskStatus::NoResult);
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::InProgress
+    );
     assert!(
         task_manager.get_result(task_id).await.is_none(),
         "staged result must remain hidden before commit"
