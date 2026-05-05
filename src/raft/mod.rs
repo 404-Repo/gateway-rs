@@ -18,8 +18,7 @@ use crate::common::cert::load_certificates;
 use crate::common::cert::load_private_key;
 use crate::common::queue::TaskQueue;
 use crate::common::rate_limit_buffer::RateLimitMutationBuffer;
-use crate::common::resolve::lookup_one_ip_per_host;
-use crate::config::{NodeConfig, TransportMode};
+use crate::config::{NodeConfig, TransportMode, validate_multi_node_raft_dns_config};
 use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{
@@ -53,7 +52,6 @@ use salvo::conn::rustls::RustlsConfig;
 use server::RServer;
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -61,6 +59,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio::net::lookup_host;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -548,14 +547,13 @@ impl Drop for Gateway {
 
 async fn get_id_for_endpoint(
     timeout: Duration,
-    ip: IpAddr,
     dns_name: &str,
+    http_port: u16,
     sleep_timeout: Duration,
     skip_verification: bool,
     retries: usize,
 ) -> Result<u64> {
-    let url = format!("https://{}:4443/id", dns_name);
-    let connection_addr = format!("{}:4443", ip);
+    let url = format!("https://{}:{}/id", dns_name, http_port);
 
     let backoff = ConstantBuilder::new()
         .with_delay(sleep_timeout)
@@ -563,6 +561,12 @@ async fn get_id_for_endpoint(
         .build();
 
     let id = (|| async {
+        let connection_addr = lookup_host((dns_name, http_port))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resolve HTTP DNS name {dns_name}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("HTTP DNS name {dns_name} resolved no endpoints"))?
+            .to_string();
         if let Ok(client) = Http3ClientBuilder::new()
             .server_domain(dns_name)
             .server_ip(&connection_addr)
@@ -593,22 +597,17 @@ async fn get_id_for_endpoint(
 
 pub async fn get_node_ids(
     timeout: Duration,
-    ips: &[IpAddr],
     dns_names: &[impl AsRef<str>],
+    http_port: u16,
     sleep_timeout: Duration,
     skip_verification: bool,
     retries: usize,
 ) -> Result<Vec<u64>> {
-    if ips.len() != dns_names.len() {
-        return Err(anyhow::anyhow!(
-            "The number of endpoints and DNS names must be equal"
-        ));
-    }
-    let futures = ips.iter().zip(dns_names.iter()).map(|(ip, dns_name)| {
+    let futures = dns_names.iter().map(|dns_name| {
         get_id_for_endpoint(
             timeout,
-            *ip,
             dns_name.as_ref(),
+            http_port,
             sleep_timeout,
             skip_verification,
             retries,
@@ -648,36 +647,72 @@ fn build_raft_config(cfg: &NodeConfig) -> Result<Arc<openraft::Config>> {
     ))
 }
 
+fn raft_endpoint(dns_name: &str, port: u16) -> String {
+    format!("{}:{}", dns_name, port)
+}
+
+fn raft_self_endpoint(cfg: &NodeConfig) -> String {
+    let host = if cfg.raft.dns_name.trim().is_empty() {
+        cfg.network.external_ip.as_str()
+    } else {
+        cfg.raft.dns_name.as_str()
+    };
+    raft_endpoint(host, cfg.raft.server_port)
+}
+
+fn raft_peer_dns_names(cfg: &NodeConfig) -> Vec<String> {
+    remote_dns_names(&cfg.raft.peer_dns_names, &cfg.raft.dns_name)
+}
+
+fn http_peer_dns_names(cfg: &NodeConfig) -> Vec<String> {
+    remote_dns_names(&cfg.network.node_dns_names, &cfg.network.domain)
+}
+
+fn remote_dns_names(names: &[String], self_name: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|&name| name != self_name)
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn http_certificate_dns_names(cfg: &NodeConfig) -> Vec<String> {
+    let mut names = std::iter::once("localhost".to_string())
+        .chain(std::iter::once(cfg.network.domain.clone()))
+        .chain(cfg.network.node_dns_names.iter().cloned())
+        .filter(|name| !name.trim().is_empty())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
 async fn setup_remote_clients(
     cfg: &NodeConfig,
-    node_ips: &[IpAddr],
     peer_dns_names: &[String],
     clients_map: Arc<scc::HashMap<String, RClient, RandomState>>,
 ) -> Result<()> {
-    let create_client_futs = node_ips
-        .iter()
-        .zip(peer_dns_names.iter())
-        .map(|(ip, dns_name)| {
-            let endpoint = format!("{}:{}", ip, cfg.network.server_port);
-            let clients_map = clients_map.clone();
-            async move {
-                let client = RClientBuilder::new()
-                    .remote_addr(endpoint.clone())
-                    .server_name(dns_name.clone())
-                    .local_bind_addr(format!("{}:{}", cfg.network.bind_ip, 0))
-                    .dangerous_skip_verification(cfg.cert.dangerous_skip_verification)
-                    .max_idle_timeout_sec(cfg.rclient.max_idle_timeout_sec)
-                    .keep_alive_interval(cfg.rclient.keep_alive_interval_sec)
-                    .protocol_cfg(cfg.rserver.clone())
-                    .build()
-                    .await?;
-                clients_map
-                    .insert_async(endpoint, client)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-                Ok::<(), anyhow::Error>(())
-            }
-        });
+    let create_client_futs = peer_dns_names.iter().map(|dns_name| {
+        let endpoint = raft_endpoint(dns_name, cfg.raft.server_port);
+        let clients_map = clients_map.clone();
+        async move {
+            let client = RClientBuilder::new()
+                .remote_addr(endpoint.clone())
+                .server_name(dns_name.clone())
+                .local_bind_addr(format!("{}:{}", cfg.network.bind_ip, 0))
+                .dangerous_skip_verification(cfg.cert.dangerous_skip_verification)
+                .max_idle_timeout_sec(cfg.rclient.max_idle_timeout_sec)
+                .keep_alive_interval(cfg.rclient.keep_alive_interval_sec)
+                .protocol_cfg(cfg.rserver.clone())
+                .build()
+                .await?;
+            clients_map
+                .insert_async(endpoint, client)
+                .await
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
 
     try_join_all(create_client_futs).await?;
     Ok(())
@@ -687,10 +722,10 @@ async fn init_membership(
     mode: GatewayMode,
     node_id: u64,
     node_ids: &[u64],
-    node_ips: &[IpAddr],
     cfg: &NodeConfig,
     raft: &Raft,
-    server_addr: &str,
+    raft_self_addr: &str,
+    peer_dns_names: &[String],
 ) -> Result<()> {
     match mode {
         GatewayMode::Bootstrap if node_id == 1 => {
@@ -698,31 +733,34 @@ async fn init_membership(
             raft.initialize(BTreeMap::from([(
                 1,
                 BasicNode {
-                    addr: server_addr.to_string(),
+                    addr: raft_self_addr.to_string(),
                 },
             )]))
             .await?;
 
             let base_raft = raft.clone();
-            let futs = node_ids.iter().zip(node_ips.iter()).map(|(id, ip)| {
-                let raft = base_raft.clone();
-                let endpoint = format!("{}:{}", ip, cfg.network.server_port);
-                async move {
-                    info!(
-                        "Adding node {} as a learner with endpoint: {}",
-                        id, endpoint
-                    );
-                    raft.add_learner(
-                        *id,
-                        BasicNode {
-                            addr: endpoint.to_string(),
-                        },
-                        true,
-                    )
-                    .await?;
-                    Ok::<(), anyhow::Error>(())
-                }
-            });
+            let futs = node_ids
+                .iter()
+                .zip(peer_dns_names.iter())
+                .map(|(id, dns_name)| {
+                    let raft = base_raft.clone();
+                    let endpoint = raft_endpoint(dns_name, cfg.raft.server_port);
+                    async move {
+                        info!(
+                            "Adding node {} as a learner with endpoint: {}",
+                            id, endpoint
+                        );
+                        raft.add_learner(
+                            *id,
+                            BasicNode {
+                                addr: endpoint.to_string(),
+                            },
+                            true,
+                        )
+                        .await?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                });
             try_join_all(futs).await?;
         }
         GatewayMode::Bootstrap => {
@@ -735,18 +773,20 @@ async fn init_membership(
             let mut members = BTreeMap::from([(
                 node_id,
                 BasicNode {
-                    addr: format!("{}:{}", cfg.network.external_ip, cfg.network.server_port),
+                    addr: raft_self_addr.to_string(),
                 },
             )]);
             if mode == GatewayMode::Vote {
-                members.extend(node_ids.iter().zip(node_ips.iter()).map(|(&id, ip)| {
-                    (
-                        id,
-                        BasicNode {
-                            addr: format!("{}:{}", ip, cfg.network.server_port),
-                        },
-                    )
-                }));
+                members.extend(node_ids.iter().zip(peer_dns_names.iter()).map(
+                    |(&id, dns_name)| {
+                        (
+                            id,
+                            BasicNode {
+                                addr: raft_endpoint(dns_name, cfg.raft.server_port),
+                            },
+                        )
+                    },
+                ));
             }
 
             match raft.initialize(members).await {
@@ -783,9 +823,12 @@ pub async fn start_gateway(
     if cfg.http.transport == TransportMode::Plain && mode != GatewayMode::Single {
         bail!("Plain HTTP transport is currently only supported in single-node mode");
     }
+    if mode != GatewayMode::Single {
+        validate_multi_node_raft_dns_config(cfg)?;
+    }
 
     let clients_map = Arc::new(scc::HashMap::with_capacity_and_hasher(
-        cfg.network.node_dns_names.len(),
+        cfg.raft.peer_dns_names.len(),
         RandomState::default(),
     ));
 
@@ -814,7 +857,8 @@ pub async fn start_gateway(
         Arc::clone(&state_machine_store),
     )
     .await?;
-    let server_addr = format!("{}:{}", cfg.network.bind_ip, cfg.network.server_port);
+    let raft_bind_addr = format!("{}:{}", cfg.network.bind_ip, cfg.raft.server_port);
+    let raft_self_addr = raft_self_endpoint(cfg);
 
     let use_cert_files = !cfg.cert.cert_file_path.is_empty() && !cfg.cert.key_file_path.is_empty();
     let cert_tuple = if use_cert_files {
@@ -835,7 +879,7 @@ pub async fn start_gateway(
     );
 
     let server = RServer::new(
-        &server_addr,
+        &raft_bind_addr,
         cert_tuple,
         raft.clone(),
         cfg.rserver.clone(),
@@ -843,26 +887,13 @@ pub async fn start_gateway(
     )
     .await?;
 
-    let peer_dns_names: Vec<_> = {
-        let mut names = cfg
-            .network
-            .node_dns_names
-            .iter()
-            .filter(|&name| name != &cfg.network.domain)
-            .cloned()
-            .collect::<Vec<_>>();
-        names.sort();
-        names
-    };
+    // These lists are paired by config order: HTTP DNS discovers node IDs,
+    // Raft DNS becomes the BasicNode address for the discovered ID.
+    let peer_dns_names = raft_peer_dns_names(cfg);
+    let http_discovery_dns_names = http_peer_dns_names(cfg);
 
-    let node_ips = if mode == GatewayMode::Single || peer_dns_names.is_empty() {
-        Vec::new()
-    } else {
-        lookup_one_ip_per_host(&peer_dns_names).await?
-    };
-
-    if mode != GatewayMode::Single && !node_ips.is_empty() {
-        setup_remote_clients(cfg, &node_ips, &peer_dns_names, clients_map.clone()).await?;
+    if mode != GatewayMode::Single && !peer_dns_names.is_empty() {
+        setup_remote_clients(cfg, &peer_dns_names, clients_map.clone()).await?;
     }
 
     let last_task_acquisition = Arc::new(AtomicU64::from(
@@ -945,7 +976,7 @@ pub async fn start_gateway(
                 .cert_from_path(&cfg.cert.cert_file_path)?
                 .key_from_path(&cfg.cert.key_file_path)?
         } else {
-            generate_and_create_keycert(vec!["localhost".to_string()])?
+            generate_and_create_keycert(http_certificate_dns_names(cfg))?
         };
         Some(RustlsConfig::new(key_cert))
     } else {
@@ -966,13 +997,13 @@ pub async fn start_gateway(
         Err(e) => bail!("Failed to start HTTP3 server: {:?}", e),
     };
 
-    let node_ids = if node_ips.is_empty() {
+    let node_ids = if peer_dns_names.is_empty() {
         Vec::new()
     } else {
         get_node_ids(
             Duration::from_secs(cfg.http.get_timeout_sec),
-            &node_ips,
-            &peer_dns_names,
+            &http_discovery_dns_names,
+            cfg.http.port,
             Duration::from_secs(cfg.network.node_id_discovery_sleep),
             cfg.cert.dangerous_skip_verification,
             cfg.network.node_id_discovery_retries,
@@ -988,10 +1019,10 @@ pub async fn start_gateway(
         mode,
         node_id,
         &node_ids,
-        &node_ips,
         cfg,
         &raft,
-        &server_addr,
+        &raft_self_addr,
+        &peer_dns_names,
     )
     .await?;
 

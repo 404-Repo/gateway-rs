@@ -20,7 +20,7 @@ use crate::config::{
 use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
 use crate::http3::whitelist::{
-    RateLimitWhitelist, resolve_cluster_peer_ips, resolve_egress_ips, resolve_rate_limit_whitelist,
+    RateLimitWhitelist, resolve_egress_ips, resolve_rate_limit_whitelist,
 };
 use crate::raft::rate_limit::RateLimitService;
 
@@ -257,6 +257,13 @@ fn warn_restart_required_changes(current: &NodeConfig, updated: &NodeConfig) {
         );
     }
 
+    if current.raft.dns_name != updated.raft.dns_name
+        || current.raft.peer_dns_names != updated.raft.peer_dns_names
+        || current.raft.server_port != updated.raft.server_port
+    {
+        warn!("Runtime config changed Raft addresses; restart required to apply");
+    }
+
     if current.http.tls_versions != updated.http.tls_versions {
         warn!(
             "Runtime config changed TLS versions from {:?} to {:?}; restart required",
@@ -339,11 +346,7 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
 
     let whitelist_ips = resolve_rate_limit_whitelist(&config.http.rate_limit_whitelist).await;
 
-    let cluster_ips = if config.network.cluster_peer_egress_ips.is_empty() {
-        resolve_cluster_peer_ips(&config.network.domain, &config.network.node_dns_names).await
-    } else {
-        resolve_egress_ips(&config.network.cluster_peer_egress_ips).await
-    };
+    let cluster_ips = resolve_egress_ips(&config.network.cluster_peer_egress_ips).await;
 
     let rate_limit_service = RateLimitService::new(&config.http);
     let rate_limiters = RateLimiters::new(&config.http);
@@ -432,7 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_falls_back_to_node_dns_names_without_egress_ips() -> Result<()> {
+    async fn snapshot_does_not_use_node_dns_names_without_egress_ips() -> Result<()> {
         let mut config = parse_node_config()?;
         config.network.domain = "self.local".to_string();
         config.network.node_dns_names = vec!["localhost".to_string()];
@@ -440,7 +443,7 @@ mod tests {
 
         let snapshot = build_runtime_snapshot(config).await?;
 
-        assert!(!snapshot.cluster_ips.is_empty());
+        assert!(snapshot.cluster_ips.is_empty());
         Ok(())
     }
 

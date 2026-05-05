@@ -248,7 +248,9 @@ async fn build_gateway_node(
     config.network.bind_ip = LOCALHOST.to_string();
     config.network.external_ip = LOCALHOST.to_string();
     config.network.domain = TEST_DOMAIN.to_string();
-    config.network.server_port = raft_socket.port();
+    config.raft.server_port = raft_socket.port();
+    config.raft.dns_name.clear();
+    config.raft.peer_dns_names.clear();
     config.network.name = format!("node-{node_id}");
     config.network.node_dns_names.clear();
     config.http.port = http_socket.port();
