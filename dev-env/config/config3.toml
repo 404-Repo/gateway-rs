@@ -59,6 +59,8 @@ get_timeout_sec = 2
 max_idle_timeout_sec = 4
 keep_alive_interval_sec = 1
 rate_limit_whitelist = []
+# Trust X-Forwarded-For only from the immediate proxy ranges that can reach the gateway.
+trusted_proxy_cidrs = []
 worker_whitelist = []
 distributed_rate_limiter_max_capacity = 4096
 allowed_origins = ["discord", "unity", "blender", "gen.404.xyz", "api"]

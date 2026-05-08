@@ -2,6 +2,9 @@ use salvo::http::{StatusCode, header::ACCEPT};
 use salvo::prelude::*;
 use tracing::error;
 
+use crate::http3::client_ip::client_ip;
+use crate::http3::state::HttpState;
+
 const TOO_MANY_REQUESTS_HTML: &str = include_str!("responses/429.html");
 const METHOD_NOT_ALLOWED_HTML: &str = include_str!("responses/405.html");
 const BAD_REQUEST_HTML: &str = include_str!("responses/400.html");
@@ -50,17 +53,25 @@ fn accepts_html(req: &Request) -> bool {
 #[handler]
 pub async fn custom_response(
     req: &Request,
-    _depot: &mut Depot,
+    depot: &mut Depot,
     res: &mut Response,
     ctrl: &mut FlowCtrl,
 ) {
     if let Some(status) = res.status_code {
         if status.is_client_error() || status.is_server_error() {
-            let client_ip = match req.remote_addr() {
-                salvo::conn::SocketAddr::IPv4(addr_v4) => addr_v4.ip().to_string(),
-                salvo::conn::SocketAddr::IPv6(addr_v6) => addr_v6.ip().to_string(),
-                _ => "unknown".to_string(),
-            };
+            let client_ip = depot
+                .obtain::<HttpState>()
+                .ok()
+                .and_then(|state| {
+                    let cfg = state.config();
+                    client_ip(req, cfg.trusted_proxy_cidrs())
+                })
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| match req.remote_addr() {
+                    salvo::conn::SocketAddr::IPv4(addr_v4) => addr_v4.ip().to_string(),
+                    salvo::conn::SocketAddr::IPv6(addr_v6) => addr_v6.ip().to_string(),
+                    _ => "unknown".to_string(),
+                });
             log_error(status, client_ip, req, &res.body);
         }
 

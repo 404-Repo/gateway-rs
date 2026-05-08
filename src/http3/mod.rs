@@ -1,4 +1,5 @@
 pub(crate) mod client;
+pub(crate) mod client_ip;
 pub(crate) mod depot_ext;
 pub(crate) mod error;
 pub(crate) mod handlers;

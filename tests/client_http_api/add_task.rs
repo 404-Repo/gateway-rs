@@ -952,6 +952,109 @@ async fn add_task_unauthorized_limit_hot_updates_without_resetting_counters() {
     assert_eq!(third_status, StatusCode::UNAUTHORIZED);
 }
 
+async fn post_unknown_key_with_xff(
+    h: &crate::support::TestHarness,
+    api_key: &str,
+    x_forwarded_for: &str,
+) -> StatusCode {
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", api_key, true)
+        .add_header("x-forwarded-for", x_forwarded_for, true)
+        .json(&serde_json::json!({"prompt": "robot"}))
+        .send(&h.service)
+        .await;
+    let (status, _headers, _body) = read_response(res).await;
+    status
+}
+
+async fn set_unauthorized_limit(h: &crate::support::TestHarness, limit: i32, whitelist: &[String]) {
+    set_gateway_runtime_settings(
+        h,
+        RateLimitPolicies::from_config(&h.config.http),
+        limit,
+        whitelist,
+        h.config.http.max_task_queue_len as i32,
+        h.config.http.request_file_size_limit as i64,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn add_task_x_forwarded_for_cannot_spoof_whitelist_without_trusted_proxy() {
+    let h = build_harness().await;
+    let spoofed_whitelist = vec!["203.0.113.44".to_string()];
+    set_unauthorized_limit(&h, 1, &spoofed_whitelist).await;
+
+    let first_key = Uuid::new_v4().to_string();
+    let second_key = Uuid::new_v4().to_string();
+
+    let first_status =
+        post_unknown_key_with_xff(&h, first_key.as_str(), "203.0.113.44, 34.117.10.1").await;
+    assert_eq!(first_status, StatusCode::UNAUTHORIZED);
+
+    let second_status =
+        post_unknown_key_with_xff(&h, second_key.as_str(), "203.0.113.44, 34.117.10.1").await;
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn add_task_trusted_proxy_ignores_spoofed_xff_prefix() {
+    let h = build_harness_with_options(GatewayHarnessOptions {
+        trusted_proxy_cidrs: vec!["127.0.0.1/32".to_string()],
+        ..GatewayHarnessOptions::default()
+    })
+    .await;
+    set_unauthorized_limit(&h, 1, &[]).await;
+
+    let first_key = Uuid::new_v4().to_string();
+    let second_key = Uuid::new_v4().to_string();
+
+    let first_status = post_unknown_key_with_xff(
+        &h,
+        first_key.as_str(),
+        "198.51.100.1, 203.0.113.20, 34.117.10.1",
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::UNAUTHORIZED);
+
+    let second_status = post_unknown_key_with_xff(
+        &h,
+        second_key.as_str(),
+        "198.51.100.2, 203.0.113.20, 34.117.10.1",
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn add_task_trusted_proxy_uses_gke_client_ip_position() {
+    let h = build_harness_with_options(GatewayHarnessOptions {
+        trusted_proxy_cidrs: vec!["127.0.0.1/32".to_string()],
+        ..GatewayHarnessOptions::default()
+    })
+    .await;
+    set_unauthorized_limit(&h, 1, &[]).await;
+
+    let first_key = Uuid::new_v4().to_string();
+    let second_key = Uuid::new_v4().to_string();
+
+    let first_status = post_unknown_key_with_xff(
+        &h,
+        first_key.as_str(),
+        "198.51.100.1, 203.0.113.20, 34.117.10.1",
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::UNAUTHORIZED);
+
+    let second_status = post_unknown_key_with_xff(
+        &h,
+        second_key.as_str(),
+        "198.51.100.1, 203.0.113.21, 34.117.10.1",
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn add_task_generic_key_ok() {
     let h = build_harness().await;

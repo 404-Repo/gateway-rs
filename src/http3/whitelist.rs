@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::common::resolve::lookup_all_host_ips;
+use crate::http3::client_ip::client_ip;
 use crate::http3::state::HttpState;
 
 #[derive(Clone)]
@@ -107,11 +108,8 @@ pub async fn resolve_egress_ips(entries: &[String]) -> HashSet<IpAddr> {
 }
 
 pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
-    let remote_ip = match req.remote_addr() {
-        salvo::conn::SocketAddr::IPv4(addr) => Some(IpAddr::V4(*addr.ip())),
-        salvo::conn::SocketAddr::IPv6(addr) => Some(IpAddr::V6(*addr.ip())),
-        _ => None,
-    };
+    let cfg = state.config();
+    let remote_ip = client_ip(req, cfg.trusted_proxy_cidrs());
 
     if let Some(ip) = remote_ip {
         return state.gateway_state().is_rate_limit_whitelisted_ip(&ip);
