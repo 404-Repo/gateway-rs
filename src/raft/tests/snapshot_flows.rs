@@ -51,7 +51,7 @@ async fn test_node_restart_from_snapshot_retains_voter() -> anyhow::Result<()> {
         let _ = state_machines.remove(leader_index);
     }
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_leader_consistent(&raft_nodes, Duration::from_secs(3)).await?;
 
     let (restarted_raft, restarted_sm, restarted_server) = setup_node(
         leader_id,

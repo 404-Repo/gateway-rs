@@ -1,4 +1,5 @@
 use http::StatusCode;
+use tokio::time::{Duration, Instant, sleep};
 
 use crate::support::{
     TestClient, build_harness, build_harness_with_gateway_info, read_response,
@@ -19,6 +20,36 @@ async fn get_load_success() {
     assert_eq!(gateways.len(), 1);
     let domain = gateways[0].get("domain").and_then(|v| v.as_str()).unwrap();
     assert_eq!(domain, h.config.network.domain);
+    assert_ne!(domain, h.config.raft.dns_name);
+    let http_port = gateways[0]
+        .get("http_port")
+        .and_then(|v| v.as_u64())
+        .unwrap();
+    assert_eq!(http_port, u64::from(h.config.http.port));
+}
+
+#[tokio::test]
+async fn get_load_gateway_last_update_advances() {
+    let h = build_harness().await;
+    let initial = read_gateway_last_update(&h).await;
+    assert!(
+        initial > 0,
+        "gateway updater should publish a non-zero last_update"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        sleep(Duration::from_millis(150)).await;
+        let next = read_gateway_last_update(&h).await;
+        if next > initial {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "gateway last_update did not advance from {initial}; latest value was {next}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -29,6 +60,27 @@ async fn get_load_empty() {
         .await;
     let (status, _headers, body) = read_response(res).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body:?}");
+}
+
+async fn read_gateway_last_update(h: &crate::support::TestHarness) -> u64 {
+    let res = TestClient::get("http://localhost/get_load")
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    payload
+        .get("gateways")
+        .and_then(|value| value.as_array())
+        .and_then(|gateways| gateways.first())
+        .and_then(|gateway| gateway.get("last_update"))
+        .and_then(|value| value.as_u64())
+        .expect("gateway last_update")
 }
 
 #[tokio::test]

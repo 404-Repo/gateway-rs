@@ -5,6 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelDefinition {
     pub output: String,
     #[serde(default = "default_true")]
@@ -14,6 +15,7 @@ pub struct ModelDefinition {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub default_model: String,
     pub models: HashMap<String, ModelDefinition>,

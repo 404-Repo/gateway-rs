@@ -71,6 +71,8 @@ services:
     networks:
       my_network:
         ipv4_address: 172.25.0.2
+        aliases:
+          - node-1-raft
     depends_on:
       cert-gen:
         condition: service_completed_successfully
@@ -93,6 +95,8 @@ services:
     networks:
       my_network:
         ipv4_address: 172.25.0.3
+        aliases:
+          - node-2-raft
     depends_on:
       cert-gen:
         condition: service_completed_successfully
@@ -115,6 +119,8 @@ services:
     networks:
       my_network:
         ipv4_address: 172.25.0.4
+        aliases:
+          - node-3-raft
     depends_on:
       cert-gen:
         condition: service_completed_successfully

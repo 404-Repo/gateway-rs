@@ -127,9 +127,9 @@ mod cluster_setup {
         let pcfg = RServerConfig::default();
         let config = Arc::new(
             openraft::Config {
-                heartbeat_interval: 500,
-                election_timeout_min: 5000,
-                election_timeout_max: 10000,
+                heartbeat_interval: 100,
+                election_timeout_min: 500,
+                election_timeout_max: 1000,
                 install_snapshot_timeout: 500,
                 ..Default::default()
             }
@@ -223,7 +223,6 @@ mod cluster_setup {
         let (config, pcfg, raft_nodes, state_machines, server_handles) =
             setup_cluster(&refs, node_clients.clone(), storage_paths).await?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
         connect_clients(&refs, &node_clients, &pcfg, |_, _| {
             "127.0.0.1:0".to_string()
         })
@@ -435,6 +434,69 @@ mod cluster_wait {
 
 use cluster_setup::*;
 use cluster_wait::*;
+
+fn read_dev_config(name: &str) -> crate::config::NodeConfig {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("dev-env/config")
+        .join(name);
+    let text = std::fs::read_to_string(path).expect("read dev config");
+    toml::from_str(&text).expect("parse dev config")
+}
+
+#[test]
+fn raft_peer_selection_uses_raft_dns_not_public_node_dns_names() {
+    let mut config = read_dev_config("config1.toml");
+    config.network.domain = "public-node-a.example".to_string();
+    config.network.node_dns_names = vec![
+        "public-node-a.example".to_string(),
+        "public-node-b.example".to_string(),
+        "public-node-c.example".to_string(),
+    ];
+    config.raft.dns_name = "node-1-raft".to_string();
+    config.raft.peer_dns_names = vec![
+        "node-1-raft".to_string(),
+        "node-2-raft".to_string(),
+        "node-3-raft".to_string(),
+    ];
+
+    let peers = super::raft_peer_dns_names(&config);
+    let http_peers = super::http_peer_dns_names(&config);
+
+    assert_eq!(peers, vec!["node-2-raft", "node-3-raft"]);
+    assert_eq!(
+        http_peers,
+        vec!["public-node-b.example", "public-node-c.example"]
+    );
+}
+
+#[test]
+fn http_certificate_names_use_public_http_dns_not_raft_dns() {
+    let mut config = read_dev_config("config1.toml");
+    config.network.domain = "public-node-a.example".to_string();
+    config.network.node_dns_names = vec![
+        "public-node-a.example".to_string(),
+        "public-node-b.example".to_string(),
+    ];
+    config.raft.dns_name = "node-1-raft".to_string();
+    config.raft.peer_dns_names = vec!["node-2-raft".to_string()];
+
+    let names = super::http_certificate_dns_names(&config);
+
+    assert!(names.contains(&"public-node-a.example".to_string()));
+    assert!(names.contains(&"public-node-b.example".to_string()));
+    assert!(!names.contains(&"node-1-raft".to_string()));
+    assert!(!names.contains(&"node-2-raft".to_string()));
+}
+
+#[test]
+fn raft_membership_endpoint_uses_raft_dns_and_port() {
+    let config = read_dev_config("config1.toml");
+
+    assert_eq!(
+        super::raft_endpoint("node-2-raft", config.raft.server_port),
+        "node-2-raft:9090"
+    );
+}
 
 async fn wait_for_consistent_leader_index(
     raft_nodes: &[Raft],

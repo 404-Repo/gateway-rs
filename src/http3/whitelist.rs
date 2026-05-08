@@ -80,24 +80,6 @@ pub async fn resolve_rate_limit_whitelist_with_status(
     }
 }
 
-pub async fn resolve_cluster_peer_ips(
-    self_domain: &str,
-    node_dns_names: &[String],
-) -> HashSet<IpAddr> {
-    let domains: Vec<String> = node_dns_names
-        .iter()
-        .filter(|d| d.as_str() != self_domain)
-        .cloned()
-        .collect();
-    if domains.is_empty() {
-        return HashSet::new();
-    }
-
-    resolve_domains_best_effort(domains, "cluster peer")
-        .await
-        .ips
-}
-
 /// Resolve a list of IPs or hostnames into a set of IpAddr.
 /// Used for cluster_peer_egress_ips: NAT egress IPs that should be
 /// whitelisted in cluster_ips without being used as Raft peer endpoints.
@@ -139,7 +121,7 @@ pub fn is_whitelisted_ip(req: &Request, state: &HttpState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_cluster_peer_ips, resolve_egress_ips, resolve_rate_limit_whitelist};
+    use super::{resolve_egress_ips, resolve_rate_limit_whitelist};
     use foldhash::HashSet as FoldHashSet;
 
     #[tokio::test]
@@ -149,21 +131,6 @@ mod tests {
         entries.insert("definitely-invalid-hostname.invalid".to_string());
 
         let resolved = resolve_rate_limit_whitelist(&entries).await;
-        assert!(
-            !resolved.is_empty(),
-            "expected at least localhost to resolve"
-        );
-    }
-
-    #[tokio::test]
-    async fn cluster_resolution_keeps_successful_domains_when_some_fail() {
-        let domains = vec![
-            "self.local".to_string(),
-            "localhost".to_string(),
-            "definitely-invalid-hostname.invalid".to_string(),
-        ];
-
-        let resolved = resolve_cluster_peer_ips("self.local", &domains).await;
         assert!(
             !resolved.is_empty(),
             "expected at least localhost to resolve"

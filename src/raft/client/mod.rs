@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use std::time::Duration;
+use tokio::net::lookup_host;
 use tracing::{error, info};
 
 use crate::{
@@ -33,7 +34,7 @@ pub struct RClientBuilder {
 
 async fn connect_with_retry(
     endpoint: &Endpoint,
-    remote_addr: SocketAddr,
+    remote_addr: &str,
     server_name: &str,
 ) -> Result<Connection> {
     let backoff = ConstantBuilder::new()
@@ -42,12 +43,29 @@ async fn connect_with_retry(
         .build();
 
     (|| async {
-        let connecting = endpoint
-            .connect(remote_addr, server_name)
-            .map_err(|e| anyhow!("Failed to start connection to {remote_addr}: {e}"))?;
-        connecting
+        let addrs = lookup_host(remote_addr)
             .await
-            .map_err(|e| anyhow!("Failed to establish connection to {remote_addr}: {e}"))
+            .map_err(|e| anyhow!("Failed to resolve {remote_addr}: {e}"))?;
+        let mut last_error = None;
+        for addr in addrs {
+            let connecting = match endpoint.connect(addr, server_name) {
+                Ok(connecting) => connecting,
+                Err(err) => {
+                    last_error = Some(format!("failed to start connection to {addr}: {err}"));
+                    continue;
+                }
+            };
+            match connecting.await {
+                Ok(connection) => return Ok(connection),
+                Err(err) => {
+                    last_error = Some(format!("failed to establish connection to {addr}: {err}"));
+                }
+            }
+        }
+        Err(anyhow!(
+            "Failed to connect to {remote_addr}: {}",
+            last_error.unwrap_or_else(|| "DNS resolution returned no addresses".to_string())
+        ))
     })
     .retry(backoff)
     .await
@@ -144,7 +162,7 @@ struct RClientInner {
 pub struct RClient {
     inner: Arc<RClientInner>,
     server_name: String,
-    remote_addr: SocketAddr,
+    remote_addr: String,
     protocol_cfg: RServerConfig,
     local_bind_addr: SocketAddr,
     client_cfg: quinn::ClientConfig,
@@ -160,7 +178,6 @@ impl RClient {
         keep_alive_interval: Option<u64>,
         protocol_cfg: RServerConfig,
     ) -> Result<Self> {
-        let remote_addr: SocketAddr = remote_addr.parse()?;
         let local_bind_addr: SocketAddr = local_bind_addr.parse()?;
 
         let mut crypto = if dangerous_skip_verification {
@@ -208,7 +225,7 @@ impl RClient {
         Ok(Self {
             inner: Arc::new(inner),
             server_name: server_name.to_string(),
-            remote_addr,
+            remote_addr: remote_addr.to_string(),
             protocol_cfg,
             local_bind_addr,
             client_cfg,
@@ -267,16 +284,7 @@ impl RClient {
                 .ok_or_else(|| anyhow!("Endpoint vanished unexpectedly after swap"))?
         };
 
-        let connecting = ep_loaded
-            .connect(self.remote_addr, &self.server_name)
-            .map_err(|e| anyhow!("Failed to start connection to {}: {}", self.remote_addr, e))?;
-        let new_conn = connecting.await.map_err(|e| {
-            anyhow!(
-                "Failed to establish connection to {}: {}",
-                self.remote_addr,
-                e
-            )
-        })?;
+        let new_conn = connect_with_retry(&ep_loaded, &self.remote_addr, &self.server_name).await?;
 
         info!(
             "RClient reconnected successfully to {} with id {}",

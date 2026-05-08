@@ -145,7 +145,6 @@ pub(crate) async fn wait_for_log_commit(
         }
 
         if all_synced {
-            println!("All nodes synced successfully");
             return Ok(());
         }
 
@@ -158,8 +157,7 @@ pub(crate) async fn wait_for_log_commit(
             );
         }
 
-        println!("Waiting for sync... Current status:{}", status);
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

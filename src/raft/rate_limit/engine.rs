@@ -432,13 +432,15 @@ mod tests {
         .expect("raft");
 
         let mut members = BTreeMap::new();
+        let raft_host = if config.raft.dns_name.trim().is_empty() {
+            config.network.external_ip.as_str()
+        } else {
+            config.raft.dns_name.as_str()
+        };
         members.insert(
             config.network.node_id,
             BasicNode {
-                addr: format!(
-                    "{}:{}",
-                    config.network.external_ip, config.network.server_port
-                ),
+                addr: format!("{}:{}", raft_host, config.raft.server_port),
             },
         );
         let _ = raft.initialize(members).await;

@@ -283,7 +283,7 @@ impl GatewayRuntimeStart {
 
         let mut config = (*config).clone();
         config.http.port = reserve_tcp_port().expect("reserve restarted HTTP port");
-        config.network.server_port = reserve_udp_port().expect("reserve restarted raft port");
+        config.raft.server_port = reserve_udp_port().expect("reserve restarted raft port");
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize restarted test config"),
@@ -504,7 +504,8 @@ impl GatewayRuntimeHarness {
         config.network.bind_ip = "127.0.0.1".to_string();
         config.network.external_ip = "127.0.0.1".to_string();
         config.network.domain = "localhost".to_string();
-        config.network.server_port = raft_port;
+        config.raft.server_port = raft_port;
+        config.raft.peer_dns_names.clear();
         config.network.name = "test-node".to_string();
         config.network.node_dns_names.clear();
         config.http.port = http_port;

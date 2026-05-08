@@ -11,9 +11,8 @@ node_id = 1
 bind_ip = "172.25.0.2"
 external_ip = "172.25.0.2"
 domain = "node-1"
-server_port = 9090
 name = "node-1"
-node_dns_names = ["node-1", "node-2", "node-3"]
+node_dns_names = ["node-2", "node-3"]
 node_id_discovery_sleep = 3
 node_id_discovery_retries = 5
 
@@ -115,6 +114,9 @@ keep_alive_interval_sec = 1
 
 [raft]
 cluster_name = "gateway_cluster"
+dns_name = "node-1-raft"
+peer_dns_names = ["node-2-raft", "node-3-raft"]
+server_port = 9090
 election_timeout_min = 5000
 election_timeout_max = 10000
 heartbeat_interval = 500

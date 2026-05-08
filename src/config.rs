@@ -14,6 +14,7 @@ pub use crate::config_model::{ModelConfig, ModelOutput, ModelResolveError};
 use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BasicConfig {
     pub max_restart_attempts: usize,
     pub update_gateway_info_ms: u64,
@@ -35,16 +36,16 @@ fn default_generation_task_retention_sec() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     pub bind_ip: String,
     // This IP will be used in the internal state
     pub external_ip: String,
     pub domain: String,
-    pub server_port: u16,
     pub node_id: u64,
     pub node_dns_names: Vec<String>,
     /// Optional IPs or hostnames used for the runtime cluster IP set.
-    /// When empty, node_dns_names are resolved instead so local/dev DNS keeps working.
+    /// When empty, no cluster peer source IPs are trusted implicitly.
     /// Use this for stable Cloud NAT egress IPs in Kubernetes where pod IPs are ephemeral.
     #[serde(default)]
     pub cluster_peer_egress_ips: Vec<String>,
@@ -54,6 +55,7 @@ pub struct NetworkConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RServerConfig {
     pub max_message_size: usize,
     pub max_recv_buffer_size: usize,
@@ -75,20 +77,28 @@ impl Default for RServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RClientConfig {
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     pub path: String,
     pub level: LogLevel,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RaftConfig {
     pub cluster_name: String,
+    #[serde(default)]
+    pub dns_name: String,
+    #[serde(default)]
+    pub peer_dns_names: Vec<String>,
+    pub server_port: u16,
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
     pub heartbeat_interval: u64,
@@ -110,6 +120,7 @@ pub struct RaftConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HTTPConfig {
     pub compression: bool,
     pub compression_lvl: u32,
@@ -169,6 +180,7 @@ pub enum TransportMode {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PromptConfig {
     pub min_len: usize,
     pub max_len: usize,
@@ -176,12 +188,14 @@ pub struct PromptConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelParamsConfig {
     #[serde(default = "default_model_params_max_len")]
     pub max_len: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageConfig {
     pub max_width: u32,
     pub max_height: u32,
@@ -190,6 +204,7 @@ pub struct ImageConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
     pub host: String,
     pub port: u16,
@@ -296,6 +311,7 @@ fn validate_loaded_config(config: NodeConfig) -> Result<NodeConfig> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Certificate {
     pub dangerous_skip_verification: bool,
     pub cert_file_path: String,
@@ -303,6 +319,7 @@ pub struct Certificate {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub model_config: ModelConfig,
     pub basic: BasicConfig,
@@ -435,6 +452,69 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         }
         tracing::warn!("TLS server verification is disabled; only use this in local development");
     }
+    validate_raft_dns_config(config)?;
+    Ok(())
+}
+
+pub fn validate_multi_node_raft_dns_config(config: &NodeConfig) -> Result<()> {
+    if config.raft.dns_name.trim().is_empty() {
+        return Err(anyhow!(
+            "raft.dns_name must be configured for multi-node gateway modes"
+        ));
+    }
+    if config.network.domain.trim().is_empty() {
+        return Err(anyhow!(
+            "network.domain must be configured for multi-node gateway modes"
+        ));
+    }
+    validate_raft_dns_config(config)?;
+    let raft_peer_count = config
+        .raft
+        .peer_dns_names
+        .iter()
+        .filter(|name| name.as_str() != config.raft.dns_name)
+        .count();
+    if raft_peer_count == 0 {
+        return Err(anyhow!(
+            "raft.peer_dns_names must include at least one remote Raft DNS name for multi-node gateway modes"
+        ));
+    }
+    let http_peer_count = config
+        .network
+        .node_dns_names
+        .iter()
+        .filter(|name| name.as_str() != config.network.domain)
+        .count();
+    if http_peer_count != raft_peer_count {
+        return Err(anyhow!(
+            "network.node_dns_names must contain the same number of remote HTTP DNS names, in the same node order, as raft.peer_dns_names contains remote Raft DNS names"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raft_dns_config(config: &NodeConfig) -> Result<()> {
+    if config.raft.peer_dns_names.is_empty() {
+        return Ok(());
+    }
+    if config.raft.dns_name.trim().is_empty() {
+        return Err(anyhow!(
+            "raft.dns_name must be configured when raft.peer_dns_names is not empty"
+        ));
+    }
+    let mut seen = HashSet::default();
+    for name in &config.raft.peer_dns_names {
+        if name.trim().is_empty() {
+            return Err(anyhow!(
+                "raft.peer_dns_names must not contain empty DNS names"
+            ));
+        }
+        if !seen.insert(name.as_str()) {
+            return Err(anyhow!(
+                "raft.peer_dns_names contains duplicate DNS name: {name}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -475,7 +555,7 @@ pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::NodeConfig;
+    use super::{NodeConfig, validate_multi_node_raft_dns_config, validate_node_config};
 
     fn read_config_single() -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -507,5 +587,124 @@ mod tests {
         let config_text = read_config_single();
         let config: NodeConfig = toml::from_str(&config_text).expect("parse config");
         assert!(config.network.cluster_peer_egress_ips.is_empty());
+    }
+
+    #[test]
+    fn network_config_rejects_old_server_port_field() {
+        let config_text = read_config_single().replacen(
+            "domain = \"node-1\"\n",
+            "domain = \"node-1\"\nserver_port = 9090\n",
+            1,
+        );
+
+        let err = toml::from_str::<NodeConfig>(&config_text).expect_err("reject old field");
+
+        assert!(err.to_string().contains("server_port"));
+    }
+
+    #[test]
+    fn node_config_rejects_unknown_top_level_section() {
+        let config_text = format!("{}\n[unexpected]\nvalue = true\n", read_config_single());
+
+        let err = toml::from_str::<NodeConfig>(&config_text).expect_err("reject unknown section");
+
+        assert!(err.to_string().contains("unexpected"));
+    }
+
+    #[test]
+    fn model_config_rejects_unknown_model_fields() {
+        let config_text = read_config_single().replacen(
+            "404-3dgs = { output = \"ply\", supports_txt3d = true, supports_img3d = true }",
+            "404-3dgs = { output = \"ply\", supports_txt3d = true, supports_img3d = true, extra = true }",
+            1,
+        );
+
+        let err =
+            toml::from_str::<NodeConfig>(&config_text).expect_err("reject unknown model field");
+
+        assert!(err.to_string().contains("extra"));
+    }
+
+    #[test]
+    fn single_node_config_can_omit_raft_dns_names() {
+        let config_text = read_config_single()
+            .replace("dns_name = \"node-1-raft\"\n", "")
+            .replace("peer_dns_names = []\n", "");
+        let config: NodeConfig = toml::from_str(&config_text).expect("parse config");
+
+        assert!(config.raft.dns_name.is_empty());
+        assert!(config.raft.peer_dns_names.is_empty());
+        validate_node_config(&config).expect("single-node DNS fields are optional");
+    }
+
+    #[test]
+    fn multi_node_config_requires_raft_dns_names() {
+        let config_text = read_config_single()
+            .replace("dns_name = \"node-1-raft\"\n", "")
+            .replace("peer_dns_names = []\n", "");
+        let config: NodeConfig = toml::from_str(&config_text).expect("parse config");
+
+        let err = validate_multi_node_raft_dns_config(&config).expect_err("reject missing DNS");
+
+        assert!(err.to_string().contains("raft.dns_name"));
+    }
+
+    #[test]
+    fn raft_peer_dns_names_allow_peers_only_and_reject_duplicates() {
+        let duplicate_self = read_config_single().replace(
+            "peer_dns_names = []",
+            "peer_dns_names = [\"node-1-raft\", \"node-1-raft\"]",
+        );
+        let config: NodeConfig = toml::from_str(&duplicate_self).expect("parse config");
+        let err = validate_node_config(&config).expect_err("reject duplicate peer DNS names");
+        assert!(err.to_string().contains("duplicate"));
+
+        let peers_only = read_config_single()
+            .replace("node_dns_names = []", "node_dns_names = [\"node-2\"]")
+            .replace("peer_dns_names = []", "peer_dns_names = [\"node-2-raft\"]");
+        let config: NodeConfig = toml::from_str(&peers_only).expect("parse config");
+        validate_node_config(&config).expect("peers-only DNS list is valid");
+        validate_multi_node_raft_dns_config(&config).expect("peers-only DNS list is valid");
+
+        let self_plus_peer = read_config_single()
+            .replace(
+                "node_dns_names = []",
+                "node_dns_names = [\"node-1\", \"node-2\"]",
+            )
+            .replace(
+                "peer_dns_names = []",
+                "peer_dns_names = [\"node-1-raft\", \"node-2-raft\"]",
+            );
+        let config: NodeConfig = toml::from_str(&self_plus_peer).expect("parse config");
+        validate_multi_node_raft_dns_config(&config)
+            .expect("self plus remote peer DNS list is tolerated");
+    }
+
+    #[test]
+    fn multi_node_config_rejects_self_only_raft_peer_dns_names() {
+        let self_only = read_config_single()
+            .replace("peer_dns_names = []", "peer_dns_names = [\"node-1-raft\"]");
+        let config: NodeConfig = toml::from_str(&self_only).expect("parse config");
+
+        let err =
+            validate_multi_node_raft_dns_config(&config).expect_err("reject self-only peer DNS");
+
+        assert!(err.to_string().contains("remote Raft DNS name"));
+    }
+
+    #[test]
+    fn multi_node_config_requires_matching_http_and_raft_peer_dns_counts() {
+        let mismatched = read_config_single()
+            .replace(
+                "node_dns_names = []",
+                "node_dns_names = [\"node-1\", \"node-2\", \"node-3\"]",
+            )
+            .replace("peer_dns_names = []", "peer_dns_names = [\"node-2-raft\"]");
+        let config: NodeConfig = toml::from_str(&mismatched).expect("parse config");
+
+        let err = validate_multi_node_raft_dns_config(&config)
+            .expect_err("reject mismatched HTTP and Raft peer DNS lists");
+
+        assert!(err.to_string().contains("network.node_dns_names"));
     }
 }
