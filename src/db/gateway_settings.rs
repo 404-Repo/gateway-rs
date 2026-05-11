@@ -14,11 +14,14 @@ use uuid::Uuid;
 use super::Database;
 use super::data_access::GatewaySettingsRow;
 use crate::http3::whitelist::resolve_rate_limit_whitelist_with_status;
+use crate::task::TaskManager;
 
 const DEFAULT_REGISTERED_GENERATION_LIMIT: u64 = 0;
 const DEFAULT_REGISTERED_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 const DEFAULT_GUEST_GENERATION_LIMIT: u64 = 1;
 const DEFAULT_GUEST_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+const DEFAULT_TASKMANAGER_TASK_LIFETIME_SEC: u64 = 600;
+const DEFAULT_TASKMANAGER_RESULT_LIFETIME_SEC: u64 = 300;
 
 pub fn gateway_settings_sync_interval(update_interval_secs: u64) -> Duration {
     Duration::from_secs(update_interval_secs.max(1))
@@ -33,6 +36,8 @@ struct CachedGatewaySettings {
     add_task_unauthorized_per_ip_daily_rate_limit: u64,
     max_task_queue_len: u64,
     request_file_size_limit: u64,
+    taskmanager_task_lifetime_sec: u64,
+    taskmanager_result_lifetime_sec: u64,
     guest_generation_limit: u64,
     guest_window_ms: u64,
     registered_generation_limit: u64,
@@ -56,6 +61,8 @@ pub struct GatewayRuntimeSettingsStore {
     add_task_unauthorized_per_ip_daily_rate_limit: AtomicU64,
     max_task_queue_len: AtomicU64,
     request_file_size_limit: AtomicU64,
+    taskmanager_task_lifetime_sec: AtomicU64,
+    taskmanager_result_lifetime_sec: AtomicU64,
     guest_generation_limit: AtomicU64,
     guest_window_ms: AtomicU64,
     registered_generation_limit: AtomicU64,
@@ -82,6 +89,10 @@ impl GatewayRuntimeSettingsStore {
             add_task_unauthorized_per_ip_daily_rate_limit: AtomicU64::new(0),
             max_task_queue_len: AtomicU64::new(0),
             request_file_size_limit: AtomicU64::new(0),
+            taskmanager_task_lifetime_sec: AtomicU64::new(DEFAULT_TASKMANAGER_TASK_LIFETIME_SEC),
+            taskmanager_result_lifetime_sec: AtomicU64::new(
+                DEFAULT_TASKMANAGER_RESULT_LIFETIME_SEC,
+            ),
             guest_generation_limit: AtomicU64::new(DEFAULT_GUEST_GENERATION_LIMIT),
             guest_window_ms: AtomicU64::new(DEFAULT_GUEST_WINDOW_MS),
             registered_generation_limit: AtomicU64::new(DEFAULT_REGISTERED_GENERATION_LIMIT),
@@ -90,7 +101,11 @@ impl GatewayRuntimeSettingsStore {
         }
     }
 
-    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
+    pub async fn run(
+        self: Arc<Self>,
+        task_manager: Option<TaskManager>,
+        shutdown: CancellationToken,
+    ) {
         let mut interval = tokio::time::interval(self.update_interval);
         loop {
             tokio::select! {
@@ -98,6 +113,13 @@ impl GatewayRuntimeSettingsStore {
                 _ = interval.tick() => {
                     if let Err(err) = self.refresh_once().await {
                         error!("Error updating gateway settings: {:?}", err);
+                    } else if self.has_database_gateway_settings()
+                        && let Some(task_manager) = task_manager.as_ref()
+                    {
+                        task_manager.set_lifetimes(
+                            Duration::from_secs(self.taskmanager_task_lifetime_sec().max(1)),
+                            Duration::from_secs(self.taskmanager_result_lifetime_sec().max(1)),
+                        );
                     }
                 }
             }
@@ -132,6 +154,12 @@ impl GatewayRuntimeSettingsStore {
                 .load(Ordering::Acquire),
             max_task_queue_len: self.max_task_queue_len.load(Ordering::Acquire),
             request_file_size_limit: self.request_file_size_limit.load(Ordering::Acquire),
+            taskmanager_task_lifetime_sec: self
+                .taskmanager_task_lifetime_sec
+                .load(Ordering::Acquire),
+            taskmanager_result_lifetime_sec: self
+                .taskmanager_result_lifetime_sec
+                .load(Ordering::Acquire),
             guest_generation_limit: self.guest_generation_limit.load(Ordering::Acquire),
             guest_window_ms: self.guest_window_ms.load(Ordering::Acquire),
             registered_generation_limit: self.registered_generation_limit.load(Ordering::Acquire),
@@ -167,6 +195,10 @@ impl GatewayRuntimeSettingsStore {
             .store(settings.max_task_queue_len, Ordering::Release);
         self.request_file_size_limit
             .store(settings.request_file_size_limit, Ordering::Release);
+        self.taskmanager_task_lifetime_sec
+            .store(settings.taskmanager_task_lifetime_sec, Ordering::Release);
+        self.taskmanager_result_lifetime_sec
+            .store(settings.taskmanager_result_lifetime_sec, Ordering::Release);
         self.guest_generation_limit
             .store(settings.guest_generation_limit, Ordering::Release);
         self.guest_window_ms
@@ -203,6 +235,8 @@ impl GatewayRuntimeSettingsStore {
                 rate_limit_whitelist,
                 max_task_queue_len,
                 request_file_size_limit,
+                taskmanager_task_lifetime_sec,
+                taskmanager_result_lifetime_sec,
                 guest_generation_limit,
                 guest_window_ms,
                 registered_generation_limit,
@@ -224,6 +258,8 @@ impl GatewayRuntimeSettingsStore {
                     add_task_unauthorized_per_ip_daily_rate_limit,
                     max_task_queue_len,
                     request_file_size_limit,
+                    taskmanager_task_lifetime_sec,
+                    taskmanager_result_lifetime_sec,
                     guest_generation_limit,
                     guest_window_ms,
                     registered_generation_limit,
@@ -253,6 +289,8 @@ impl GatewayRuntimeSettingsStore {
                         add_task_unauthorized_per_ip_daily_rate_limit,
                         max_task_queue_len,
                         request_file_size_limit,
+                        taskmanager_task_lifetime_sec,
+                        taskmanager_result_lifetime_sec,
                         guest_generation_limit,
                         guest_window_ms,
                         registered_generation_limit,
@@ -314,6 +352,15 @@ impl GatewayRuntimeSettingsStore {
         self.cached_gateway_settings().request_file_size_limit
     }
 
+    pub fn taskmanager_task_lifetime_sec(&self) -> u64 {
+        self.cached_gateway_settings().taskmanager_task_lifetime_sec
+    }
+
+    pub fn taskmanager_result_lifetime_sec(&self) -> u64 {
+        self.cached_gateway_settings()
+            .taskmanager_result_lifetime_sec
+    }
+
     pub fn guest_generation_limit(&self) -> u64 {
         self.cached_gateway_settings().guest_generation_limit
     }
@@ -347,6 +394,8 @@ impl GatewayRuntimeSettingsStore {
                 .add_task_unauthorized_per_ip_daily_rate_limit,
             max_task_queue_len: current.max_task_queue_len,
             request_file_size_limit: current.request_file_size_limit,
+            taskmanager_task_lifetime_sec: current.taskmanager_task_lifetime_sec,
+            taskmanager_result_lifetime_sec: current.taskmanager_result_lifetime_sec,
             guest_generation_limit: current.guest_generation_limit,
             guest_window_ms: current.guest_window_ms,
             registered_generation_limit: current.registered_generation_limit,
@@ -373,6 +422,8 @@ impl GatewayRuntimeSettingsStore {
                 .add_task_unauthorized_per_ip_daily_rate_limit,
             max_task_queue_len: current.max_task_queue_len,
             request_file_size_limit: current.request_file_size_limit,
+            taskmanager_task_lifetime_sec: current.taskmanager_task_lifetime_sec,
+            taskmanager_result_lifetime_sec: current.taskmanager_result_lifetime_sec,
             guest_generation_limit: current.guest_generation_limit,
             guest_window_ms: current.guest_window_ms,
             registered_generation_limit: current.registered_generation_limit,

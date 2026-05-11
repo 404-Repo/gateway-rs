@@ -92,7 +92,9 @@ max_rate_limit_deltas_per_batch = 8192
 unique_workers_per_task = 3
 taskmanager_initial_capacity = 1024
 taskmanager_cleanup_interval = 30
-taskmanager_result_lifetime = 2000
+# Task lifetime controls worker deadline/refunds; result lifetime controls in-memory result retention.
+taskmanager_task_lifetime = 600
+taskmanager_result_lifetime = 300
 taskqueue_cleanup_interval = 1
 taskqueue_task_ttl = 1800
 generation_task_retention_sec = 86400

@@ -469,6 +469,40 @@ where
             .request_file_size_limit
     }
 
+    pub fn taskmanager_task_lifetime_sec(&self) -> u64 {
+        if self.has_database_gateway_settings() {
+            return self
+                .internal
+                .gateway_settings
+                .taskmanager_task_lifetime_sec()
+                .max(1);
+        }
+        self.internal
+            .config
+            .snapshot()
+            .node()
+            .basic
+            .taskmanager_task_lifetime
+            .max(1)
+    }
+
+    pub fn taskmanager_result_lifetime_sec(&self) -> u64 {
+        if self.has_database_gateway_settings() {
+            return self
+                .internal
+                .gateway_settings
+                .taskmanager_result_lifetime_sec()
+                .max(1);
+        }
+        self.internal
+            .config
+            .snapshot()
+            .node()
+            .basic
+            .taskmanager_result_lifetime
+            .max(1)
+    }
+
     pub fn guest_generation_limit(&self) -> u64 {
         self.internal.gateway_settings.guest_generation_limit()
     }

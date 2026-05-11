@@ -25,6 +25,8 @@ pub struct GatewaySettingsRow {
     pub rate_limit_whitelist: Vec<String>,
     pub max_task_queue_len: u64,
     pub request_file_size_limit: u64,
+    pub taskmanager_task_lifetime_sec: u64,
+    pub taskmanager_result_lifetime_sec: u64,
     pub guest_generation_limit: u64,
     pub guest_window_ms: u64,
     pub registered_generation_limit: u64,
@@ -119,6 +121,8 @@ fn decode_gateway_settings_row(row: Row) -> Result<GatewaySettingsRow> {
         row.get("add_task_unauthorized_per_ip_daily_rate_limit");
     let max_task_queue_len: i32 = row.get("max_task_queue_len");
     let request_file_size_limit: i64 = row.get("request_file_size_limit");
+    let taskmanager_task_lifetime_sec: i32 = row.get("taskmanager_task_lifetime_sec");
+    let taskmanager_result_lifetime_sec: i32 = row.get("taskmanager_result_lifetime_sec");
     let guest_generation_limit: i32 = row.get("guest_generation_limit");
     let guest_window_ms: i64 = row.get("guest_window_ms");
     let registered_generation_limit: i32 = row.get("registered_generation_limit");
@@ -143,6 +147,14 @@ fn decode_gateway_settings_row(row: Row) -> Result<GatewaySettingsRow> {
         request_file_size_limit: nonnegative_i64_to_u64(
             request_file_size_limit,
             "request_file_size_limit",
+        )?,
+        taskmanager_task_lifetime_sec: nonnegative_i32_to_u64(
+            taskmanager_task_lifetime_sec,
+            "taskmanager_task_lifetime_sec",
+        )?,
+        taskmanager_result_lifetime_sec: nonnegative_i32_to_u64(
+            taskmanager_result_lifetime_sec,
+            "taskmanager_result_lifetime_sec",
         )?,
         guest_generation_limit: nonnegative_i32_to_u64(
             guest_generation_limit,
@@ -289,6 +301,8 @@ SELECT
   rate_limit_whitelist,
   max_task_queue_len,
   request_file_size_limit,
+  taskmanager_task_lifetime_sec,
+  taskmanager_result_lifetime_sec,
   guest_generation_limit,
   guest_window_ms,
   registered_generation_limit,

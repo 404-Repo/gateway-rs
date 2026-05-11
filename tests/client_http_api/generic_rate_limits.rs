@@ -251,7 +251,7 @@ async fn generic_key_concurrent_limit_is_shared_across_source_ips_end_to_end() {
 async fn generic_key_concurrent_limit_recovers_after_restart_timeout_end_to_end() {
     let start = GatewayRuntimeHarness::start(GatewayHarnessOptions {
         taskmanager_cleanup_interval_secs: Some(1),
-        taskmanager_result_lifetime_secs: Some(2),
+        taskmanager_task_lifetime_secs: Some(2),
         generic_key_concurrent_limit: Some(1),
         ..GatewayHarnessOptions::default()
     })

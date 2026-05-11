@@ -24,6 +24,9 @@ pub struct BasicConfig {
     pub unique_workers_per_task: usize,
     pub taskmanager_initial_capacity: usize,
     pub taskmanager_cleanup_interval: u64,
+    #[serde(default = "default_taskmanager_task_lifetime")]
+    pub taskmanager_task_lifetime: u64,
+    #[serde(default = "default_taskmanager_result_lifetime")]
     pub taskmanager_result_lifetime: u64,
     pub taskqueue_cleanup_interval: u64,
     pub taskqueue_task_ttl: u64,
@@ -33,6 +36,14 @@ pub struct BasicConfig {
 
 fn default_generation_task_retention_sec() -> u64 {
     86_400
+}
+
+fn default_taskmanager_task_lifetime() -> u64 {
+    600
+}
+
+fn default_taskmanager_result_lifetime() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

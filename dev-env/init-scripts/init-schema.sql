@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS app_settings (
   rate_limit_whitelist TEXT[] NOT NULL,
   max_task_queue_len INTEGER NOT NULL CHECK (max_task_queue_len >= 0),
   request_file_size_limit BIGINT NOT NULL CHECK (request_file_size_limit >= 0),
+  taskmanager_task_lifetime_sec INTEGER NOT NULL DEFAULT 600 CHECK (taskmanager_task_lifetime_sec > 0),
+  taskmanager_result_lifetime_sec INTEGER NOT NULL DEFAULT 300 CHECK (taskmanager_result_lifetime_sec > 0),
   stripe_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL
@@ -93,6 +95,8 @@ BEGIN
     rate_limit_whitelist,
     max_task_queue_len,
     request_file_size_limit,
+    taskmanager_task_lifetime_sec,
+    taskmanager_result_lifetime_sec,
     stripe_enabled,
     created_at,
     updated_at
@@ -112,6 +116,8 @@ BEGIN
     ARRAY[]::TEXT[],
     500,
     157286400,
+    600,
+    300,
     TRUE,
     v_now,
     v_now

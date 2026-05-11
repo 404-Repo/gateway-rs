@@ -191,6 +191,7 @@ pub async fn build_shared_harness_core(
         initial_capacity: config.basic.taskmanager_initial_capacity,
         expected_results: config.basic.unique_workers_per_task,
         cleanup_interval: Duration::from_secs(config.basic.taskmanager_cleanup_interval),
+        task_lifetime: Duration::from_secs(config.basic.taskmanager_task_lifetime),
         result_lifetime: Duration::from_secs(config.basic.taskmanager_result_lifetime),
         rate_limit_mutation_queue: rate_limit_mutation_queue.clone(),
         metrics: metrics.clone(),
