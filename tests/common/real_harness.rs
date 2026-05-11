@@ -192,6 +192,7 @@ pub(crate) struct GatewayHarnessOptions {
     pub(crate) include_gateway_info: bool,
     pub(crate) worker_whitelist: Option<HashSet<Hotkey>>,
     pub(crate) taskmanager_cleanup_interval_secs: Option<u64>,
+    pub(crate) taskmanager_task_lifetime_secs: Option<u64>,
     pub(crate) taskmanager_result_lifetime_secs: Option<u64>,
     pub(crate) api_keys_update_interval_secs: Option<u64>,
     pub(crate) generic_key_concurrent_limit: Option<usize>,
@@ -203,6 +204,7 @@ impl Default for GatewayHarnessOptions {
             include_gateway_info: true,
             worker_whitelist: None,
             taskmanager_cleanup_interval_secs: None,
+            taskmanager_task_lifetime_secs: None,
             taskmanager_result_lifetime_secs: None,
             api_keys_update_interval_secs: None,
             generic_key_concurrent_limit: None,
@@ -536,6 +538,9 @@ impl GatewayRuntimeHarness {
         if let Some(cleanup_secs) = options.taskmanager_cleanup_interval_secs {
             config.basic.taskmanager_cleanup_interval = cleanup_secs;
         }
+        if let Some(task_lifetime_secs) = options.taskmanager_task_lifetime_secs {
+            config.basic.taskmanager_task_lifetime = task_lifetime_secs;
+        }
         if let Some(result_lifetime_secs) = options.taskmanager_result_lifetime_secs {
             config.basic.taskmanager_result_lifetime = result_lifetime_secs;
         }
@@ -561,6 +566,8 @@ impl GatewayRuntimeHarness {
                 rate_limit_whitelist: config.http.rate_limit_whitelist.iter().cloned().collect(),
                 max_task_queue_len: config.http.max_task_queue_len as i32,
                 request_file_size_limit: config.http.request_file_size_limit as i64,
+                taskmanager_task_lifetime_sec: config.basic.taskmanager_task_lifetime as i32,
+                taskmanager_result_lifetime_sec: config.basic.taskmanager_result_lifetime as i32,
                 guest_generation_limit: 1,
                 guest_window_ms: 86_400_000,
                 registered_generation_limit: 0,
@@ -778,6 +785,8 @@ pub(crate) struct GatewayRuntimeAppSettingsUpdate {
     pub(crate) rate_limit_whitelist: Vec<String>,
     pub(crate) max_task_queue_len: i32,
     pub(crate) request_file_size_limit: i64,
+    pub(crate) taskmanager_task_lifetime_sec: i32,
+    pub(crate) taskmanager_result_lifetime_sec: i32,
     pub(crate) guest_generation_limit: i32,
     pub(crate) guest_window_ms: i64,
     pub(crate) registered_generation_limit: i32,
@@ -791,8 +800,8 @@ pub(crate) async fn update_app_settings_gateway_runtime(
     let now = current_time_ms();
     client
         .execute(
-            "UPDATE app_settings SET gateway_generic_key = $1, gateway_generic_global_daily_limit = $2, gateway_generic_per_ip_daily_limit = $3, add_task_unauthorized_per_ip_daily_rate_limit = $4, rate_limit_whitelist = $5, max_task_queue_len = $6, request_file_size_limit = $7, guest_generation_limit = $8, guest_window_ms = $9, registered_generation_limit = $10, registered_window_ms = $11, updated_at = $12 WHERE id = 1",
-            &[&update.generic_key, &update.global_limit, &update.per_ip_limit, &update.unauthorized_per_ip_limit, &update.rate_limit_whitelist, &update.max_task_queue_len, &update.request_file_size_limit, &update.guest_generation_limit, &update.guest_window_ms, &update.registered_generation_limit, &update.registered_window_ms, &now],
+            "UPDATE app_settings SET gateway_generic_key = $1, gateway_generic_global_daily_limit = $2, gateway_generic_per_ip_daily_limit = $3, add_task_unauthorized_per_ip_daily_rate_limit = $4, rate_limit_whitelist = $5, max_task_queue_len = $6, request_file_size_limit = $7, taskmanager_task_lifetime_sec = $8, taskmanager_result_lifetime_sec = $9, guest_generation_limit = $10, guest_window_ms = $11, registered_generation_limit = $12, registered_window_ms = $13, updated_at = $14 WHERE id = 1",
+            &[&update.generic_key, &update.global_limit, &update.per_ip_limit, &update.unauthorized_per_ip_limit, &update.rate_limit_whitelist, &update.max_task_queue_len, &update.request_file_size_limit, &update.taskmanager_task_lifetime_sec, &update.taskmanager_result_lifetime_sec, &update.guest_generation_limit, &update.guest_window_ms, &update.registered_generation_limit, &update.registered_window_ms, &now],
         )
         .await
         .context("update gateway runtime app settings")?;

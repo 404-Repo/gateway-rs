@@ -238,7 +238,7 @@ async fn records_worker_timeout_event() {
         None,
         GatewayHarnessOptions {
             taskmanager_cleanup_interval_secs: Some(1),
-            taskmanager_result_lifetime_secs: Some(1),
+            taskmanager_task_lifetime_secs: Some(1),
             ..GatewayHarnessOptions::default()
         },
     )

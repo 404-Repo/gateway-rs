@@ -9,6 +9,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +34,7 @@ pub(crate) fn rate_limit_completion_request_id(task_id: Uuid) -> u128 {
 struct TaskManagerInnerInit {
     initial_capacity: usize,
     expected_results: usize,
+    task_lifetime: Duration,
     result_lifetime: Duration,
     expiration_queue: scc::Queue<ExpirationEvent>,
     rate_limit_mutation_queue: RateLimitMutationBuffer,
@@ -44,6 +46,7 @@ pub struct TaskManagerInit {
     pub initial_capacity: usize,
     pub expected_results: usize,
     pub cleanup_interval: Duration,
+    pub task_lifetime: Duration,
     pub result_lifetime: Duration,
     pub rate_limit_mutation_queue: RateLimitMutationBuffer,
     pub metrics: Metrics,
@@ -53,7 +56,8 @@ pub struct TaskManagerInit {
 struct TaskManagerInner {
     tasks: HashMap<Uuid, TaskState, RandomState>,
     expected_results: usize,
-    result_lifetime: Duration,
+    task_lifetime_ms: AtomicU64,
+    result_lifetime_ms: AtomicU64,
     metrics: Metrics,
     worker_event_recorder: Option<EventRecorder>,
     expiration_queue: scc::Queue<ExpirationEvent>,
@@ -104,10 +108,19 @@ struct ExpirationEvent {
 }
 
 impl TaskManagerInner {
+    fn duration_to_millis(duration: Duration) -> u64 {
+        duration.as_millis().clamp(1, u64::MAX as u128) as u64
+    }
+
+    fn duration_from_millis(value: u64) -> Duration {
+        Duration::from_millis(value.max(1))
+    }
+
     fn new(init: TaskManagerInnerInit) -> Self {
         let TaskManagerInnerInit {
             initial_capacity,
             expected_results,
+            task_lifetime,
             result_lifetime,
             expiration_queue,
             rate_limit_mutation_queue,
@@ -116,7 +129,8 @@ impl TaskManagerInner {
         } = init;
         Self {
             expected_results,
-            result_lifetime,
+            task_lifetime_ms: AtomicU64::new(Self::duration_to_millis(task_lifetime)),
+            result_lifetime_ms: AtomicU64::new(Self::duration_to_millis(result_lifetime)),
             metrics,
             worker_event_recorder,
             tasks: HashMap::with_capacity_and_hasher(initial_capacity, RandomState::default()),
@@ -140,13 +154,28 @@ impl TaskManagerInner {
             kind: ExpirationKind::Results,
         });
     }
+
+    fn task_lifetime(&self) -> Duration {
+        Self::duration_from_millis(self.task_lifetime_ms.load(Ordering::Acquire))
+    }
+
+    fn result_lifetime(&self) -> Duration {
+        Self::duration_from_millis(self.result_lifetime_ms.load(Ordering::Acquire))
+    }
+
+    fn set_lifetimes(&self, task_lifetime: Duration, result_lifetime: Duration) {
+        self.task_lifetime_ms
+            .store(Self::duration_to_millis(task_lifetime), Ordering::Release);
+        self.result_lifetime_ms
+            .store(Self::duration_to_millis(result_lifetime), Ordering::Release);
+    }
 }
 
 impl TaskState {
-    fn new(task: &crate::api::Task, now: Instant, result_lifetime: Duration) -> Self {
+    fn new(task: &crate::api::Task, now: Instant, task_lifetime: Duration) -> Self {
         Self {
             execution_start: Some(now),
-            task_expires_at: Some(now + result_lifetime),
+            task_expires_at: Some(now + task_lifetime),
             last_result_instant: None,
             results_expires_at: None,
             task_kind: task_kind_from_task(task),
@@ -317,10 +346,32 @@ impl TaskManager {
         metrics: Metrics,
         worker_event_recorder: Option<EventRecorder>,
     ) -> Self {
+        Self::new_with_task_lifetime(
+            initial_capacity,
+            expected_results,
+            cleanup_interval,
+            result_lifetime,
+            result_lifetime,
+            metrics,
+            worker_event_recorder,
+        )
+        .await
+    }
+
+    pub async fn new_with_task_lifetime(
+        initial_capacity: usize,
+        expected_results: usize,
+        cleanup_interval: Duration,
+        task_lifetime: Duration,
+        result_lifetime: Duration,
+        metrics: Metrics,
+        worker_event_recorder: Option<EventRecorder>,
+    ) -> Self {
         Self::new_with_rate_limit_mutation_queue(TaskManagerInit {
             initial_capacity,
             expected_results,
             cleanup_interval,
+            task_lifetime,
             result_lifetime,
             rate_limit_mutation_queue: RateLimitMutationBuffer::default(),
             metrics,
@@ -334,6 +385,7 @@ impl TaskManager {
             initial_capacity,
             expected_results,
             cleanup_interval,
+            task_lifetime,
             result_lifetime,
             rate_limit_mutation_queue,
             metrics,
@@ -343,6 +395,7 @@ impl TaskManager {
         let inner = Arc::new(TaskManagerInner::new(TaskManagerInnerInit {
             initial_capacity,
             expected_results,
+            task_lifetime,
             result_lifetime,
             expiration_queue: scc::Queue::default(),
             rate_limit_mutation_queue,
@@ -359,6 +412,10 @@ impl TaskManager {
             cancel_token,
             _cleanup_task: Arc::new(handle),
         }
+    }
+
+    pub fn set_lifetimes(&self, task_lifetime: Duration, result_lifetime: Duration) {
+        self.inner.set_lifetimes(task_lifetime, result_lifetime);
     }
 
     fn spawn_cleanup(
@@ -472,7 +529,7 @@ impl TaskManager {
                                                         .is_none_or(|expires_at| expires_at <= now)
                                                     {
                                                         let terminal_expires_at =
-                                                            now + inner.result_lifetime;
+                                                            now + inner.result_lifetime();
                                                         state.results_expires_at =
                                                             Some(terminal_expires_at);
                                                         schedule_results_expiration =
@@ -592,7 +649,7 @@ impl TaskManager {
                     state,
                     result,
                     self.inner.expected_results,
-                    self.inner.result_lifetime,
+                    self.inner.result_lifetime(),
                 );
                 (outcome, results_expires_at, reservation)
             }
@@ -663,7 +720,7 @@ impl TaskManager {
                         state,
                         result,
                         self.inner.expected_results,
-                        self.inner.result_lifetime,
+                        self.inner.result_lifetime(),
                     );
                     (outcome, results_expires_at, reservation)
                 }
@@ -754,19 +811,19 @@ impl TaskManager {
                 state.image = task.image.clone();
                 state.model = task.model.clone();
                 state.execution_start = Some(now);
-                state.task_expires_at = Some(now + self.inner.result_lifetime);
+                state.task_expires_at = Some(now + self.inner.task_lifetime());
                 state.seed = Some(task.seed);
                 state.finished_results_count = 0;
                 state.rate_limit_reservation = rate_limit_reservation;
             }
             Entry::Vacant(entry) => {
-                let mut state = TaskState::new(task, now, self.inner.result_lifetime);
+                let mut state = TaskState::new(task, now, self.inner.task_lifetime());
                 state.rate_limit_reservation = rate_limit_reservation;
                 entry.insert_entry(state);
             }
         }
         self.inner
-            .schedule_task_expiration(task.id, now + self.inner.result_lifetime);
+            .schedule_task_expiration(task.id, now + self.inner.task_lifetime());
     }
 
     fn take_terminal_completion_reservation(

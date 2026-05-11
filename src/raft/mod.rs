@@ -941,10 +941,6 @@ pub async fn start_gateway(
         Arc::clone(&api_key_validator),
         gateway_shutdown.clone(),
     ));
-    let gateway_settings_updater = tokio::spawn(GatewayRuntimeSettingsStore::run(
-        api_key_validator.gateway_settings(),
-        gateway_shutdown.clone(),
-    ));
     let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
 
     let rate_limit_queue = RateLimitMutationBuffer::default();
@@ -952,12 +948,19 @@ pub async fn start_gateway(
         initial_capacity: cfg.basic.taskmanager_initial_capacity,
         expected_results: cfg.basic.unique_workers_per_task,
         cleanup_interval: Duration::from_secs(cfg.basic.taskmanager_cleanup_interval),
+        task_lifetime: Duration::from_secs(cfg.basic.taskmanager_task_lifetime),
         result_lifetime: Duration::from_secs(cfg.basic.taskmanager_result_lifetime),
         rate_limit_mutation_queue: rate_limit_queue.clone(),
         metrics: metrics.clone(),
         worker_event_recorder: Some(event_recorder.clone()),
     })
     .await;
+
+    let gateway_settings_updater = tokio::spawn(GatewayRuntimeSettingsStore::run(
+        api_key_validator.gateway_settings(),
+        Some(task_manager.clone()),
+        gateway_shutdown.clone(),
+    ));
 
     let gateway_state = GatewayState::new(GatewayStateInit {
         state: state_machine_store,

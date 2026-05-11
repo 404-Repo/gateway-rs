@@ -333,6 +333,10 @@ pub(crate) async fn set_request_file_size_limit(
                 .collect(),
             max_task_queue_len: harness.core.config.http.max_task_queue_len as i32,
             request_file_size_limit,
+            taskmanager_task_lifetime_sec: harness.core.config.basic.taskmanager_task_lifetime
+                as i32,
+            taskmanager_result_lifetime_sec: harness.core.config.basic.taskmanager_result_lifetime
+                as i32,
             guest_generation_limit: 1,
             guest_window_ms: 86_400_000,
             registered_generation_limit: 0,

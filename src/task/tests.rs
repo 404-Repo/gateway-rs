@@ -104,6 +104,55 @@ async fn assigned_task_without_results_is_in_progress() {
 }
 
 #[tokio::test]
+async fn updated_lifetimes_apply_to_new_tasks_without_shortening_existing_tasks() {
+    let task_manager = TaskManager::new_with_task_lifetime(
+        4,
+        1,
+        Duration::from_millis(20),
+        Duration::from_millis(400),
+        Duration::from_millis(400),
+        Metrics::new(0.05).unwrap(),
+        None,
+    )
+    .await;
+    let existing_task_id = Uuid::new_v4();
+    let new_task_id = Uuid::new_v4();
+    let existing_worker = Hotkey::from_bytes(&[70u8; 32]);
+    let new_worker = Hotkey::from_bytes(&[71u8; 32]);
+
+    task_manager.add_task(sample_task(existing_task_id)).await;
+    task_manager
+        .record_assignment(
+            existing_task_id,
+            existing_worker.clone(),
+            existing_worker.to_string().into(),
+        )
+        .await;
+    task_manager.set_lifetimes(Duration::from_millis(80), Duration::from_millis(500));
+    task_manager.add_task(sample_task(new_task_id)).await;
+    task_manager
+        .record_assignment(
+            new_task_id,
+            new_worker.clone(),
+            new_worker.to_string().into(),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    assert_eq!(
+        task_manager.get_status(new_task_id).await,
+        TaskStatus::Failure {
+            reason: Arc::<str>::from("Task timed out"),
+        }
+    );
+    assert_eq!(
+        task_manager.get_status(existing_task_id).await,
+        TaskStatus::InProgress
+    );
+}
+
+#[tokio::test]
 async fn single_success_stays_partial_until_expected_results_are_exhausted() {
     let task_manager = TaskManager::new(
         4,
@@ -317,7 +366,7 @@ async fn stage_result_rejects_double_stage_for_same_worker() {
 #[tokio::test]
 async fn staged_result_defers_timeout_until_commit() {
     const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
-    const RESULT_LIFETIME: Duration = Duration::from_millis(120);
+    const TASK_AND_RESULT_LIFETIME: Duration = Duration::from_millis(120);
 
     let metrics = Metrics::new(0.05).unwrap();
     let mutation_queue = RateLimitMutationBuffer::default();
@@ -326,7 +375,8 @@ async fn staged_result_defers_timeout_until_commit() {
         initial_capacity: 4,
         expected_results: 1,
         cleanup_interval: CLEANUP_INTERVAL,
-        result_lifetime: RESULT_LIFETIME,
+        task_lifetime: TASK_AND_RESULT_LIFETIME,
+        result_lifetime: TASK_AND_RESULT_LIFETIME,
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,
         worker_event_recorder: None,
@@ -363,7 +413,7 @@ async fn staged_result_defers_timeout_until_commit() {
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(
-        RESULT_LIFETIME.as_millis() as u64 + 200,
+        TASK_AND_RESULT_LIFETIME.as_millis() as u64 + 200,
     ))
     .await;
 
@@ -1095,6 +1145,7 @@ async fn emits_refund_when_task_completes_with_only_failures() {
         initial_capacity: 4,
         expected_results: 2,
         cleanup_interval: CLEANUP_INTERVAL,
+        task_lifetime: RESULT_LIFETIME,
         result_lifetime: RESULT_LIFETIME,
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,
@@ -1186,6 +1237,7 @@ async fn waits_for_expected_results_before_emitting_refund() {
         initial_capacity: 4,
         expected_results: 2,
         cleanup_interval: CLEANUP_INTERVAL,
+        task_lifetime: RESULT_LIFETIME,
         result_lifetime: RESULT_LIFETIME,
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,
@@ -1284,6 +1336,7 @@ async fn does_not_emit_refund_when_timeout_occurs_after_partial_success() {
         initial_capacity: 4,
         expected_results: 2,
         cleanup_interval: CLEANUP_INTERVAL,
+        task_lifetime: RESULT_LIFETIME,
         result_lifetime: RESULT_LIFETIME,
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,
@@ -1401,6 +1454,7 @@ async fn refund_rolls_back_local_pending_capacity() {
         initial_capacity: 2,
         expected_results: 1,
         cleanup_interval: CLEANUP_INTERVAL,
+        task_lifetime: RESULT_LIFETIME,
         result_lifetime: RESULT_LIFETIME,
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,

@@ -229,8 +229,7 @@ pub async fn add_task_handler(
             task_kind: billing_task_kind(task_kind).to_string(),
             model: model_name.clone(),
             expected_results: cfg.node().basic.unique_workers_per_task as i32,
-            deadline_at_ms: now_ms
-                + (cfg.node().basic.taskmanager_result_lifetime.max(1) as i64 * 1000),
+            deadline_at_ms: now_ms + (gateway_state.taskmanager_task_lifetime_sec() as i64 * 1000),
             gateway_name: cfg.node().network.name.clone(),
             client_origin: billing_client_origin.to_string(),
             request_json: billing_request_json.to_string(),

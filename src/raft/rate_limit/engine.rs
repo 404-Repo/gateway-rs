@@ -445,10 +445,11 @@ mod tests {
         );
         let _ = raft.initialize(members).await;
 
-        let task_manager = TaskManager::new(
+        let task_manager = TaskManager::new_with_task_lifetime(
             config.basic.taskmanager_initial_capacity,
             config.basic.unique_workers_per_task,
             Duration::from_secs(config.basic.taskmanager_cleanup_interval),
+            Duration::from_secs(config.basic.taskmanager_task_lifetime),
             Duration::from_secs(config.basic.taskmanager_result_lifetime),
             Metrics::new(0.05).expect("metrics"),
             None,
