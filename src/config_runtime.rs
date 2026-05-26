@@ -14,8 +14,8 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use crate::config::{
-    HTTPConfig, ImageConfig, ModelParamsConfig, NodeConfig, PromptConfig, read_config_from_path,
-    validate_node_config,
+    HTTPConfig, ImageConfig, ModelParamsConfig, NodeConfig, PromptConfig, TrustedProxyRange,
+    parse_trusted_proxy_cidr, read_config_from_path, validate_node_config,
 };
 use crate::http3::rate_limits::RateLimiters;
 use crate::http3::upload_limiter::ImageUploadLimiter;
@@ -29,6 +29,7 @@ pub struct RuntimeConfigSnapshot {
     pub prompt_regex: Regex,
     pub rate_limit_whitelist: RateLimitWhitelist,
     pub cluster_ips: HashSet<IpAddr>,
+    pub trusted_proxy_cidrs: Vec<TrustedProxyRange>,
     pub rate_limiters: RateLimiters,
     pub rate_limit_service: RateLimitService,
     pub image_upload_limiter: ImageUploadLimiter,
@@ -70,6 +71,10 @@ impl RuntimeConfigView {
 
     pub fn cluster_ips(&self) -> &HashSet<IpAddr> {
         &self.snapshot.cluster_ips
+    }
+
+    pub fn trusted_proxy_cidrs(&self) -> &[TrustedProxyRange] {
+        &self.snapshot.trusted_proxy_cidrs
     }
 
     pub fn rate_limits(&self) -> &RateLimitService {
@@ -347,6 +352,12 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
     let whitelist_ips = resolve_rate_limit_whitelist(&config.http.rate_limit_whitelist).await;
 
     let cluster_ips = resolve_egress_ips(&config.network.cluster_peer_egress_ips).await;
+    let trusted_proxy_cidrs = config
+        .http
+        .trusted_proxy_cidrs
+        .iter()
+        .map(|entry| parse_trusted_proxy_cidr(entry))
+        .collect::<Result<Vec<_>>>()?;
 
     let rate_limit_service = RateLimitService::new(&config.http);
     let rate_limiters = RateLimiters::new(&config.http);
@@ -359,6 +370,7 @@ async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnaps
             ips: Arc::new(whitelist_ips),
         },
         cluster_ips,
+        trusted_proxy_cidrs,
         rate_limiters,
         rate_limit_service,
         image_upload_limiter,

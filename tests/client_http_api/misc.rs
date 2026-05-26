@@ -53,13 +53,44 @@ async fn get_load_gateway_last_update_advances() {
 }
 
 #[tokio::test]
-async fn get_load_empty() {
+async fn get_load_missing_gateway_info_returns_500() {
+    const MAX_GET_LOAD_ATTEMPTS: usize = 50;
+
     let h = build_harness_with_gateway_info(false).await;
-    let res = TestClient::get("http://localhost/get_load")
-        .send(&h.service)
-        .await;
-    let (status, _headers, body) = read_response(res).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body:?}");
+
+    for attempt in 1..=MAX_GET_LOAD_ATTEMPTS {
+        let res = TestClient::get("http://localhost/get_load")
+            .send(&h.service)
+            .await;
+        let (status, _headers, body) = read_response(res).await;
+
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            return;
+        }
+
+        let is_startup_empty_membership = status == StatusCode::OK
+            && serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("gateways")
+                        .and_then(|value| value.as_array())
+                        .map(|gateways| gateways.is_empty())
+                })
+                == Some(true);
+
+        assert!(
+            is_startup_empty_membership,
+            "expected get_load to return 500 for missing gateway info; status: {status}, body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        if attempt < MAX_GET_LOAD_ATTEMPTS {
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    panic!("get_load kept returning an empty gateway list before gateway info became observable");
 }
 
 async fn read_gateway_last_update(h: &crate::support::TestHarness) -> u64 {

@@ -158,6 +158,10 @@ pub async fn api_or_generic_key_check(
     }
 
     if !context.key_is_uuid {
+        tracing::warn!(
+            "Unauthorized login attempt: Invalid API key format from IP {}",
+            context.source_addr.as_deref().unwrap_or("unknown")
+        );
         return Err(ServerError::BadRequest(
             "Invalid API key format".to_string(),
         ));
@@ -166,6 +170,10 @@ pub async fn api_or_generic_key_check(
     if context.has_authorized_key() {
         Ok(())
     } else if context.auth_lookup_blocked {
+        tracing::warn!(
+            "Unauthorized login attempt: API key lookup blocked for IP {}",
+            context.source_addr.as_deref().unwrap_or("unknown")
+        );
         Err(ServerError::Json(
             StatusCode::TOO_MANY_REQUESTS,
             json!({
@@ -174,6 +182,10 @@ pub async fn api_or_generic_key_check(
             }),
         ))
     } else {
+        tracing::warn!(
+            "Unauthorized login attempt: Invalid API key from IP {}",
+            context.source_addr.as_deref().unwrap_or("unknown")
+        );
         Err(ServerError::Unauthorized("Invalid API key".to_string()))
     }
 }

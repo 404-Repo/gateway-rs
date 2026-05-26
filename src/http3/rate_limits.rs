@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::config::HTTPConfig;
+use crate::config::{HTTPConfig, TrustedProxyRange};
 use crate::db::GenerationBillingOwner;
+use crate::http3::client_ip::client_ip;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
@@ -198,28 +199,40 @@ impl RateLimitReservation {
     }
 }
 
-fn decimal_ip_from_req(req: &mut Request) -> Option<Arc<str>> {
-    match req.remote_addr() {
-        salvo::conn::SocketAddr::IPv4(addr) => {
-            let bits = addr.ip().to_bits();
+fn ip_from_req(
+    req: &Request,
+    trusted_proxy_cidrs: &[TrustedProxyRange],
+) -> Option<std::net::IpAddr> {
+    client_ip(req, trusted_proxy_cidrs)
+}
+
+fn decimal_ip_from_req(
+    req: &mut Request,
+    trusted_proxy_cidrs: &[TrustedProxyRange],
+) -> Option<Arc<str>> {
+    let ip = ip_from_req(req, trusted_proxy_cidrs)?;
+    match ip {
+        std::net::IpAddr::V4(addr) => {
+            let bits = addr.to_bits();
             let mut buf = itoa::Buffer::new();
             Some(Arc::<str>::from(buf.format(bits)))
         }
-        salvo::conn::SocketAddr::IPv6(addr) => {
-            let bits = addr.ip().to_bits();
+        std::net::IpAddr::V6(addr) => {
+            let bits = addr.to_bits();
             let mut buf = itoa::Buffer::new();
             Some(Arc::<str>::from(buf.format(bits)))
         }
-        _ => None,
     }
 }
 
-fn source_addr_from_req(req: &mut Request) -> Option<Arc<str>> {
-    match req.remote_addr() {
-        salvo::conn::SocketAddr::IPv4(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
-        salvo::conn::SocketAddr::IPv6(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
-        _ => Some(Arc::<str>::from(req.remote_addr().to_string())),
+fn source_addr_from_req(
+    req: &mut Request,
+    trusted_proxy_cidrs: &[TrustedProxyRange],
+) -> Option<Arc<str>> {
+    if let Some(ip) = ip_from_req(req, trusted_proxy_cidrs) {
+        return Some(Arc::<str>::from(ip.to_string()));
     }
+    Some(Arc::<str>::from(req.remote_addr().to_string()))
 }
 
 fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
@@ -231,7 +244,13 @@ fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
             return Some(Arc::clone(addr));
         }
     }
-    decimal_ip_from_req(req).or_else(|| source_addr_from_req(req))
+    if let Ok(state) = depot.obtain::<HttpState>() {
+        let cfg = state.config();
+        return decimal_ip_from_req(req, cfg.trusted_proxy_cidrs())
+            .or_else(|| source_addr_from_req(req, cfg.trusted_proxy_cidrs()));
+    }
+
+    decimal_ip_from_req(req, &[]).or_else(|| source_addr_from_req(req, &[]))
 }
 
 const UNAUTHORIZED_DAILY_COUNTER_TTL: Duration = Duration::from_secs(60 * 60 * 48);
@@ -348,14 +367,14 @@ impl RateLimitContext {
 }
 
 fn base_rate_limit_context(req: &mut Request, state: &HttpState) -> RateLimitContext {
+    let cfg = state.config();
+    let trusted_proxy_cidrs = cfg.trusted_proxy_cidrs();
     let mut context = RateLimitContext {
         is_whitelisted_ip: is_whitelisted_ip(req, state),
         ..RateLimitContext::default()
     };
-    context.decimal_ip = decimal_ip_from_req(req);
-    if context.decimal_ip.is_none() {
-        context.source_addr = source_addr_from_req(req);
-    }
+    context.decimal_ip = decimal_ip_from_req(req, trusted_proxy_cidrs);
+    context.source_addr = source_addr_from_req(req, trusted_proxy_cidrs);
     context
 }
 
@@ -591,6 +610,7 @@ struct SubjectParams<'a> {
     active_limit: u64,
     daily_limit: u64,
     scope_label: &'a str,
+    user_email: Option<&'a str>,
     require_day_match: bool,
 }
 
@@ -628,6 +648,7 @@ async fn check_subject_limit(
     let active_limit = params.active_limit;
     let daily_limit = params.daily_limit;
     let scope_label = params.scope_label;
+    let user_email = params.user_email;
     let require_day_match = params.require_day_match;
 
     let has_limits = active_limit > 0 || daily_limit > 0;
@@ -668,6 +689,20 @@ async fn check_subject_limit(
                 format!("{} daily task limit exceeded.", scope_label)
             }
         };
+
+        if subject != Subject::GenericGlobal {
+            if let Some(email) = user_email {
+                tracing::warn!(
+                    "Rate limit exceeded for {} (user: {}): {:?}",
+                    scope_label,
+                    email,
+                    rejection
+                );
+            } else {
+                tracing::warn!("Rate limit exceeded for {}: {:?}", scope_label, rejection);
+            }
+        }
+
         return Err(match rejection {
             RateLimitRejection::Active => ServerError::Json(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -712,6 +747,7 @@ pub async fn reserve_add_task_rate_limit(
             active_limit: company.concurrent_limit,
             daily_limit: company.daily_limit,
             scope_label: company.name.as_ref(),
+            user_email: ctx.user_email.as_deref(),
             require_day_match: company.daily_limit > 0,
         });
     } else if let (Some(user_id), Some((concurrent_limit, daily_limit))) =
@@ -724,6 +760,7 @@ pub async fn reserve_add_task_rate_limit(
             active_limit: concurrent_limit,
             daily_limit,
             scope_label: "User",
+            user_email: ctx.user_email.as_deref(),
             require_day_match: daily_limit > 0,
         });
     } else if ctx.key_is_uuid && ctx.is_generic_key {
@@ -733,6 +770,7 @@ pub async fn reserve_add_task_rate_limit(
             active_limit: cfg.http().generic_key_concurrent_limit as u64,
             daily_limit: 0,
             scope_label: "Generic key",
+            user_email: None,
             require_day_match: false,
         });
     }
@@ -886,6 +924,7 @@ mod tests {
             active_limit: 0,
             daily_limit: 10,
             scope_label: "Company",
+            user_email: None,
             require_day_match: true,
         };
 
@@ -905,6 +944,7 @@ mod tests {
             active_limit: 0,
             daily_limit: 0,
             scope_label: "Company",
+            user_email: None,
             require_day_match: false,
         };
 

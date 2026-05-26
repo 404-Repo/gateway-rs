@@ -41,7 +41,7 @@ pub async fn add_result_handler(
     res: &mut Response,
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
-    let worker_ip = request_ip(req);
+    let worker_ip = request_ip(req, &state);
 
     ResultSubmissionLogContext::parsing_started(&worker_ip);
 

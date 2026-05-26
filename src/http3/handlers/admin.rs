@@ -6,6 +6,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::api::response::GenericKeyResponse;
+use crate::config::TrustedProxyRange;
+use crate::http3::client_ip::client_ip;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
@@ -56,7 +58,7 @@ pub async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(),
         return Ok(());
     }
 
-    if let Some(source_key) = admin_key_source_from_req(req) {
+    if let Some(source_key) = admin_key_source_from_req(req, cfg.trusted_proxy_cidrs()) {
         let limiter = state.admin_key_failure_limiter();
         if limiter.is_blocked(&source_key).await || limiter.record_miss(source_key).await {
             return Err(ServerError::Json(
@@ -74,10 +76,12 @@ pub async fn admin_key_check(depot: &mut Depot, req: &mut Request) -> Result<(),
     ))
 }
 
-fn admin_key_source_from_req(req: &Request) -> Option<Arc<str>> {
-    match req.remote_addr() {
-        salvo::conn::SocketAddr::IPv4(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
-        salvo::conn::SocketAddr::IPv6(addr) => Some(Arc::<str>::from(addr.ip().to_string())),
-        _ => Some(Arc::<str>::from(req.remote_addr().to_string())),
+fn admin_key_source_from_req(
+    req: &Request,
+    trusted_proxy_cidrs: &[TrustedProxyRange],
+) -> Option<Arc<str>> {
+    if let Some(ip) = client_ip(req, trusted_proxy_cidrs) {
+        return Some(Arc::<str>::from(ip.to_string()));
     }
+    Some(Arc::<str>::from(req.remote_addr().to_string()))
 }

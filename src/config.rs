@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use foldhash::HashSet;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
@@ -148,6 +149,10 @@ pub struct HTTPConfig {
     pub basic_rate_limit: usize,
     pub add_task_unauthorized_per_ip_daily_rate_limit: usize,
     pub rate_limit_whitelist: HashSet<String>,
+    /// CIDR ranges or literal IPs whose X-Forwarded-For headers are trusted.
+    /// Keep empty unless the gateway is only reachable through those proxies.
+    #[serde(default)]
+    pub trusted_proxy_cidrs: Vec<String>,
     #[serde(default = "default_distributed_rate_limiter_max_capacity")]
     pub distributed_rate_limiter_max_capacity: usize,
     pub worker_per_minute_rate_limit: usize,
@@ -463,7 +468,119 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         }
         tracing::warn!("TLS server verification is disabled; only use this in local development");
     }
+    validate_trusted_proxy_cidrs(&config.http.trusted_proxy_cidrs)?;
     validate_raft_dns_config(config)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedProxyRange {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+impl TrustedProxyRange {
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (*self, ip) {
+            (TrustedProxyRange::V4 { network, prefix }, IpAddr::V4(ip)) => {
+                u32::from(ip) & ipv4_prefix_mask(prefix) == network
+            }
+            (TrustedProxyRange::V6 { network, prefix }, IpAddr::V6(ip)) => {
+                u128::from(ip) & ipv6_prefix_mask(prefix) == network
+            }
+            _ => false,
+        }
+    }
+
+    fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(ip) => Self::from_ipv4_cidr(ip, 32),
+            IpAddr::V6(ip) => Self::from_ipv6_cidr(ip, 128),
+        }
+    }
+
+    fn from_ipv4_cidr(ip: Ipv4Addr, prefix: u8) -> Self {
+        let network = u32::from(ip) & ipv4_prefix_mask(prefix);
+        Self::V4 { network, prefix }
+    }
+
+    fn from_ipv6_cidr(ip: Ipv6Addr, prefix: u8) -> Self {
+        let network = u128::from(ip) & ipv6_prefix_mask(prefix);
+        Self::V6 { network, prefix }
+    }
+}
+
+fn ipv4_prefix_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    }
+}
+
+fn ipv6_prefix_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix))
+    }
+}
+
+pub fn parse_trusted_proxy_cidr(entry: &str) -> Result<TrustedProxyRange> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "http.trusted_proxy_cidrs must not contain empty entries"
+        ));
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(TrustedProxyRange::from_ip(ip));
+    }
+
+    if let Some((addr, prefix)) = trimmed.split_once('/') {
+        if prefix.contains('/') {
+            return Err(anyhow!(
+                "http.trusted_proxy_cidrs entry '{}' must be an IP address or CIDR block",
+                entry
+            ));
+        }
+        let ip = addr.trim().parse::<IpAddr>().map_err(|_| {
+            anyhow!(
+                "http.trusted_proxy_cidrs entry '{}' must be an IP address or CIDR block",
+                entry
+            )
+        })?;
+        let prefix = prefix.trim().parse::<u8>().map_err(|_| {
+            anyhow!(
+                "http.trusted_proxy_cidrs entry '{}' has an invalid CIDR prefix length",
+                entry
+            )
+        })?;
+        return match ip {
+            IpAddr::V4(ip) if prefix <= 32 => Ok(TrustedProxyRange::from_ipv4_cidr(ip, prefix)),
+            IpAddr::V6(ip) if prefix <= 128 => Ok(TrustedProxyRange::from_ipv6_cidr(ip, prefix)),
+            IpAddr::V4(_) => Err(anyhow!(
+                "http.trusted_proxy_cidrs entry '{}' has IPv4 prefix length greater than 32",
+                entry
+            )),
+            IpAddr::V6(_) => Err(anyhow!(
+                "http.trusted_proxy_cidrs entry '{}' has IPv6 prefix length greater than 128",
+                entry
+            )),
+        };
+    }
+
+    Err(anyhow!(
+        "http.trusted_proxy_cidrs entry '{}' must be an IP address or CIDR block",
+        entry
+    ))
+}
+
+fn validate_trusted_proxy_cidrs(entries: &[String]) -> Result<()> {
+    for entry in entries {
+        parse_trusted_proxy_cidr(entry)?;
+    }
     Ok(())
 }
 
@@ -566,7 +683,10 @@ pub fn resolve_config_path(path: Option<&String>) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeConfig, validate_multi_node_raft_dns_config, validate_node_config};
+    use super::{
+        NodeConfig, parse_trusted_proxy_cidr, validate_multi_node_raft_dns_config,
+        validate_node_config,
+    };
 
     fn read_config_single() -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -591,6 +711,44 @@ mod tests {
         );
         let config: NodeConfig = toml::from_str(&config_text).expect("parse config with override");
         assert_eq!(config.http.generic_key_concurrent_limit, 3);
+    }
+
+    #[test]
+    fn http_config_defaults_trusted_proxy_cidrs_when_missing() {
+        let config_text = read_config_single().replace("trusted_proxy_cidrs = []\n", "");
+        let config: NodeConfig =
+            toml::from_str(&config_text).expect("parse config without trusted proxies");
+        assert!(config.http.trusted_proxy_cidrs.is_empty());
+        validate_node_config(&config).expect("empty trusted proxy cidrs are valid");
+    }
+
+    #[test]
+    fn http_config_rejects_invalid_trusted_proxy_cidrs() {
+        let config_text = read_config_single().replace(
+            "trusted_proxy_cidrs = []",
+            "trusted_proxy_cidrs = [\"not-a-cidr\"]",
+        );
+        let config: NodeConfig = toml::from_str(&config_text).expect("parse config");
+        let err = validate_node_config(&config).expect_err("reject invalid proxy cidr");
+        assert!(err.to_string().contains("trusted_proxy_cidrs"));
+    }
+
+    #[test]
+    fn trusted_proxy_cidr_parser_matches_ipv4_and_ipv6_ranges() {
+        let ipv4 = parse_trusted_proxy_cidr("35.191.0.0/16").expect("ipv4 cidr");
+        assert!(ipv4.contains("35.191.22.10".parse().unwrap()));
+        assert!(!ipv4.contains("35.192.0.1".parse().unwrap()));
+
+        let ipv6 = parse_trusted_proxy_cidr("2600:2d00:1:b029::/64").expect("ipv6 cidr");
+        assert!(ipv6.contains("2600:2d00:1:b029::1".parse().unwrap()));
+        assert!(!ipv6.contains("2600:2d00:1:b02a::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxy_cidr_parser_accepts_literal_ip_as_single_host() {
+        let proxy = parse_trusted_proxy_cidr("127.0.0.1").expect("literal ip");
+        assert!(proxy.contains("127.0.0.1".parse().unwrap()));
+        assert!(!proxy.contains("127.0.0.2".parse().unwrap()));
     }
 
     #[test]

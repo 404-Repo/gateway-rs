@@ -196,6 +196,7 @@ pub(crate) struct GatewayHarnessOptions {
     pub(crate) taskmanager_result_lifetime_secs: Option<u64>,
     pub(crate) api_keys_update_interval_secs: Option<u64>,
     pub(crate) generic_key_concurrent_limit: Option<usize>,
+    pub(crate) trusted_proxy_cidrs: Vec<String>,
 }
 
 impl Default for GatewayHarnessOptions {
@@ -208,6 +209,7 @@ impl Default for GatewayHarnessOptions {
             taskmanager_result_lifetime_secs: None,
             api_keys_update_interval_secs: None,
             generic_key_concurrent_limit: None,
+            trusted_proxy_cidrs: Vec::new(),
         }
     }
 }
@@ -546,6 +548,9 @@ impl GatewayRuntimeHarness {
         }
         if let Some(generic_key_concurrent_limit) = options.generic_key_concurrent_limit {
             config.http.generic_key_concurrent_limit = generic_key_concurrent_limit;
+        }
+        if !options.trusted_proxy_cidrs.is_empty() {
+            config.http.trusted_proxy_cidrs = options.trusted_proxy_cidrs;
         }
 
         let generic_key = config.http.generic_key.expect("generic key");

@@ -38,7 +38,7 @@ pub async fn add_task_handler(
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
     let gateway_state = state.gateway_state().clone();
-    let submitter_ip = request_ip(req);
+    let submitter_ip = request_ip(req, &state);
     let mut rollback_guard = PendingRateLimitRollbackGuard::new(None);
     let mut task_log: Option<AddTaskLogContext> = None;
 
