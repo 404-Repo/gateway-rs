@@ -14,7 +14,7 @@ use super::add_result_log::{
 use super::add_result_parse::{ParsedAddResultRequest, parse_add_result_request};
 
 // Add successful result
-// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
+// curl --http3 -X POST https://api.dns.404.xyz/add_result \
 //   -F id=123e4567-e89b-12d3-a456-426614174001 \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \
@@ -25,7 +25,7 @@ use super::add_result_parse::{ParsedAddResultRequest, parse_add_result_request};
 //   -F asset=@/path/to/result.spz
 
 // Add failed result
-// curl --http3 -X POST https://gateway-eu.404.xyz:4443/add_result \
+// curl --http3 -X POST https://api.dns.404.xyz/add_result \
 //   -F id=987e6543-e21b-45d6-c789-123456789abc \
 //   -F signature=signature \
 //   -F timestamp=404_GATEWAY_1713096000 \

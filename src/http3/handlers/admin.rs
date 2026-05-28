@@ -23,7 +23,7 @@ pub async fn generic_key_update_handler(
     ))
 }
 
-// curl --http3 -X GET "https://gateway-eu.404.xyz:4443/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
+// curl --http3 -X GET "https://api.dns.404.xyz/get_key" -H "x-admin-key: b6c8597a-00e9-493a-b6cd-5dfc7244d46b"
 #[handler]
 pub async fn generic_key_read_handler(
     depot: &mut Depot,

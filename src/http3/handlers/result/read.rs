@@ -173,11 +173,11 @@ async fn authorize_task_read_access(
     }
 }
 
-// curl --http3 "https://gateway-eu.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
+// curl --http3 "https://api.dns.404.xyz/get_result?id=123e4567-e89b-12d3-a456-426614174000" \
 //   -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o result.ply
 
-// curl --http3 "https://gateway-eu.404.xyz:4443/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
+// curl --http3 "https://api.dns.404.xyz/get_result?id=123e4567-e89b-12d3-a456-426614174000&all=true" \
 //   -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" \
 //   -o results.zip
 #[handler]
@@ -382,7 +382,7 @@ pub async fn get_result_handler(
     Ok(())
 }
 
-// curl --http3 "https://gateway-eu.404.xyz:4443/get_status?id=123e4567-e89b-12d3-a456-426614174000"
+// curl --http3 "https://api.dns.404.xyz/get_status?id=123e4567-e89b-12d3-a456-426614174000"
 #[handler]
 pub async fn get_status_handler(
     depot: &mut Depot,

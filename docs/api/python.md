@@ -1,10 +1,17 @@
 # 404.xyz Gateway Python Examples
 
-This page contains Python examples for the gateway. Replace `{REGION}` and
+This page contains Python examples for the gateway. Replace `{BASE_URL}` and
 `{YOUR-API-KEY}` with your values.
 Optional: include `model` in `/add_task` to select output format. For `404-3dgs`,
 `/get_result` returns SPZ by default (PLY with `compress=0`). For `404-mesh`,
 `/get_result` returns GLB.
+
+## Server domains
+
+- **GeoDNS**: `https://api.dns.404.xyz` (routes to the closest healthy region)
+- **EU**: `https://api-eu.404.xyz`
+- **US East**: `https://api-us-east.404.xyz`
+- **US West**: `https://api-us-west.404.xyz`
 
 ## Text to 3D (Python)
 Note: `model` is only sent to `/add_task`, not `/get_status` or `/get_result`.
@@ -13,10 +20,10 @@ Note: `model` is only sent to `/add_task`, not `/get_status` or `/get_result`.
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 
-url = f"https://{region}:4443/add_task"
+url = f"{base_url}/add_task"
 headers = {"content-type": "application/json", "x-api-key": api_key}
 data = {"prompt": "mechanic robot", "model": "404-3dgs", "seed": 12345}  # Optional model, optional seed
 
@@ -29,10 +36,10 @@ with httpx.Client(http2=True) as client:
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 
-url = f"https://{region}:4443/get_status"
+url = f"{base_url}/get_status"
 headers = {"x-api-key": api_key}
 params = {"id": "bc2e40a1-1e51-4a09-8a58-c42b93b573b2"}
 
@@ -48,11 +55,11 @@ or the web interface at https://spz.404.xyz/
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 task_id = "123e4567-e89b-12d3-a456-426614174000"
 
-url = f"https://{region}:4443/get_result"
+url = f"{base_url}/get_result"
 params = {"id": task_id}
 headers = {"x-api-key": api_key}
 
@@ -68,8 +75,7 @@ import httpx
 import time
 
 API_KEY = "API_KEY"
-GATEWAY = "gateway-eu.404.xyz"
-BASE_URL = f"https://{GATEWAY}:4443"
+BASE_URL = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 
 # Choose output format: "spz" (default, compressed) or "ply" (compress=0)
 OUTPUT_FORMAT = "spz"  # or "ply"
@@ -104,10 +110,10 @@ Note: `model` is only sent to `/add_task`, not `/get_result`.
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 
-url = f"https://{region}:4443/add_task"
+url = f"{base_url}/add_task"
 headers = {"x-api-key": api_key}
 
 with httpx.Client(http2=True) as client:
@@ -125,11 +131,11 @@ or the web interface at https://spz.404.xyz/
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 task_id = "123e4567-e89b-12d3-a456-426614174000"
 
-url = f"https://{region}:4443/get_result"
+url = f"{base_url}/get_result"
 params = {"id": task_id}
 headers = {"x-api-key": api_key}
 
@@ -143,11 +149,11 @@ with httpx.Client(http2=True) as client:
 ```python
 import httpx
 
-region = "gateway-eu.404.xyz"  # Replace with your region
+base_url = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 api_key = "{YOUR-API-KEY}"
 task_id = "123e4567-e89b-12d3-a456-426614174000"
 
-url = f"https://{region}:4443/get_result"
+url = f"{base_url}/get_result"
 params = {"id": task_id, "compress": "0"}
 headers = {"x-api-key": api_key}
 
@@ -163,8 +169,7 @@ import httpx
 import time
 
 API_KEY = "{YOUR-API-KEY}"
-GATEWAY = "gateway-eu.404.xyz"
-BASE_URL = f"https://{GATEWAY}:4443"
+BASE_URL = "https://api.dns.404.xyz"  # GeoDNS; replace with a regional URL if needed
 
 # Choose output format: "spz" (default, compressed) or "ply" (compress=0)
 OUTPUT_FORMAT = "ply"  # or "spz"

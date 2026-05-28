@@ -27,9 +27,11 @@ use super::add_task_parse::{parse_add_task_request, validate_add_task_input};
 use super::add_task_rate_limit::{PendingRateLimitRollbackGuard, publish_accepted_reservation};
 use super::current_time_ms;
 
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot", "seed": 12345}'
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "prompt=a robot" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
-// curl --http3 -X POST "https://gateway-eu.404.xyz:4443/add_task" -F "image=@image.jpg" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
+// GeoDNS endpoint: https://api.dns.404.xyz. Regional endpoints:
+// https://api-eu.404.xyz, https://api-us-east.404.xyz, https://api-us-west.404.xyz.
+// curl --http3 -X POST "https://api.dns.404.xyz/add_task" -H "content-type: application/json" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001" -d '{"prompt": "mechanic robot", "seed": 12345}'
+// curl --http3 -X POST "https://api.dns.404.xyz/add_task" -F "prompt=a robot" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
+// curl --http3 -X POST "https://api.dns.404.xyz/add_task" -F "image=@image.jpg" -F "seed=12345" -H "x-api-key: 123e4567-e89b-12d3-a456-426614174001"
 #[handler]
 pub async fn add_task_handler(
     depot: &mut Depot,

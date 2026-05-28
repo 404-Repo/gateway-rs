@@ -1,20 +1,27 @@
 # 404.xyz Gateway TypeScript Examples (Bun/Node.js)
 
 These examples work with Bun and Node.js 18+ (which includes `fetch`).
-Replace `{REGION}` and `{YOUR-API-KEY}` with your values.
+Replace `{BASE_URL}` and `{YOUR-API-KEY}` with your values.
 Optional: include `model` in `/add_task` to select output format. For `404-3dgs`,
 `/get_result` returns SPZ by default (PLY with `compress=0`). For `404-mesh`,
 `/get_result` returns GLB.
+
+## Server domains
+
+- **GeoDNS**: `https://api.dns.404.xyz` (routes to the closest healthy region)
+- **EU**: `https://api-eu.404.xyz`
+- **US East**: `https://api-us-east.404.xyz`
+- **US West**: `https://api-us-west.404.xyz`
 
 ## Text to 3D (TypeScript)
 Note: `model` is only sent to `/add_task`, not `/get_status` or `/get_result`.
 
 ### 1. Add task
 ```ts
-const region = "gateway-eu.404.xyz"; // Replace with your region
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 
-const res = await fetch(`https://${region}:4443/add_task`, {
+const res = await fetch(`${baseUrl}/add_task`, {
   method: "POST",
   headers: {
     "content-type": "application/json",
@@ -29,11 +36,11 @@ console.log(json);
 
 ### 2. Get task status
 ```ts
-const region = "gateway-eu.404.xyz";
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 const taskId = "bc2e40a1-1e51-4a09-8a58-c42b93b573b2";
 
-const url = new URL(`https://${region}:4443/get_status`);
+const url = new URL(`${baseUrl}/get_status`);
 url.searchParams.set("id", taskId);
 
 const res = await fetch(url, {
@@ -45,11 +52,11 @@ console.log(res.status, await res.text());
 
 ### 3. Get result (SPZ, default)
 ```ts
-const region = "gateway-eu.404.xyz";
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 const taskId = "123e4567-e89b-12d3-a456-426614174000";
 
-const url = new URL(`https://${region}:4443/get_result`);
+const url = new URL(`${baseUrl}/get_result`);
 url.searchParams.set("id", taskId);
 
 const res = await fetch(url, { headers: { "x-api-key": apiKey } });
@@ -62,8 +69,7 @@ await Bun.write("result.spz", buf); // Bun
 ### Complete example with selectable output (SPZ or PLY)
 ```ts
 const API_KEY = "{YOUR-API-KEY}";
-const GATEWAY = "gateway-eu.404.xyz";
-const BASE_URL = `https://${GATEWAY}:4443`;
+const BASE_URL = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 
 // Choose output format: "spz" (default, compressed) or "ply" (compress=0)
 const OUTPUT_FORMAT = "spz"; // or "ply"
@@ -106,7 +112,7 @@ Note: `model` is only sent to `/add_task`, not `/get_result`.
 
 ### 1. Add 2D to 3D task
 ```ts
-const region = "gateway-eu.404.xyz";
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 
 const form = new FormData();
@@ -117,7 +123,7 @@ form.append("seed", "12345"); // Optional seed for reproducibility
 // import fs from "node:fs";
 // form.append("image", new Blob([fs.readFileSync("input_2d_image.jpg")]), "input_2d_image.jpg");
 
-const res = await fetch(`https://${region}:4443/add_task`, {
+const res = await fetch(`${baseUrl}/add_task`, {
   method: "POST",
   headers: { "x-api-key": apiKey },
   body: form,
@@ -128,11 +134,11 @@ console.log(await res.json());
 
 ### 2. Get result (SPZ, default)
 ```ts
-const region = "gateway-eu.404.xyz";
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 const taskId = "123e4567-e89b-12d3-a456-426614174000";
 
-const url = new URL(`https://${region}:4443/get_result`);
+const url = new URL(`${baseUrl}/get_result`);
 url.searchParams.set("id", taskId);
 
 const res = await fetch(url, { headers: { "x-api-key": apiKey } });
@@ -144,11 +150,11 @@ await Bun.write("result.spz", buf); // Bun
 
 ### 3. Get result (PLY)
 ```ts
-const region = "gateway-eu.404.xyz";
+const baseUrl = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 const apiKey = "{YOUR-API-KEY}";
 const taskId = "123e4567-e89b-12d3-a456-426614174000";
 
-const url = new URL(`https://${region}:4443/get_result`);
+const url = new URL(`${baseUrl}/get_result`);
 url.searchParams.set("id", taskId);
 url.searchParams.set("compress", "0");
 
@@ -162,8 +168,7 @@ await Bun.write("model.ply", buf); // Bun
 ### Complete 2D to 3D pipeline example (selectable output)
 ```ts
 const API_KEY = "{YOUR-API-KEY}";
-const GATEWAY = "gateway-eu.404.xyz";
-const BASE_URL = `https://${GATEWAY}:4443`;
+const BASE_URL = "https://api.dns.404.xyz"; // GeoDNS; replace with a regional URL if needed
 
 // Choose output format: "spz" (default, compressed) or "ply" (compress=0)
 const OUTPUT_FORMAT = "ply"; // or "spz"

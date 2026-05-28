@@ -19,7 +19,7 @@ use crate::raft::gateway_state::WorkerEventRef;
 
 use super::{current_time_ms, task_kind_label};
 
-// curl --http3 -X POST https://gateway-eu.404.xyz:4443/get_tasks \
+// curl --http3 -X POST https://api.dns.404.xyz/get_tasks \
 //   -H "content-type: application/json" \
 //   -d '{"validator_hotkey": "abc123", "worker_id": "worker-123", "signature": "signatureinbase64", "timestamp": "404_GATEWAY_1743657200", "requested_task_count": 10}'
 #[handler]

@@ -5,11 +5,13 @@ This page gives the minimal setup and where to find runnable examples.
 ## Quick start
 
 1) Get your API key from your `gen.404.xyz/account` page after signing in.
-2) Pick the closest gateway base URL:
+2) Pick a gateway base URL. The GeoDNS endpoint routes to the closest healthy region:
 
-- **EU**: `https://gateway-eu.404.xyz:4443`
-- **US-EAST**: `https://gateway-us-east.404.xyz:4443`
-- **US-WEST**: `https://gateway-us-west.404.xyz:4443`
+- **GeoDNS**: `https://api.dns.404.xyz`
+- **EU**: `https://api-eu.404.xyz`
+- **US East**: `https://api-us-east.404.xyz`
+- **US West**: `https://api-us-west.404.xyz`
+
 3) Send requests with the `x-api-key` header.
 
 ## Two pipelines
