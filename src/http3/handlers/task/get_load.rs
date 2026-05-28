@@ -6,7 +6,7 @@ use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::state::HttpState;
 
-// curl --http3 -X GET -k https://gateway-eu.404.xyz:4443/get_load
+// curl --http3 -X GET https://api.dns.404.xyz/get_load
 #[handler]
 pub async fn get_load_handler(
     depot: &mut Depot,
