@@ -18,7 +18,6 @@ pub struct MetricsEntry {
     pub failed_tasks: Counter,
     pub timeout_failed_tasks: Counter,
     pub tasks_received: Counter,
-    pub best_results_total: Gauge,
     pub tasks_in_progress: IntGauge,
     last_touched_ms: AtomicU64,
 }
@@ -49,7 +48,7 @@ struct MetricsInner {
 
     registry: Registry,
 
-    queue_len: Gauge,
+    queue_len: IntGauge,
     queue_time_avg: Gauge,
     queue_time_max: Gauge,
 
@@ -63,7 +62,6 @@ struct MetricsInner {
     failed_tasks: CounterVec,
     timeout_failed_tasks: CounterVec,
     tasks_received: CounterVec,
-    best_results_total: GaugeVec,
     tasks_in_progress: IntGaugeVec,
 
     map: HashMap<String, Arc<MetricsEntry>, RandomState>,
@@ -74,7 +72,7 @@ impl Metrics {
     pub fn new(alpha: f64) -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
-        let queue_len = Gauge::with_opts(opts!(
+        let queue_len = IntGauge::with_opts(opts!(
             "queue_len",
             "Number of tasks currently waiting in the queue"
         ))?;
@@ -147,13 +145,6 @@ impl Metrics {
             ),
             &["worker"],
         )?;
-        let best_completed_tasks = GaugeVec::new(
-            Opts::new(
-                "best_completed_tasks",
-                "Per-worker count of wins where this worker's result was selected as best",
-            ),
-            &["worker"],
-        )?;
         let tasks_in_progress = IntGaugeVec::new(
             Opts::new(
                 "tasks_in_progress",
@@ -170,7 +161,6 @@ impl Metrics {
         registry.register(Box::new(failed_tasks.clone()))?;
         registry.register(Box::new(timeout_failed_tasks.clone()))?;
         registry.register(Box::new(tasks_received.clone()))?;
-        registry.register(Box::new(best_completed_tasks.clone()))?;
         registry.register(Box::new(tasks_in_progress.clone()))?;
 
         let inner = MetricsInner {
@@ -186,7 +176,6 @@ impl Metrics {
             failed_tasks,
             timeout_failed_tasks,
             tasks_received,
-            best_results_total: best_completed_tasks,
             tasks_in_progress,
             requests_by_origin,
             map: HashMap::with_capacity_and_hasher(16, RandomState::default()),
@@ -209,8 +198,8 @@ impl Metrics {
         &self.inner.registry
     }
 
-    pub fn set_queue_len(&self, len: usize) {
-        self.inner.queue_len.set(len as f64);
+    pub fn queue_len_gauge(&self) -> IntGauge {
+        self.inner.queue_len.clone()
     }
 
     pub fn inc_task_completed_kind(&self, kind: TaskKind) {
@@ -233,7 +222,6 @@ impl Metrics {
                 failed_tasks: self.inner.failed_tasks.with_label_values(&[key]),
                 timeout_failed_tasks: self.inner.timeout_failed_tasks.with_label_values(&[key]),
                 tasks_received: self.inner.tasks_received.with_label_values(&[key]),
-                best_results_total: self.inner.best_results_total.with_label_values(&[key]),
                 tasks_in_progress: self.inner.tasks_in_progress.with_label_values(&[key]),
                 last_touched_ms: AtomicU64::new(now_ms),
             });
@@ -274,7 +262,6 @@ impl Metrics {
         let failed_tasks = self.inner.failed_tasks.clone();
         let timeout_failed_tasks = self.inner.timeout_failed_tasks.clone();
         let tasks_received = self.inner.tasks_received.clone();
-        let best_results_total = self.inner.best_results_total.clone();
         let tasks_in_progress = self.inner.tasks_in_progress.clone();
 
         self.inner
@@ -293,7 +280,6 @@ impl Metrics {
                 let _ = failed_tasks.remove_label_values(&labels);
                 let _ = timeout_failed_tasks.remove_label_values(&labels);
                 let _ = tasks_received.remove_label_values(&labels);
-                let _ = best_results_total.remove_label_values(&labels);
                 let _ = tasks_in_progress.remove_label_values(&labels);
                 false
             })
@@ -337,10 +323,6 @@ impl Metrics {
     pub async fn inc_timeout_failed(&self, key: &str) {
         let entry = self.get_entry(key).await;
         entry.timeout_failed_tasks.inc();
-    }
-
-    pub async fn inc_best_task(&self, key: &str) {
-        self.get_entry(key).await.best_results_total.inc();
     }
 
     pub async fn start_task(&self, key: &str) -> TaskInProgressGuard {

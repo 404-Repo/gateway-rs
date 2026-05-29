@@ -543,6 +543,24 @@ pub(crate) async fn update_company_api_key_limits_without_timestamp(
     sync_db_caches(h).await;
 }
 
+pub(crate) async fn update_company_worker_tags(h: &TestHarness, worker_tags: &[&str]) {
+    let tags: Vec<String> = worker_tags.iter().map(|tag| tag.to_string()).collect();
+    let updated = h
+        .core
+        .db_client
+        .execute(
+            "UPDATE companies
+             SET worker_tags = $1,
+                 updated_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+             WHERE id = $2",
+            &[&tags, &h.company_id],
+        )
+        .await
+        .expect("update company worker tags");
+    assert_eq!(updated, 1, "expected exactly one company row to update");
+    sync_db_caches(h).await;
+}
+
 pub(crate) async fn revoke_api_key_without_timestamp_no_sync(h: &TestHarness, api_key: &str) {
     let key_hash = api_key_hash_bytes(h, api_key);
     let updated = h

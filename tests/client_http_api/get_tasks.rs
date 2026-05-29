@@ -7,7 +7,7 @@ use crate::support::{
     build_harness_with_worker_whitelist, create_personal_api_key, multipart_body,
     purge_terminal_generation_task_in_db, read_response, sign_worker,
     timeout_generation_task_in_db, tiny_png_bytes, top_up_personal_api_key_balance,
-    update_personal_api_key_limits_without_timestamp,
+    update_company_worker_tags, update_personal_api_key_limits_without_timestamp,
 };
 
 #[tokio::test]
@@ -327,6 +327,99 @@ async fn get_tasks_multiple_models_returns_all_matches() {
         .collect();
     assert!(models.contains("404-3dgs"));
     assert!(models.contains("404-mesh"));
+}
+
+#[tokio::test]
+async fn get_tasks_requires_matching_worker_tag_for_tagged_company_task() {
+    let h = build_harness().await;
+    update_company_worker_tags(&h, &["acme", "premium"]).await;
+    let task_id = add_task_prompt_with_api_key(&h, &h.company_api_key, "company robot", None).await;
+
+    let (worker_hotkey, timestamp, signature) = sign_worker([5u8; 32]);
+    let no_match = TestClient::post("http://localhost/get_tasks")
+        .json(&serde_json::json!({
+            "worker_hotkey": worker_hotkey.to_string(),
+            "worker_id": "worker-no-match",
+            "signature": signature,
+            "timestamp": timestamp,
+            "requested_task_count": 1,
+            "model": "404-3dgs",
+            "worker_tags": ["other"]
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(no_match).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    assert_eq!(
+        payload
+            .get("tasks")
+            .and_then(|value| value.as_array())
+            .expect("tasks")
+            .len(),
+        0
+    );
+
+    let (worker_hotkey, timestamp, signature) = sign_worker([6u8; 32]);
+    let matching = TestClient::post("http://localhost/get_tasks")
+        .json(&serde_json::json!({
+            "worker_hotkey": worker_hotkey.to_string(),
+            "worker_id": "worker-match",
+            "signature": signature,
+            "timestamp": timestamp,
+            "requested_task_count": 1,
+            "model": "404-3dgs",
+            "worker_tags": ["premium"]
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(matching).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let tasks = payload
+        .get("tasks")
+        .and_then(|value| value.as_array())
+        .expect("tasks");
+    assert_eq!(tasks.len(), 1);
+    let returned_task_id = tasks[0]
+        .get("id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .expect("task id");
+    assert_eq!(returned_task_id, task_id);
+}
+
+#[tokio::test]
+async fn get_tasks_allows_untagged_company_task_without_worker_tags() {
+    let h = build_harness().await;
+    let task_id = add_task_prompt_with_api_key(&h, &h.company_api_key, "company robot", None).await;
+
+    let (worker_hotkey, timestamp, signature) = sign_worker([7u8; 32]);
+    let res = TestClient::post("http://localhost/get_tasks")
+        .json(&serde_json::json!({
+            "worker_hotkey": worker_hotkey.to_string(),
+            "worker_id": "worker-public",
+            "signature": signature,
+            "timestamp": timestamp,
+            "requested_task_count": 1,
+            "model": "404-3dgs"
+        }))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    let tasks = payload
+        .get("tasks")
+        .and_then(|value| value.as_array())
+        .expect("tasks");
+    assert_eq!(tasks.len(), 1);
+    let returned_task_id = tasks[0]
+        .get("id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .expect("task id");
+    assert_eq!(returned_task_id, task_id);
 }
 
 #[tokio::test]

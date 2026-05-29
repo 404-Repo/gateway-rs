@@ -617,13 +617,15 @@ pub async fn get_node_ids(
     Ok(ids)
 }
 
-fn build_task_queue(cfg: &NodeConfig) -> TaskQueue {
+fn build_task_queue(cfg: &NodeConfig, metrics: &Metrics) -> TaskQueue {
     TaskQueue::builder()
         .dup(cfg.basic.unique_workers_per_task)
         .ttl(cfg.basic.taskqueue_task_ttl)
         .cleanup_interval(cfg.basic.taskqueue_cleanup_interval)
         .default_model(cfg.model_config.default_model.clone())
         .models(cfg.model_config.models.keys().cloned())
+        .reservation_scan_cap(cfg.http.max_task_queue_len)
+        .queue_len_gauge(metrics.queue_len_gauge())
         .build()
 }
 
@@ -832,7 +834,8 @@ pub async fn start_gateway(
         RandomState::default(),
     ));
 
-    let task_queue = build_task_queue(cfg);
+    let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
+    let task_queue = build_task_queue(cfg, &metrics);
     let raft_config = build_raft_config(cfg)?;
     let gateway_shutdown = shutdown.child_token();
 
@@ -941,8 +944,6 @@ pub async fn start_gateway(
         Arc::clone(&api_key_validator),
         gateway_shutdown.clone(),
     ));
-    let metrics = Metrics::new(0.05).map_err(|e| anyhow::anyhow!(e))?;
-
     let rate_limit_queue = RateLimitMutationBuffer::default();
     let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
         initial_capacity: cfg.basic.taskmanager_initial_capacity,

@@ -7,6 +7,7 @@ use tracing::info;
 use super::connection::StmtKey;
 use super::task_lifecycle::GenerationBillingOwner;
 use super::{ActivityEventRow, Database, WorkerEventRow};
+use crate::api::request::normalize_worker_tags;
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyBillingOwnerRow {
@@ -33,10 +34,17 @@ pub struct GatewaySettingsRow {
     pub registered_window_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompanyMeta {
+    pub name: String,
+    pub concurrent_limit: u64,
+    pub daily_limit: u64,
+    pub worker_tags: Vec<String>,
+}
+
 type UserKeyHashesRow = (i64, String, u64, u64, Vec<Vec<u8>>);
 type UserMetaRow = (String, u64, u64);
-type TaskLimitsRow = (String, u64, u64);
-type CompanyMetaRow = (uuid::Uuid, TaskLimitsRow);
+type CompanyMetaRow = (uuid::Uuid, CompanyMeta);
 type CompanyKeyHashesRow = (uuid::Uuid, Vec<Vec<u8>>);
 
 fn nonnegative_i32_to_u64(value: i32, field_name: &str) -> Result<u64> {
@@ -58,12 +66,20 @@ fn positive_i64_to_u64(value: i64, field_name: &str) -> Result<u64> {
     Ok(value as u64)
 }
 
-fn decode_task_limits(name: String, concurrent: i32, daily: i32) -> Result<TaskLimitsRow> {
-    Ok((
+fn decode_company_meta_fields(
+    name: String,
+    concurrent: i32,
+    daily: i32,
+    worker_tags: Vec<String>,
+) -> Result<CompanyMeta> {
+    let worker_tags = normalize_worker_tags(&worker_tags)
+        .map_err(|message| anyhow!("Invalid company worker_tags for company {name}: {message}"))?;
+    Ok(CompanyMeta {
         name,
-        nonnegative_i32_to_u64(concurrent, "task_limit_concurrent")?,
-        nonnegative_i32_to_u64(daily, "task_limit_daily")?,
-    ))
+        concurrent_limit: nonnegative_i32_to_u64(concurrent, "task_limit_concurrent")?,
+        daily_limit: nonnegative_i32_to_u64(daily, "task_limit_daily")?,
+        worker_tags,
+    })
 }
 
 fn decode_user_key_hashes_row(row: Row) -> Result<UserKeyHashesRow> {
@@ -86,14 +102,19 @@ fn decode_company_meta_row(row: Row) -> Result<CompanyMetaRow> {
     let name: String = row.get("name");
     let concurrent: i32 = row.get("task_limit_concurrent");
     let daily: i32 = row.get("task_limit_daily");
-    Ok((id, decode_task_limits(name, concurrent, daily)?))
+    let worker_tags: Vec<String> = row.get("worker_tags");
+    Ok((
+        id,
+        decode_company_meta_fields(name, concurrent, daily, worker_tags)?,
+    ))
 }
 
-fn decode_company_limits_row(row: Row) -> Result<TaskLimitsRow> {
+fn decode_company_limits_row(row: Row) -> Result<CompanyMeta> {
     let name: String = row.get("name");
     let concurrent: i32 = row.get("task_limit_concurrent");
     let daily: i32 = row.get("task_limit_daily");
-    decode_task_limits(name, concurrent, daily)
+    let worker_tags: Vec<String> = row.get("worker_tags");
+    decode_company_meta_fields(name, concurrent, daily, worker_tags)
 }
 
 fn decode_user_meta_row(row: Row) -> Result<UserMetaRow> {
@@ -402,18 +423,18 @@ WHERE id = $1;
 "#;
 
     pub(super) const Q_FULL_COMPANIES_META: &'static str = r#"
-SELECT id, name, task_limit_concurrent, task_limit_daily FROM companies;
+SELECT id, name, task_limit_concurrent, task_limit_daily, worker_tags FROM companies;
 "#;
 
     pub(super) const Q_DELTA_COMPANIES_META: &'static str = r#"
-SELECT id, name, task_limit_concurrent, task_limit_daily
+SELECT id, name, task_limit_concurrent, task_limit_daily, worker_tags
 FROM companies
 WHERE (updated_at > $1 AND updated_at <= $2)
    OR (created_at > $1 AND created_at <= $2);
 "#;
 
     pub(super) const Q_COMPANY_META_BY_ID: &'static str = r#"
-SELECT id, name, task_limit_concurrent, task_limit_daily
+SELECT id, name, task_limit_concurrent, task_limit_daily, worker_tags
 FROM companies
 WHERE id = $1
 LIMIT 1;
@@ -566,7 +587,7 @@ created_at\
             .collect())
     }
 
-    pub async fn fetch_full_companies_meta(&self) -> Result<Vec<(uuid::Uuid, (String, u64, u64))>> {
+    pub async fn fetch_full_companies_meta(&self) -> Result<Vec<(uuid::Uuid, CompanyMeta)>> {
         let rows = self.query_prepared(StmtKey::FullCompaniesMeta, &[]).await?;
         rows.into_iter()
             .map(decode_company_meta_row)
@@ -577,7 +598,7 @@ created_at\
         &self,
         since: i64,
         until: i64,
-    ) -> Result<Vec<(uuid::Uuid, (String, u64, u64))>> {
+    ) -> Result<Vec<(uuid::Uuid, CompanyMeta)>> {
         let params: [&(dyn ToSql + Sync); 2] = [&since, &until];
         let rows = self
             .query_prepared(StmtKey::DeltaCompaniesMeta, &params)
@@ -587,10 +608,7 @@ created_at\
             .collect::<Result<Vec<_>>>()
     }
 
-    pub async fn fetch_company_meta(
-        &self,
-        company_id: uuid::Uuid,
-    ) -> Result<Option<(String, u64, u64)>> {
+    pub async fn fetch_company_meta(&self, company_id: uuid::Uuid) -> Result<Option<CompanyMeta>> {
         let params: [&(dyn ToSql + Sync); 1] = [&company_id];
         let rows = self
             .query_prepared(StmtKey::CompanyMetaById, &params)
@@ -750,5 +768,39 @@ fn append_copy_field(buf: &mut Vec<u8>, value: Option<&str>) {
             b'\r' => buf.extend_from_slice(b"\\r"),
             _ => buf.push(b),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_company_meta_fields;
+
+    #[test]
+    fn decode_company_meta_fields_normalizes_and_dedupes_worker_tags() {
+        let meta = decode_company_meta_fields(
+            "Acme".to_string(),
+            1,
+            10,
+            vec![
+                " Premium ".to_string(),
+                "premium".to_string(),
+                "ACME".to_string(),
+            ],
+        )
+        .expect("company meta should decode");
+
+        assert_eq!(meta.worker_tags, vec!["premium", "acme"]);
+    }
+
+    #[test]
+    fn decode_company_meta_fields_rejects_invalid_worker_tags() {
+        let error =
+            decode_company_meta_fields("Acme".to_string(), 1, 10, vec!["bad tag".to_string()])
+                .expect_err("invalid company worker tag should be rejected");
+
+        assert!(
+            error.to_string().contains("Invalid company worker_tags"),
+            "unexpected error: {error}"
+        );
     }
 }

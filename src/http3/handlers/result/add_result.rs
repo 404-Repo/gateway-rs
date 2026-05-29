@@ -226,15 +226,14 @@ pub async fn add_result_handler(
             .inc_task_completed(outcome.worker_hotkey.as_ref())
             .await;
         metrics.inc_task_completed_kind(task_kind);
+        if let Some(elapsed) = elapsed_secs {
+            metrics
+                .record_completion_time(outcome.worker_hotkey.as_ref(), elapsed)
+                .await;
+        }
     } else {
         metrics
             .inc_task_failed(outcome.worker_hotkey.as_ref())
-            .await;
-    }
-
-    if let Some(elapsed) = elapsed_secs {
-        metrics
-            .record_completion_time(outcome.worker_hotkey.as_ref(), elapsed)
             .await;
     }
 
