@@ -46,6 +46,7 @@ pub struct CompanyRateLimit {
     pub name: Arc<str>,
     pub concurrent_limit: u64,
     pub daily_limit: u64,
+    pub worker_tags: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -407,14 +408,13 @@ async fn populate_api_key_context(
             context.user_limits = lookup.user_limits;
             context.billing_owner = lookup.billing_owner;
             context.auth_lookup_blocked = lookup.auth_lookup_blocked;
-            if let (Some(cid), Some((name, concurrent, daily))) =
-                (lookup.company_id, lookup.company_info)
-            {
+            if let (Some(cid), Some(company_info)) = (lookup.company_id, lookup.company_info) {
                 context.company = Some(CompanyRateLimit {
                     id: cid,
-                    name,
-                    concurrent_limit: concurrent,
-                    daily_limit: daily,
+                    name: company_info.name,
+                    concurrent_limit: company_info.concurrent_limit,
+                    daily_limit: company_info.daily_limit,
+                    worker_tags: company_info.worker_tags,
                 });
             }
         }

@@ -70,7 +70,6 @@ pub struct NetworkConfig {
 #[serde(deny_unknown_fields)]
 pub struct RServerConfig {
     pub max_message_size: usize,
-    pub max_recv_buffer_size: usize,
     pub receive_message_timeout_ms: u64,
     pub max_idle_timeout_sec: u64,
     pub keep_alive_interval_sec: u64,
@@ -80,7 +79,6 @@ impl Default for RServerConfig {
     fn default() -> Self {
         Self {
             max_message_size: 256 * 1024,
-            max_recv_buffer_size: 8 * 1024,
             receive_message_timeout_ms: 2000,
             max_idle_timeout_sec: 4,
             keep_alive_interval_sec: 1,

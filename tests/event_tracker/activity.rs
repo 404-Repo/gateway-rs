@@ -101,6 +101,7 @@ async fn records_company_activity_with_image_task() {
             name: Arc::from("Acme"),
             concurrent_limit: 100,
             daily_limit: 1000,
+            worker_tags: Vec::new(),
         }),
         ..RateLimitContext::default()
     };

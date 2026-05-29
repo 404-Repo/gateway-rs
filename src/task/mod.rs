@@ -24,7 +24,10 @@ use crate::http3::rate_limits::RateLimitReservation;
 use crate::metrics::{Metrics, TaskInProgressGuard, TaskKind};
 
 const TASK_TIMED_OUT_REASON: &str = "Task timed out";
+#[cfg(not(test))]
 const PENDING_RESULT_COMMIT_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const PENDING_RESULT_COMMIT_GRACE: Duration = Duration::from_millis(150);
 const RATE_LIMIT_COMPLETION_REQUEST_ID_XOR: u128 = 0x7b2f_4d91_a6c3_e805_19fe_42ac_55d0_3b71;
 
 pub(crate) fn rate_limit_completion_request_id(task_id: Uuid) -> u128 {
@@ -82,6 +85,7 @@ struct TaskState {
     assigned_assignment_tokens: FoldHashMap<Hotkey, Uuid>,
     in_progress: FoldHashMap<Hotkey, TaskInProgressGuard>,
     pending_results: FoldHashMap<Hotkey, AddTaskResultRequest>,
+    pending_results_grace_until: Option<Instant>,
     seed: Option<i32>,
     finished_results_count: usize,
     rate_limit_reservation: Option<RateLimitReservation>,
@@ -191,6 +195,7 @@ impl TaskState {
             assigned_assignment_tokens: FoldHashMap::default(),
             in_progress: FoldHashMap::default(),
             pending_results: FoldHashMap::default(),
+            pending_results_grace_until: None,
             seed: Some(task.seed),
             finished_results_count: 0,
             rate_limit_reservation: None,
@@ -480,16 +485,23 @@ impl TaskManager {
                                                         continue;
                                                     }
                                                     if !state.pending_results.is_empty() {
-                                                        let deferred_expires_at =
-                                                            now + PENDING_RESULT_COMMIT_GRACE;
-                                                        state.task_expires_at =
-                                                            Some(deferred_expires_at);
-                                                        heap.push(Reverse((
-                                                            deferred_expires_at,
-                                                            ExpirationKind::Task as u8,
-                                                            task_id.as_u128(),
-                                                        )));
-                                                        continue;
+                                                        let grace_until = state
+                                                            .pending_results_grace_until
+                                                            .get_or_insert_with(|| {
+                                                                now + PENDING_RESULT_COMMIT_GRACE
+                                                            });
+                                                        if *grace_until > now {
+                                                            state.task_expires_at =
+                                                                Some(*grace_until);
+                                                            heap.push(Reverse((
+                                                                *grace_until,
+                                                                ExpirationKind::Task as u8,
+                                                                task_id.as_u128(),
+                                                            )));
+                                                            continue;
+                                                        }
+                                                        state.pending_results.clear();
+                                                        state.pending_results_grace_until = None;
                                                     }
                                                     let task_kind = state.task_kind.label();
                                                     let assigned_workers = std::mem::take(&mut state.assigned_workers);
@@ -685,6 +697,7 @@ impl TaskManager {
                     return Err(AddResultError::AlreadyStaged);
                 }
                 state.pending_results.insert(worker, result);
+                state.pending_results_grace_until = None;
                 Ok(())
             }
             Entry::Vacant(_) => Err(AddResultError::NotAssigned),
@@ -716,6 +729,9 @@ impl TaskManager {
                     let Some(result) = state.pending_results.remove(worker) else {
                         return Err(AddResultError::PendingResultMissing);
                     };
+                    if state.pending_results.is_empty() {
+                        state.pending_results_grace_until = None;
+                    }
                     let (outcome, results_expires_at, reservation) = Self::apply_committed_result(
                         state,
                         result,
@@ -737,7 +753,11 @@ impl TaskManager {
 
     pub async fn rollback_staged_result(&self, task_id: Uuid, worker: &Hotkey) {
         if let Entry::Occupied(mut entry) = self.inner.tasks.entry_async(task_id).await {
-            entry.get_mut().pending_results.remove(worker);
+            let state = entry.get_mut();
+            state.pending_results.remove(worker);
+            if state.pending_results.is_empty() {
+                state.pending_results_grace_until = None;
+            }
         }
     }
 
@@ -899,6 +919,9 @@ impl TaskManager {
                     .is_some_and(|stored_token| *stored_token != assignment_token)
                 {
                     state.pending_results.remove(&worker);
+                    if state.pending_results.is_empty() {
+                        state.pending_results_grace_until = None;
+                    }
                 }
                 state
                     .assigned_assignment_tokens

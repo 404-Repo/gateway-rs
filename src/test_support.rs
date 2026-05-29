@@ -104,6 +104,8 @@ pub async fn build_shared_harness_core(
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
         .default_model(config.model_config.default_model.clone())
         .models(config.model_config.models.keys().cloned())
+        .reservation_scan_cap(config.http.max_task_queue_len)
+        .queue_len_gauge(metrics.queue_len_gauge())
         .build();
 
     let db = Arc::new(Database::new_mock());

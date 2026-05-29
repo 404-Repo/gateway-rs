@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS companies (
   task_limit_concurrent INTEGER NOT NULL DEFAULT 1 CHECK (task_limit_concurrent >= 0),
   task_limit_daily INTEGER NOT NULL CHECK (task_limit_daily >= 0),
   ownership_state TEXT NOT NULL DEFAULT 'unassigned' CHECK (ownership_state IN ('unassigned', 'owned')),
+  worker_tags TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
   created_by_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
   created_at BIGINT NOT NULL,
   updated_at BIGINT NOT NULL
