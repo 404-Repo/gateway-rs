@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::Database;
-use super::data_access::ApiKeyBillingOwnerRow;
+use super::data_access::{ApiKeyBillingOwnerRow, CompanyMeta};
 use super::gateway_settings::{GatewayRuntimeSettingsConfig, GatewayRuntimeSettingsStore};
 use super::task_lifecycle::GenerationBillingOwner;
 use crate::crypto::crypto_provider::ApiKeyHasher;
@@ -36,6 +36,14 @@ struct CachedUserMeta {
     email: Option<Arc<str>>,
     concurrent_limit: u64,
     daily_limit: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedCompanyMeta {
+    pub name: Arc<str>,
+    pub concurrent_limit: u64,
+    pub daily_limit: u64,
+    pub worker_tags: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -92,7 +100,7 @@ pub struct ApiKeyValidator {
     // mapping from user_id -> cached metadata used by the gateway auth/rate-limit path
     users_meta: scc::HashMap<i64, CachedUserMeta, RandomState>,
     // mapping from company_id -> cached metadata used by the gateway auth/rate-limit path
-    companies: scc::HashMap<Uuid, (Arc<str>, u64, u64), RandomState>,
+    companies: scc::HashMap<Uuid, CachedCompanyMeta, RandomState>,
     // forward mapping: company_id -> list of api_key_hashes
     company_keys: scc::HashMap<Uuid, Vec<[u8; 32]>, RandomState>,
     // reverse mapping: api_key_hash -> key record for auth and billing
@@ -118,7 +126,7 @@ pub struct ApiKeyLookup {
     pub user_email: Option<Arc<str>>,
     pub user_limits: Option<(u64, u64)>,
     pub company_id: Option<Uuid>,
-    pub company_info: Option<(Arc<str>, u64, u64)>,
+    pub company_info: Option<CachedCompanyMeta>,
     pub billing_owner: Option<GenerationBillingOwner>,
     pub auth_lookup_blocked: bool,
 }
@@ -277,6 +285,15 @@ impl ApiKeyValidator {
 
     pub fn gateway_settings(&self) -> Arc<GatewayRuntimeSettingsStore> {
         Arc::clone(&self.gateway_settings)
+    }
+
+    fn cached_company_meta(meta: CompanyMeta) -> CachedCompanyMeta {
+        CachedCompanyMeta {
+            name: Arc::<str>::from(meta.name),
+            concurrent_limit: meta.concurrent_limit,
+            daily_limit: meta.daily_limit,
+            worker_tags: meta.worker_tags,
+        }
     }
 
     fn convert_hash(bytes: &[u8]) -> Option<[u8; 32]> {
@@ -510,9 +527,8 @@ impl ApiKeyValidator {
 
         if let Some(since) = Self::delta_since(last_sync_ms, now, "companies_meta") {
             let deltas = self.db.fetch_delta_companies_meta(since, now).await?;
-            for (cid, limits) in deltas {
-                let (name, concurrent, daily) = limits;
-                let value = (Arc::<str>::from(name), concurrent, daily);
+            for (cid, meta) in deltas {
+                let value = Self::cached_company_meta(meta);
                 match self.companies.entry_async(cid).await {
                     scc::hash_map::Entry::Occupied(mut entry) => {
                         *entry.get_mut() = value;
@@ -525,11 +541,10 @@ impl ApiKeyValidator {
         } else {
             let all = self.db.fetch_full_companies_meta().await?;
             self.companies.clear_async().await;
-            for (cid, limits) in all {
-                let (name, concurrent, daily) = limits;
+            for (cid, meta) in all {
                 let _ = self
                     .companies
-                    .insert_async(cid, (Arc::<str>::from(name), concurrent, daily))
+                    .insert_async(cid, Self::cached_company_meta(meta))
                     .await;
             }
         }
@@ -625,8 +640,8 @@ impl ApiKeyValidator {
                 Some(entry.get().clone())
             } else {
                 match self.db.fetch_company_meta(cid).await {
-                    Ok(Some((name, concurrent, daily))) => {
-                        let company_info = (Arc::<str>::from(name), concurrent, daily);
+                    Ok(Some(meta)) => {
+                        let company_info = Self::cached_company_meta(meta);
                         let _ = self.companies.insert_async(cid, company_info.clone()).await;
                         Some(company_info)
                     }
@@ -797,16 +812,39 @@ impl ApiKeyValidator {
         concurrent_limit: u64,
         daily_limit: u64,
     ) {
+        self.seed_company_key_with_worker_tags(
+            api_key,
+            company_id,
+            company_name,
+            concurrent_limit,
+            daily_limit,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub async fn seed_company_key_with_worker_tags(
+        &self,
+        api_key: &str,
+        company_id: Uuid,
+        company_name: &str,
+        concurrent_limit: u64,
+        daily_limit: u64,
+        worker_tags: Vec<String>,
+    ) {
         let key_hash = self.hasher.compute_hash_array(api_key);
         let _ = self
             .companies
             .insert_async(
                 company_id,
-                (
-                    Arc::<str>::from(company_name),
+                CachedCompanyMeta {
+                    name: Arc::<str>::from(company_name),
                     concurrent_limit,
                     daily_limit,
-                ),
+                    worker_tags,
+                },
             )
             .await;
         let _ = self

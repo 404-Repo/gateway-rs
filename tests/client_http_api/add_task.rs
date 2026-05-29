@@ -843,8 +843,8 @@ async fn add_task_company_key_limit_updates_take_effect_without_manual_updated_a
     let lookup = lookup_api_key(&h, &h.company_api_key).await;
     assert_eq!(lookup.company_id, Some(h.company_id));
     let company = lookup.company_info.expect("company lookup info");
-    assert_eq!(company.1, 100);
-    assert_eq!(company.2, 1);
+    assert_eq!(company.concurrent_limit, 100);
+    assert_eq!(company.daily_limit, 1);
 }
 
 #[tokio::test]

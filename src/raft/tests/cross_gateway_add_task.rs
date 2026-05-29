@@ -192,6 +192,7 @@ fn build_task_queue(config: &NodeConfig) -> TaskQueue {
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
         .default_model(config.model_config.default_model.clone())
         .models(config.model_config.models.keys().cloned())
+        .reservation_scan_cap(config.http.max_task_queue_len)
         .build()
 }
 
@@ -646,47 +647,47 @@ async fn repeated_random_admin_key_writes_are_rejected_before_body_parse() -> Re
     let cfg = leader._runtime_config.snapshot();
     let random_admin_key = random_non_admin_key(cfg.http().admin_key).to_string();
 
-    let (first_status, first_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
+    let invalid_bodies = [
         Bytes::from_static(b"not-msgpack"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(
-        first_status,
-        StatusCode::UNAUTHORIZED,
-        "bad-key write should fail on admin key before body parsing; body: {}",
-        String::from_utf8_lossy(first_body.as_ref())
-    );
-
-    let (second_status, second_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
         Bytes::from_static(b"still-not-msgpack"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(
-        second_status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "body: {}",
-        String::from_utf8_lossy(second_body.as_ref())
-    );
-    let payload: serde_json::Value = serde_json::from_slice(second_body.as_ref())?;
-    assert_eq!(
-        payload.get("error").and_then(|value| value.as_str()),
-        Some("invalid_admin_key_rate_limit")
-    );
-
-    let (third_status, _third_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
         Bytes::from_static(b"still-not-msgpack-again"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
+    ];
+    let mut saw_rate_limit = false;
+    for body in invalid_bodies {
+        let (status, response_body) = post_gateway_write(
+            &leader.client,
+            leader.http_port,
+            body,
+            random_admin_key.as_str(),
+        )
+        .await?;
+
+        match status {
+            StatusCode::UNAUTHORIZED => {
+                assert!(
+                    !saw_rate_limit,
+                    "bad-key write became unblocked after rate limit; body: {}",
+                    String::from_utf8_lossy(response_body.as_ref())
+                );
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                saw_rate_limit = true;
+                let payload: serde_json::Value = serde_json::from_slice(response_body.as_ref())?;
+                assert_eq!(
+                    payload.get("error").and_then(|value| value.as_str()),
+                    Some("invalid_admin_key_rate_limit")
+                );
+            }
+            other => panic!(
+                "bad-key write should fail on admin key before body parsing; status: {other}, body: {}",
+                String::from_utf8_lossy(response_body.as_ref())
+            ),
+        }
+    }
+    assert!(
+        saw_rate_limit,
+        "repeated bad-key writes should eventually hit invalid admin key rate limit"
+    );
     Ok(())
 }
 

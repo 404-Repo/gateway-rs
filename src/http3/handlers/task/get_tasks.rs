@@ -5,8 +5,9 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::api::request::GetTasksRequest;
+use crate::api::request::{GetTasksRequest, normalize_worker_tags};
 use crate::api::response::{AssignedTask, GetTasksResponse};
+use crate::common::queue::WorkerRouting;
 use crate::db::{RecordedGenerationTaskAssignment, RecordedGenerationTaskAssignmentAction};
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
@@ -69,6 +70,13 @@ pub async fn get_tasks_handler(
 
         models
     };
+    let worker_tags = normalize_worker_tags(&get_tasks.worker_tags).map_err(|message| {
+        ServerError::BadRequestJson(serde_json::json!({
+            "error": "invalid_field",
+            "field": "worker_tags",
+            "message": message,
+        }))
+    })?;
 
     info!(
         worker_hotkey = %get_tasks.worker_hotkey,
@@ -76,6 +84,7 @@ pub async fn get_tasks_handler(
         requested_count = get_tasks.requested_task_count,
         model_filter_count = model_filter.len(),
         models = ?model_filter,
+        worker_tag_count = worker_tags.len(),
         "Worker requested tasks"
     );
 
@@ -85,20 +94,20 @@ pub async fn get_tasks_handler(
         .map_err(|e| ServerError::Internal(format!("Failed to obtain gateways: {:?}", e)))?;
     let gateway_count = gateways.len();
 
+    let max_task_queue_len = state.gateway_state().max_task_queue_len();
     let requested_task_count = get_tasks
         .requested_task_count
-        .min(state.gateway_state().max_task_queue_len().max(1));
+        .min(max_task_queue_len.max(1));
+    queue.set_reservation_scan_cap(max_task_queue_len);
     let mut task_ids = Vec::with_capacity(requested_task_count);
     let task_manager = gateway_state.task_manager();
-    let mut deliveries = queue.reserve_for_models(
+    let mut deliveries = queue.reserve_for_models_with_routing(
         requested_task_count,
         &get_tasks.worker_hotkey,
         model_filter.as_slice(),
+        WorkerRouting::from_tags(worker_tags.as_slice()),
     );
     for delivery in &deliveries {
-        if let Some(dur) = delivery.duration() {
-            metrics.record_queue_time(dur.as_secs_f64());
-        }
         task_ids.push(delivery.task().id);
     }
     let reserved_count = task_ids.len();
@@ -177,7 +186,10 @@ pub async fn get_tasks_handler(
                             let assignment_token = assignment
                                 .assignment_token
                                 .expect("assigned task is missing assignment token");
-                            let task = delivery.commit().0;
+                            let (task, queue_duration) = delivery.commit();
+                            if let Some(duration) = queue_duration {
+                                metrics.record_queue_time(duration.as_secs_f64());
+                            }
                             tasks.push(AssignedTask {
                                 task: task.clone(),
                                 assignment_token,
@@ -215,8 +227,6 @@ pub async fn get_tasks_handler(
             })),
         });
     }
-
-    metrics.set_queue_len(queue.len());
 
     gateway_state.update_task_acquisition().map_err(|e| {
         ServerError::Internal(format!(

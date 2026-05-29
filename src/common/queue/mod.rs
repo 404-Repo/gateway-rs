@@ -1,9 +1,10 @@
+use crossbeam_skiplist::SkipMap;
 use foldhash::fast::RandomState;
 use foldhash::{HashMap as FoldHashMap, HashSet as FoldHashSet};
 use moka::sync::Cache;
+use prometheus::IntGauge;
 use scc::HashMap;
 use scc::hash_map::Entry as SccEntry;
-use sdd::Queue;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,15 +21,77 @@ const DEFAULT_DUP_COUNT: usize = 1;
 const DEFAULT_TTL_SECS: u64 = 300;
 const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 1;
 const EXHAUSTED_CACHE_MAX_CAPACITY: u64 = 16_384;
+const SCAN_CURSOR_CACHE_MAX_CAPACITY: u64 = 16_384;
 const MAX_CLEANUP_SCAN_PER_TICK: usize = 64;
+const DEFAULT_RESERVATION_SCAN_CAP: usize = 512;
 const ENTRY_COUNT_BITS: u64 = 30;
 const ENTRY_COUNT_MASK: u64 = (1u64 << ENTRY_COUNT_BITS) - 1;
 const ENTRY_LEASED_SHIFT: u64 = ENTRY_COUNT_BITS;
-const ENTRY_QUEUED_FLAG: u64 = 1u64 << 60;
 const ENTRY_RETIRED_FLAG: u64 = 1u64 << 61;
 const MAX_DUP_SLOTS: usize = ENTRY_COUNT_MASK as usize;
 
 type SentKey = (Uuid, usize);
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct WorkerRoutingKey {
+    tags: Arc<[String]>,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ExhaustedKey {
+    hotkey: Hotkey,
+    routing: WorkerRoutingKey,
+}
+
+#[derive(Clone, Default)]
+pub struct TaskRouting {
+    required_worker_tags: Arc<[String]>,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct WorkerRouting<'a> {
+    tags: &'a [String],
+}
+
+impl TaskRouting {
+    pub fn with_required_worker_tags(required_worker_tags: Vec<String>) -> Self {
+        Self {
+            required_worker_tags: Arc::from(required_worker_tags),
+        }
+    }
+
+    fn matches_worker(&self, worker: WorkerRouting<'_>) -> bool {
+        self.required_worker_tags.is_empty()
+            || self
+                .required_worker_tags
+                .iter()
+                .any(|required| worker.tags.iter().any(|tag| tag == required))
+    }
+}
+
+impl<'a> WorkerRouting<'a> {
+    pub fn from_tags(tags: &'a [String]) -> Self {
+        Self { tags }
+    }
+
+    fn cache_key(self) -> WorkerRoutingKey {
+        let mut tags = self.tags.to_vec();
+        tags.sort();
+        tags.dedup();
+        WorkerRoutingKey {
+            tags: Arc::from(tags),
+        }
+    }
+}
+
+impl ExhaustedKey {
+    fn new(hotkey: &Hotkey, routing: WorkerRoutingKey) -> Self {
+        Self {
+            hotkey: hotkey.clone(),
+            routing,
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 struct ActiveTaskState {
@@ -38,6 +101,7 @@ struct ActiveTaskState {
 
 struct QueueEntry {
     item: Arc<Task>,
+    routing: TaskRouting,
     state: AtomicU64,
     timestamp: Instant,
     generation: usize,
@@ -45,30 +109,25 @@ struct QueueEntry {
 
 #[derive(Copy, Clone)]
 struct LeaseAcquireOutcome {
-    available_after: usize,
     final_candidate: bool,
 }
 
 #[derive(Copy, Clone, Default)]
 struct LeaseReleaseOutcome {
     generation_bump: bool,
-    requeue: bool,
     retire_now: bool,
 }
 
 impl QueueEntry {
     fn initial_state(available: usize) -> u64 {
         debug_assert!(available <= MAX_DUP_SLOTS);
-        Self::pack_state(available, 0, false, false)
+        Self::pack_state(available, 0, false)
     }
 
-    fn pack_state(available: usize, leased: usize, queued: bool, retired: bool) -> u64 {
+    fn pack_state(available: usize, leased: usize, retired: bool) -> u64 {
         debug_assert!(available <= MAX_DUP_SLOTS);
         debug_assert!(leased <= MAX_DUP_SLOTS);
         let mut state = (available as u64) | ((leased as u64) << ENTRY_LEASED_SHIFT);
-        if queued {
-            state |= ENTRY_QUEUED_FLAG;
-        }
         if retired {
             state |= ENTRY_RETIRED_FLAG;
         }
@@ -81,10 +140,6 @@ impl QueueEntry {
 
     fn leased_slots(state: u64) -> usize {
         ((state >> ENTRY_LEASED_SHIFT) & ENTRY_COUNT_MASK) as usize
-    }
-
-    fn is_queued(state: u64) -> bool {
-        state & ENTRY_QUEUED_FLAG != 0
     }
 
     fn is_retired(state: u64) -> bool {
@@ -104,45 +159,6 @@ impl QueueEntry {
         self.timestamp.elapsed() > ttl
     }
 
-    fn clear_queued_flag(&self) {
-        let mut state = self.load_state();
-        loop {
-            if !Self::is_queued(state) {
-                return;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state & !ENTRY_QUEUED_FLAG,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
-    fn try_mark_queued(&self) -> bool {
-        let mut state = self.load_state();
-        loop {
-            if Self::is_retired(state)
-                || Self::is_queued(state)
-                || Self::available_slots(state) == 0
-            {
-                return false;
-            }
-            match self.state.compare_exchange_weak(
-                state,
-                state | ENTRY_QUEUED_FLAG,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
-    }
-
     fn try_acquire_lease(&self) -> Option<LeaseAcquireOutcome> {
         let mut state = self.load_state();
         loop {
@@ -156,14 +172,13 @@ impl QueueEntry {
                 return None;
             }
 
-            let next = Self::pack_state(available - 1, leased + 1, Self::is_queued(state), false);
+            let next = Self::pack_state(available - 1, leased + 1, false);
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
                     return Some(LeaseAcquireOutcome {
-                        available_after: available - 1,
                         final_candidate: available == 1 && leased == 0,
                     });
                 }
@@ -172,16 +187,16 @@ impl QueueEntry {
         }
     }
 
-    fn retire_after_pop(&self) -> bool {
+    fn retire_if_idle(&self) -> bool {
         let mut state = self.load_state();
         loop {
+            let leased = Self::leased_slots(state);
             if Self::is_retired(state) {
-                return false;
+                return leased == 0;
             }
 
-            let leased = Self::leased_slots(state);
             let retire_now = leased == 0;
-            let next = Self::pack_state(0, leased, false, retire_now);
+            let next = Self::pack_state(0, leased, true);
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
@@ -197,15 +212,14 @@ impl QueueEntry {
         loop {
             let available = Self::available_slots(state);
             let leased = Self::leased_slots(state);
-            let queued = Self::is_queued(state);
             let retired = Self::is_retired(state);
             if leased == 0 {
                 return false;
             }
 
             let next_leased = leased - 1;
-            let retire_now = !retired && available == 0 && next_leased == 0 && !queued;
-            let next = Self::pack_state(available, next_leased, queued, retired || retire_now);
+            let retire_now = next_leased == 0 && (retired || available == 0);
+            let next = Self::pack_state(available, next_leased, retired || retire_now);
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
@@ -221,19 +235,18 @@ impl QueueEntry {
         loop {
             let available = Self::available_slots(state);
             let leased = Self::leased_slots(state);
-            let queued = Self::is_queued(state);
             let retired = Self::is_retired(state);
             if leased == 0 {
                 return LeaseReleaseOutcome::default();
             }
 
             let next_leased = leased - 1;
-            let (next_available, generation_bump, requeue, retire_now) = if expired {
-                (0, false, false, !retired && next_leased == 0 && !queued)
+            let (next_available, generation_bump, retire_now) = if expired || retired {
+                (0, false, next_leased == 0)
             } else {
-                (available + 1, available == 0, !queued, false)
+                (available + 1, available == 0, false)
             };
-            let next = Self::pack_state(next_available, next_leased, queued, retired || retire_now);
+            let next = Self::pack_state(next_available, next_leased, retired || expired);
             match self
                 .state
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
@@ -241,7 +254,6 @@ impl QueueEntry {
                 Ok(_) => {
                     return LeaseReleaseOutcome {
                         generation_bump,
-                        requeue,
                         retire_now,
                     };
                 }
@@ -252,117 +264,102 @@ impl QueueEntry {
 }
 
 struct ModelBucket {
-    q: Queue<Arc<QueueEntry>>,
+    entries: SkipMap<u64, Arc<QueueEntry>>,
+    next_seq: AtomicU64,
     live: AtomicUsize,
-    in_flight: AtomicUsize,
     activity: AtomicUsize,
     generation: AtomicUsize,
-    exhausted_by_hotkey: Cache<Hotkey, usize, RandomState>,
+    exhausted_by_worker: Cache<ExhaustedKey, usize, RandomState>,
+    scan_cursor_by_worker: Cache<ExhaustedKey, u64, RandomState>,
 }
 
 impl Default for ModelBucket {
     fn default() -> Self {
         Self {
-            q: Queue::default(),
+            entries: SkipMap::new(),
+            next_seq: AtomicU64::new(0),
             live: AtomicUsize::new(0),
-            in_flight: AtomicUsize::new(0),
             activity: AtomicUsize::new(0),
             generation: AtomicUsize::new(0),
-            exhausted_by_hotkey: Cache::builder()
+            exhausted_by_worker: Cache::builder()
                 .max_capacity(EXHAUSTED_CACHE_MAX_CAPACITY)
+                .build_with_hasher(RandomState::default()),
+            scan_cursor_by_worker: Cache::builder()
+                .max_capacity(SCAN_CURSOR_CACHE_MAX_CAPACITY)
                 .build_with_hasher(RandomState::default()),
         }
     }
 }
 
 impl ModelBucket {
-    fn pop_visible_entry(&self) -> Option<Arc<QueueEntry>> {
-        self.pop_visible_entry_inner(|| {})
-    }
-
-    fn pop_visible_entry_inner<F: FnOnce()>(&self, after_pop: F) -> Option<Arc<QueueEntry>> {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        match self.q.pop() {
-            Some(shared) => {
-                let entry = (**shared).clone();
-                entry.clear_queued_flag();
-                after_pop();
-                self.activity.fetch_add(1, Ordering::AcqRel);
-                Some(entry)
-            }
-            None => {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
-                None
-            }
-        }
-    }
-
     #[cfg(test)]
-    fn pop_visible_entry_with_hook<F: FnOnce()>(&self, after_pop: F) -> Option<Arc<QueueEntry>> {
-        self.pop_visible_entry_inner(after_pop)
-    }
-
-    fn push_ready(&self, entry: Arc<QueueEntry>) -> bool {
-        if !entry.try_mark_queued() {
-            return false;
-        }
-        self.q.push(entry);
-        self.activity.fetch_add(1, Ordering::AcqRel);
-        true
-    }
-
-    fn finish_entry(&self, entry: Arc<QueueEntry>, requeue: bool) -> bool {
-        let requeued = requeue && self.push_ready(entry);
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
-        requeued
+    fn snapshot_entries(&self, limit: usize) -> Vec<(u64, Arc<QueueEntry>)> {
+        self.entries
+            .iter()
+            .take(limit)
+            .map(|entry| (*entry.key(), Arc::clone(entry.value())))
+            .collect()
     }
 
     fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn clear_exhausted_hotkey(&self, hotkey: &Hotkey) {
-        self.exhausted_by_hotkey.invalidate(hotkey);
+    fn clear_exhausted(&self, key: &ExhaustedKey) {
+        self.exhausted_by_worker.invalidate(key);
+    }
+
+    fn scan_cursor(&self, key: &ExhaustedKey) -> u64 {
+        self.scan_cursor_by_worker.get(key).unwrap_or(0)
+    }
+
+    fn update_scan_cursor(&self, key: &ExhaustedKey, seq: u64) {
+        self.scan_cursor_by_worker.insert(key.clone(), seq);
+    }
+
+    fn rewind_scan_cursor(&self, key: &ExhaustedKey, seq: u64) {
+        self.scan_cursor_by_worker.insert(key.clone(), seq);
     }
 
     fn enqueue_new(&self, entry: Arc<QueueEntry>) {
-        let _ = self.push_ready(entry);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.entries.insert(seq, entry);
         self.live.fetch_add(1, Ordering::Relaxed);
         // Readers use the generation acquire-load as the publication point for
         // the widened live/activity state.
+        self.activity.fetch_add(1, Ordering::AcqRel);
         self.bump_generation();
     }
 
-    fn exhausted_generation(&self, hotkey: &Hotkey) -> Option<usize> {
-        self.exhausted_by_hotkey.get(hotkey)
+    fn remove_entry(&self, seq: u64) -> bool {
+        if self.entries.remove(&seq).is_none() {
+            return false;
+        }
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.activity.fetch_add(1, Ordering::AcqRel);
+        self.bump_generation();
+        true
+    }
+
+    fn exhausted_generation(&self, key: &ExhaustedKey) -> Option<usize> {
+        self.exhausted_by_worker.get(key)
     }
 
     fn mark_exhausted_if_stable(
         &self,
-        hotkey: &Hotkey,
+        key: &ExhaustedKey,
         generation: usize,
         start_activity: usize,
         local_activity: usize,
-        start_in_flight: usize,
     ) {
-        if start_in_flight != 0 {
-            return;
-        }
         if self.generation.load(Ordering::Acquire) != generation {
-            return;
-        }
-        if self.in_flight.load(Ordering::Acquire) != 0 {
             return;
         }
         if self.activity.load(Ordering::Acquire) != start_activity.wrapping_add(local_activity) {
             return;
         }
 
-        self.exhausted_by_hotkey.insert(hotkey.clone(), generation);
-    }
-
-    fn finish_live_entry(&self) {
-        self.live.fetch_sub(1, Ordering::Relaxed);
+        self.exhausted_by_worker.insert(key.clone(), generation);
     }
 }
 
@@ -376,8 +373,10 @@ struct Inner {
     active_ids: HashMap<Uuid, ActiveTaskState, RandomState>,
     ttl: Duration,
     len: AtomicUsize,
+    queue_len_gauge: Option<IntGauge>,
     next_bucket: AtomicUsize,
     next_generation: AtomicUsize,
+    reservation_scan_cap: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -394,9 +393,11 @@ pub struct TaskQueueReservation {
 pub struct TaskQueueDelivery {
     inner: Arc<Inner>,
     bucket: Arc<ModelBucket>,
+    seq: u64,
     entry: Option<Arc<QueueEntry>>,
     key: Option<SentKey>,
     hotkey: Option<Hotkey>,
+    exhausted_key: ExhaustedKey,
     task: Task,
     duration: Option<Duration>,
 }
@@ -407,6 +408,8 @@ pub struct TaskQueueBuilder {
     cleanup_interval: Duration,
     default_model: Option<String>,
     models: Vec<String>,
+    queue_len_gauge: Option<IntGauge>,
+    reservation_scan_cap: usize,
 }
 
 impl TaskQueueBuilder {
@@ -436,6 +439,16 @@ impl TaskQueueBuilder {
         S: Into<String>,
     {
         self.models = models.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn queue_len_gauge(mut self, gauge: IntGauge) -> Self {
+        self.queue_len_gauge = Some(gauge);
+        self
+    }
+
+    pub fn reservation_scan_cap(mut self, cap: usize) -> Self {
+        self.reservation_scan_cap = cap.max(DEFAULT_RESERVATION_SCAN_CAP);
         self
     }
 
@@ -477,9 +490,14 @@ impl TaskQueueBuilder {
             ),
             ttl: self.ttl,
             len: AtomicUsize::new(0),
+            queue_len_gauge: self.queue_len_gauge,
             next_bucket: AtomicUsize::new(0),
             next_generation: AtomicUsize::new(1),
+            reservation_scan_cap: AtomicUsize::new(
+                self.reservation_scan_cap.max(DEFAULT_RESERVATION_SCAN_CAP),
+            ),
         });
+        inner.observe_len(0);
         let cleanup_interval = self.cleanup_interval;
         let weak_inner = Arc::downgrade(&inner);
         task::spawn(async move {
@@ -491,21 +509,21 @@ impl TaskQueueBuilder {
                         .live
                         .load(Ordering::Acquire)
                         .min(MAX_CLEANUP_SCAN_PER_TICK);
-                    for _ in 0..scan_limit {
-                        let Some(entry) = bucket.pop_visible_entry() else {
-                            break;
-                        };
+                    for index_entry in bucket.entries.iter().take(scan_limit) {
+                        let seq = *index_entry.key();
+                        let entry = Arc::clone(index_entry.value());
+                        drop(index_entry);
 
-                        if entry.is_expired(inner.ttl) || !entry.has_visible_capacity() {
-                            let retired_now = entry.retire_after_pop();
+                        let state = entry.load_state();
+                        let idle_without_capacity = QueueEntry::available_slots(state) == 0
+                            && QueueEntry::leased_slots(state) == 0;
+                        if entry.is_expired(inner.ttl) || idle_without_capacity {
+                            let retired_now = entry.retire_if_idle();
                             let task_id = *entry.item.id();
                             let generation = entry.generation;
-                            bucket.finish_entry(entry, false);
                             if retired_now {
-                                inner.retire_entry(bucket.as_ref(), task_id, generation);
+                                inner.retire_entry(bucket.as_ref(), seq, task_id, generation);
                             }
-                        } else {
-                            bucket.finish_entry(entry, true);
                         }
                     }
                 }
@@ -520,6 +538,11 @@ impl TaskQueueReservation {
         self.inner.push_internal(task);
         self.committed = true;
     }
+
+    pub fn push_with_routing(mut self, task: Task, routing: TaskRouting) {
+        self.inner.push_internal_with_routing(task, routing);
+        self.committed = true;
+    }
 }
 
 impl TaskQueueDelivery {
@@ -527,6 +550,8 @@ impl TaskQueueDelivery {
         &self.task
     }
 
+    /// Returns a pre-commit duration hint for the final lease. The duration
+    /// returned by `commit()` is authoritative because retirement happens there.
     pub fn duration(&self) -> Option<Duration> {
         self.duration
     }
@@ -545,7 +570,7 @@ impl TaskQueueDelivery {
 
         if retired_now {
             self.inner
-                .retire_entry(self.bucket.as_ref(), self.task.id, generation);
+                .retire_entry(self.bucket.as_ref(), self.seq, self.task.id, generation);
         }
 
         let duration = retired_now.then(|| entry.timestamp.elapsed());
@@ -568,25 +593,30 @@ impl TaskQueueDelivery {
         let Some(entry) = self.entry.take() else {
             return;
         };
+        let expired = force_retire || entry.is_expired(self.inner.ttl);
         if let Some(key) = self.key.take()
             && let Some(hotkey) = self.hotkey.take()
             && clear_hotkey_delivery
         {
             self.inner.clear_sent_for_hotkey(key, &hotkey);
-            self.bucket.clear_exhausted_hotkey(&hotkey);
+            self.bucket.clear_exhausted(&self.exhausted_key);
+            if !expired {
+                self.bucket
+                    .rewind_scan_cursor(&self.exhausted_key, self.seq);
+            }
         }
 
-        let expired = force_retire || entry.is_expired(self.inner.ttl);
         let outcome = entry.finish_rollback(expired);
         if outcome.generation_bump {
             self.bucket.bump_generation();
         }
-        if outcome.requeue {
-            let _ = self.bucket.push_ready(Arc::clone(&entry));
-        }
         if outcome.retire_now {
-            self.inner
-                .retire_entry(self.bucket.as_ref(), self.task.id, entry.generation);
+            self.inner.retire_entry(
+                self.bucket.as_ref(),
+                self.seq,
+                self.task.id,
+                entry.generation,
+            );
         }
     }
 }
@@ -594,7 +624,7 @@ impl TaskQueueDelivery {
 impl Drop for TaskQueueReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.inner.len.fetch_sub(1, Ordering::Relaxed);
+            self.inner.decrement_len();
         }
     }
 }
@@ -606,6 +636,52 @@ impl Drop for TaskQueueDelivery {
 }
 
 impl Inner {
+    fn observe_len(&self, len: usize) {
+        if let Some(gauge) = self.queue_len_gauge.as_ref() {
+            gauge.set(len.try_into().unwrap_or(i64::MAX));
+        }
+    }
+
+    fn increment_len(&self) {
+        let len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
+        self.observe_len(len);
+    }
+
+    fn decrement_len(&self) {
+        loop {
+            let len = self.len.load(Ordering::Relaxed);
+            if len == 0 {
+                self.observe_len(0);
+                return;
+            }
+            if self
+                .len
+                .compare_exchange_weak(len, len - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.observe_len(len - 1);
+                return;
+            }
+        }
+    }
+
+    fn try_increment_len(&self, max_len: usize) -> bool {
+        loop {
+            let len = self.len.load(Ordering::Relaxed);
+            if len >= max_len {
+                return false;
+            }
+            if self
+                .len
+                .compare_exchange_weak(len, len + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.observe_len(len + 1);
+                return true;
+            }
+        }
+    }
+
     fn clear_sent_for_task_generation(&self, task_id: Uuid, generation: usize) {
         let _ = self.sent.remove_sync(&(task_id, generation));
     }
@@ -623,10 +699,11 @@ impl Inner {
         }
     }
 
-    fn retire_entry(&self, bucket: &ModelBucket, task_id: Uuid, generation: usize) {
-        bucket.finish_live_entry();
-        self.len.fetch_sub(1, Ordering::Relaxed);
-        self.release_task_id(task_id, generation);
+    fn retire_entry(&self, bucket: &ModelBucket, seq: u64, task_id: Uuid, generation: usize) {
+        if bucket.remove_entry(seq) {
+            self.decrement_len();
+            self.release_task_id(task_id, generation);
+        }
     }
 
     fn acquire_task_generation(&self, task_id: Uuid) -> usize {
@@ -687,11 +764,16 @@ impl Inner {
     }
 
     fn push_internal(&self, task: Task) {
+        self.push_internal_with_routing(task, TaskRouting::default());
+    }
+
+    fn push_internal_with_routing(&self, task: Task, routing: TaskRouting) {
         let (task, model) = self.normalize_task(task);
         let task_id = *task.id();
         let generation = self.acquire_task_generation(task_id);
         let entry = Arc::new(QueueEntry {
             item: Arc::new(task),
+            routing,
             state: AtomicU64::new(QueueEntry::initial_state(self.dup)),
             timestamp: Instant::now(),
             generation,
@@ -708,33 +790,25 @@ impl TaskQueue {
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
             default_model: None,
             models: Vec::new(),
+            queue_len_gauge: None,
+            reservation_scan_cap: DEFAULT_RESERVATION_SCAN_CAP,
         }
     }
 
     pub fn push(&self, task: Task) {
-        self.inner.len.fetch_add(1, Ordering::Relaxed);
+        self.inner.increment_len();
         self.inner.push_internal(task);
     }
 
     pub fn try_reserve(&self, max_len: usize) -> Option<TaskQueueReservation> {
-        loop {
-            let len = self.inner.len.load(Ordering::Relaxed);
-            if len >= max_len {
-                return None;
-            }
-            if self
-                .inner
-                .len
-                .compare_exchange_weak(len, len + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Some(TaskQueueReservation {
-                    inner: Arc::clone(&self.inner),
-                    committed: false,
-                    _marker: PhantomData,
-                });
-            }
+        if !self.inner.try_increment_len(max_len) {
+            return None;
         }
+        Some(TaskQueueReservation {
+            inner: Arc::clone(&self.inner),
+            committed: false,
+            _marker: PhantomData,
+        })
     }
 
     #[allow(dead_code)]
@@ -754,6 +828,7 @@ impl TaskQueue {
         self.reserve_from_bucket_refs(
             num,
             hotkey,
+            WorkerRouting::default(),
             self.inner
                 .bucket_order
                 .iter()
@@ -788,13 +863,33 @@ impl TaskQueue {
     where
         S: AsRef<str>,
     {
+        self.reserve_for_models_with_routing(num, hotkey, models, WorkerRouting::default())
+    }
+
+    pub fn reserve_for_models_with_routing<S>(
+        &self,
+        num: usize,
+        hotkey: &Hotkey,
+        models: &[S],
+        routing: WorkerRouting<'_>,
+    ) -> Vec<TaskQueueDelivery>
+    where
+        S: AsRef<str>,
+    {
         self.reserve_from_bucket_refs(
             num,
             hotkey,
+            routing,
             models
                 .iter()
                 .filter_map(|model| self.inner.buckets.get(model.as_ref()).cloned()),
         )
+    }
+
+    pub fn set_reservation_scan_cap(&self, cap: usize) {
+        self.inner
+            .reservation_scan_cap
+            .store(cap.max(DEFAULT_RESERVATION_SCAN_CAP), Ordering::Release);
     }
 
     fn pop_from_bucket_refs<I>(
@@ -806,7 +901,7 @@ impl TaskQueue {
     where
         I: IntoIterator<Item = Arc<ModelBucket>>,
     {
-        self.reserve_from_bucket_refs(num, hotkey, buckets_iter)
+        self.reserve_from_bucket_refs(num, hotkey, WorkerRouting::default(), buckets_iter)
             .into_iter()
             .map(TaskQueueDelivery::commit)
             .collect()
@@ -816,6 +911,7 @@ impl TaskQueue {
         &self,
         num: usize,
         hotkey: &Hotkey,
+        routing: WorkerRouting<'_>,
         buckets_iter: I,
     ) -> Vec<TaskQueueDelivery>
     where
@@ -840,7 +936,7 @@ impl TaskQueue {
                     break;
                 }
                 let bucket = &buckets[(start + offset) % buckets.len()];
-                if let Some(item) = self.reserve_one_from_bucket(bucket, hotkey) {
+                if let Some(item) = self.reserve_one_from_bucket(bucket, hotkey, routing) {
                     progressed = true;
                     result.push(item);
                 }
@@ -858,99 +954,170 @@ impl TaskQueue {
         &self,
         bucket: &Arc<ModelBucket>,
         hotkey: &Hotkey,
+        routing: WorkerRouting<'_>,
     ) -> Option<TaskQueueDelivery> {
+        let routing_key = routing.cache_key();
+        let exhausted_key = ExhaustedKey::new(hotkey, routing_key);
         let generation = bucket.generation.load(Ordering::Acquire);
-        if bucket.exhausted_generation(hotkey) == Some(generation) {
+        if bucket.exhausted_generation(&exhausted_key) == Some(generation) {
             return None;
         }
 
         let start_activity = bucket.activity.load(Ordering::Acquire);
-        let start_in_flight = bucket.in_flight.load(Ordering::Acquire);
-        let scan_limit = bucket.live.load(Ordering::Acquire);
-        let mut local_activity = 0usize;
+        let live = bucket.live.load(Ordering::Acquire);
+        let scan_cap = self.inner.reservation_scan_cap.load(Ordering::Acquire);
+        let scan_limit = live.min(scan_cap);
+        let local_activity = 0usize;
 
-        for _ in 0..scan_limit {
-            let Some(entry) = bucket.pop_visible_entry() else {
-                bucket.mark_exhausted_if_stable(
-                    hotkey,
-                    generation,
-                    start_activity,
-                    local_activity,
-                    start_in_flight,
-                );
-                return None;
-            };
-            local_activity = local_activity.wrapping_add(1);
-
-            if entry.is_expired(self.inner.ttl) || !entry.has_visible_capacity() {
-                let task_id = *entry.item.id();
-                let generation = entry.generation;
-                let retired_now = entry.retire_after_pop();
-                bucket.finish_entry(entry, false);
-                if retired_now {
-                    self.inner
-                        .retire_entry(bucket.as_ref(), task_id, generation);
-                }
-                continue;
-            }
-
-            let key = (*entry.item.id(), entry.generation);
-            let already_sent = match self.inner.sent.entry_sync(key) {
-                SccEntry::Occupied(mut sent_entry) => {
-                    let sent_hotkeys = sent_entry.get_mut();
-                    !sent_hotkeys.insert(hotkey.clone())
-                }
-                SccEntry::Vacant(sent_entry) => {
-                    let mut sent_hotkeys = FoldHashSet::default();
-                    sent_hotkeys.insert(hotkey.clone());
-                    sent_entry.insert_entry(sent_hotkeys);
-                    false
-                }
-            };
-
-            if already_sent {
-                if bucket.finish_entry(entry, true) {
-                    local_activity = local_activity.wrapping_add(1);
-                }
-                continue;
-            }
-
-            let Some(lease) = entry.try_acquire_lease() else {
-                self.inner.clear_sent_for_hotkey(key, hotkey);
-                let task_id = *entry.item.id();
-                let generation = entry.generation;
-                let retired_now = entry.retire_after_pop();
-                bucket.finish_entry(entry, false);
-                if retired_now {
-                    self.inner
-                        .retire_entry(bucket.as_ref(), task_id, generation);
-                }
-                continue;
-            };
-
-            bucket.clear_exhausted_hotkey(hotkey);
-            let _ = bucket.finish_entry(Arc::clone(&entry), lease.available_after > 0);
-            let task = (*entry.item).clone();
-            let duration = lease.final_candidate.then(|| entry.timestamp.elapsed());
-            return Some(TaskQueueDelivery {
-                inner: Arc::clone(&self.inner),
-                bucket: Arc::clone(bucket),
-                entry: Some(entry),
-                key: Some(key),
-                hotkey: Some(hotkey.clone()),
-                task,
-                duration,
-            });
+        if scan_limit == 0 {
+            bucket.mark_exhausted_if_stable(
+                &exhausted_key,
+                generation,
+                start_activity,
+                local_activity,
+            );
+            return None;
         }
 
-        bucket.mark_exhausted_if_stable(
-            hotkey,
-            generation,
-            start_activity,
-            local_activity,
-            start_in_flight,
-        );
+        let start_seq = bucket.scan_cursor(&exhausted_key);
+        let mut scanned_any = false;
+        let mut scanned_count = 0usize;
+
+        for index_entry in bucket.entries.range(start_seq..) {
+            scanned_any = true;
+            scanned_count += 1;
+            let seq = *index_entry.key();
+            let entry = Arc::clone(index_entry.value());
+            drop(index_entry);
+            bucket.update_scan_cursor(&exhausted_key, seq.saturating_add(1));
+
+            if let Some(delivery) =
+                self.reserve_scanned_entry(bucket, &exhausted_key, hotkey, routing, seq, entry)
+            {
+                return Some(delivery);
+            }
+            if scanned_count >= scan_limit {
+                break;
+            }
+        }
+
+        if scanned_count < scan_limit && start_seq != 0 {
+            for index_entry in bucket.entries.iter() {
+                let seq = *index_entry.key();
+                if seq >= start_seq {
+                    break;
+                }
+                scanned_any = true;
+                scanned_count += 1;
+                let entry = Arc::clone(index_entry.value());
+                drop(index_entry);
+                bucket.update_scan_cursor(&exhausted_key, seq.saturating_add(1));
+
+                if let Some(delivery) =
+                    self.reserve_scanned_entry(bucket, &exhausted_key, hotkey, routing, seq, entry)
+                {
+                    return Some(delivery);
+                }
+                if scanned_count >= scan_limit {
+                    break;
+                }
+            }
+        }
+
+        if !scanned_any {
+            bucket.mark_exhausted_if_stable(
+                &exhausted_key,
+                generation,
+                start_activity,
+                local_activity,
+            );
+            return None;
+        }
+
+        if live <= scan_cap && scanned_count >= live {
+            bucket.mark_exhausted_if_stable(
+                &exhausted_key,
+                generation,
+                start_activity,
+                local_activity,
+            );
+        }
         None
+    }
+
+    fn reserve_scanned_entry(
+        &self,
+        bucket: &Arc<ModelBucket>,
+        exhausted_key: &ExhaustedKey,
+        hotkey: &Hotkey,
+        routing: WorkerRouting<'_>,
+        seq: u64,
+        entry: Arc<QueueEntry>,
+    ) -> Option<TaskQueueDelivery> {
+        if entry.is_expired(self.inner.ttl) {
+            let task_id = *entry.item.id();
+            let generation = entry.generation;
+            let retired_now = entry.retire_if_idle();
+            if retired_now {
+                self.inner
+                    .retire_entry(bucket.as_ref(), seq, task_id, generation);
+            }
+            return None;
+        }
+
+        if !entry.has_visible_capacity() {
+            if QueueEntry::leased_slots(entry.load_state()) == 0 {
+                let task_id = *entry.item.id();
+                let generation = entry.generation;
+                let retired_now = entry.retire_if_idle();
+                if retired_now {
+                    self.inner
+                        .retire_entry(bucket.as_ref(), seq, task_id, generation);
+                }
+            }
+            return None;
+        }
+
+        if !entry.routing.matches_worker(routing) {
+            return None;
+        }
+
+        let key = (*entry.item.id(), entry.generation);
+        let already_sent = match self.inner.sent.entry_sync(key) {
+            SccEntry::Occupied(mut sent_entry) => {
+                let sent_hotkeys = sent_entry.get_mut();
+                !sent_hotkeys.insert(hotkey.clone())
+            }
+            SccEntry::Vacant(sent_entry) => {
+                let mut sent_hotkeys = FoldHashSet::default();
+                sent_hotkeys.insert(hotkey.clone());
+                sent_entry.insert_entry(sent_hotkeys);
+                false
+            }
+        };
+        if already_sent {
+            return None;
+        }
+
+        let Some(lease) = entry.try_acquire_lease() else {
+            self.inner.clear_sent_for_hotkey(key, hotkey);
+            return None;
+        };
+
+        bucket.clear_exhausted(exhausted_key);
+        let task = (*entry.item).clone();
+        let duration = lease.final_candidate.then(|| entry.timestamp.elapsed());
+        Some(TaskQueueDelivery {
+            inner: Arc::clone(&self.inner),
+            bucket: Arc::clone(bucket),
+            seq,
+            entry: Some(entry),
+            key: Some(key),
+            hotkey: Some(hotkey.clone()),
+            exhausted_key: exhausted_key.clone(),
+            task,
+            duration,
+        })
     }
 
     #[allow(dead_code)]

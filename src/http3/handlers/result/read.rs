@@ -193,7 +193,6 @@ pub async fn get_result_handler(
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
     let http_cfg = cfg.http();
-    let metrics = state.metrics().clone();
     let record_origin = normalize_origin(req, http_cfg);
     let gateway_state = state.gateway_state().clone();
     let task_manager = gateway_state.task_manager();
@@ -293,13 +292,6 @@ pub async fn get_result_handler(
     let successful_results = results_vec;
 
     if get_task.all {
-        let best_worker = successful_results
-            .first()
-            .ok_or_else(|| ServerError::Internal("No TaskResult after filtering".into()))?
-            .worker_hotkey
-            .clone();
-        metrics.inc_best_task(&best_worker).await;
-
         let content_disposition = "attachment; filename=\"results.zip\"";
         set_download_headers(res, "application/zip", content_disposition)?;
 
@@ -366,13 +358,10 @@ pub async fn get_result_handler(
         .next()
         .ok_or_else(|| ServerError::Internal("Failed to select best TaskResult".into()))?;
 
-    let best_worker = best.worker_hotkey.clone();
     let asset = best
         .asset
         .ok_or_else(|| ServerError::Internal("Missing asset on best TaskResult".into()))?;
     let data = process_asset(asset, decompress_spz).await?;
-
-    metrics.inc_best_task(&best_worker).await;
 
     let content_disposition = format!("attachment; filename=\"result.{}\"", extension);
     set_download_headers(res, content_type, &content_disposition)?;
