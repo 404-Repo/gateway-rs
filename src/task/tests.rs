@@ -365,8 +365,8 @@ async fn stage_result_rejects_double_stage_for_same_worker() {
 
 #[tokio::test]
 async fn staged_result_defers_timeout_until_commit() {
-    const CLEANUP_INTERVAL: Duration = Duration::from_millis(40);
-    const TASK_AND_RESULT_LIFETIME: Duration = Duration::from_millis(120);
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(20);
+    const TASK_AND_RESULT_LIFETIME: Duration = Duration::from_millis(40);
 
     let metrics = Metrics::new(0.05).unwrap();
     let mutation_queue = RateLimitMutationBuffer::default();
@@ -376,7 +376,7 @@ async fn staged_result_defers_timeout_until_commit() {
         expected_results: 1,
         cleanup_interval: CLEANUP_INTERVAL,
         task_lifetime: TASK_AND_RESULT_LIFETIME,
-        result_lifetime: TASK_AND_RESULT_LIFETIME,
+        result_lifetime: Duration::from_secs(1),
         rate_limit_mutation_queue: mutation_queue.clone(),
         metrics,
         worker_event_recorder: None,
@@ -412,10 +412,7 @@ async fn staged_result_defers_timeout_until_commit() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(
-        TASK_AND_RESULT_LIFETIME.as_millis() as u64 + 200,
-    ))
-    .await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
 
     assert!(
         task_manager.is_assigned(task_id, &worker).await,
@@ -442,6 +439,77 @@ async fn staged_result_defers_timeout_until_commit() {
     assert!(
         mutation_queue.drain_batch(1).await.is_some(),
         "completion side effects should emit after the staged result commits"
+    );
+}
+
+#[tokio::test]
+async fn stale_staged_result_is_dropped_after_bounded_grace() {
+    const CLEANUP_INTERVAL: Duration = Duration::from_millis(20);
+    const TASK_AND_RESULT_LIFETIME: Duration = Duration::from_millis(40);
+
+    let metrics = Metrics::new(0.05).unwrap();
+    let mutation_queue = RateLimitMutationBuffer::default();
+    let limiter = DistributedRateLimiter::new(64);
+    let task_manager = TaskManager::new_with_rate_limit_mutation_queue(TaskManagerInit {
+        initial_capacity: 4,
+        expected_results: 1,
+        cleanup_interval: CLEANUP_INTERVAL,
+        task_lifetime: TASK_AND_RESULT_LIFETIME,
+        result_lifetime: Duration::from_secs(1),
+        rate_limit_mutation_queue: mutation_queue.clone(),
+        metrics,
+        worker_event_recorder: None,
+    })
+    .await;
+    let task_id = Uuid::new_v4();
+    task_manager
+        .add_task_with_rate_limit_reservation(
+            &sample_task(task_id),
+            Some(RateLimitReservation::new(
+                limiter,
+                vec![RateLimitDelta {
+                    subject: Subject::User,
+                    id: 4_243u128,
+                    day_epoch: 99,
+                    add_active: 1,
+                    add_day: 0,
+                }],
+            )),
+        )
+        .await;
+
+    let worker: Hotkey = Hotkey::from_bytes(&[62u8; 32]);
+    let worker_str = worker.to_string();
+    task_manager
+        .record_assignment(task_id, worker.clone(), worker_str.clone().into())
+        .await;
+    task_manager
+        .stage_result(
+            task_id,
+            make_result(worker_str.as_str(), worker_str.as_str(), Instant::now()),
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(260)).await;
+
+    assert!(
+        !task_manager.is_assigned(task_id, &worker).await,
+        "stale staged result should not keep the task assigned forever"
+    );
+    assert!(matches!(
+        task_manager.commit_staged_result(task_id, &worker).await,
+        Err(AddResultError::PendingResultMissing)
+    ));
+    assert_eq!(
+        task_manager.get_status(task_id).await,
+        TaskStatus::Failure {
+            reason: "Task timed out".into(),
+        }
+    );
+    assert!(
+        mutation_queue.drain_batch(1).await.is_some(),
+        "timeout cleanup should still emit completion side effects after dropping stale staged data"
     );
 }
 

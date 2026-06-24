@@ -124,7 +124,6 @@ impl RServer {
                     let protocol = Protocol::new(
                         connection.clone(),
                         rserver_cfg.max_message_size,
-                        rserver_cfg.max_recv_buffer_size,
                         Duration::from_millis(rserver_cfg.receive_message_timeout_ms),
                     );
                     if let Err(e) = Self::handle_request(protocol, send, recv, raft.clone()).await {

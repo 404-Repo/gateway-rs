@@ -6,6 +6,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::api::Task;
+use crate::common::queue::TaskRouting;
 use crate::db::{CreateGenerationTaskInput, CreateGenerationTaskOutcome};
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
@@ -111,6 +112,19 @@ pub async fn add_task_handler(
             } else {
                 None
             };
+        let required_worker_tags = if billing_owner
+            .as_ref()
+            .and_then(|owner| owner.company_id)
+            .is_some()
+        {
+            rate_ctx
+                .company
+                .as_ref()
+                .map(|company| company.worker_tags.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let billing_request_json = json!({
             "seed": seed,
             "model": &model_name,
@@ -265,8 +279,10 @@ pub async fn add_task_handler(
             .task_manager()
             .add_task_with_rate_limit_reservation(&task, reservation.clone())
             .await;
-        queue_slot.push(task);
-        metrics.set_queue_len(queue.len());
+        queue_slot.push_with_routing(
+            task,
+            TaskRouting::with_required_worker_tags(required_worker_tags),
+        );
 
         if let Some(task_log) = task_log.as_ref() {
             task_log.queued();

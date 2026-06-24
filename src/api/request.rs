@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use foldhash::{HashSet, fast::RandomState};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -7,6 +8,36 @@ use uuid::Uuid;
 
 pub use super::gateway_info::{GatewayInfoExt, GatewayInfoExtRef};
 use crate::crypto::hotkey::Hotkey;
+
+pub const MAX_WORKER_TAG_LENGTH: usize = 32;
+
+pub fn normalize_worker_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(tags.len());
+    let mut seen = HashSet::with_capacity_and_hasher(tags.len(), RandomState::default());
+    for tag in tags {
+        let tag = tag.trim().to_ascii_lowercase();
+        if tag.is_empty() {
+            return Err("worker_tags cannot contain empty tags".to_string());
+        }
+        if tag.len() > MAX_WORKER_TAG_LENGTH {
+            return Err(format!(
+                "worker_tags entries cannot exceed {MAX_WORKER_TAG_LENGTH} characters"
+            ));
+        }
+        if !tag.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        }) {
+            return Err(
+                "worker_tags entries may only contain lowercase letters, numbers, underscores, or dashes"
+                    .to_string(),
+            );
+        }
+        if seen.insert(tag.clone()) {
+            normalized.push(tag);
+        }
+    }
+    Ok(normalized)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddTaskRequest {
@@ -57,6 +88,8 @@ pub struct GetTasksRequest {
     pub timestamp: String,
     pub requested_task_count: usize,
     pub model: ModelFilter,
+    #[serde(default)]
+    pub worker_tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

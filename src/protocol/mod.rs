@@ -71,7 +71,6 @@ impl_try_from!(VoteResponse, VoteResponse<NodeId>);
 pub struct Protocol {
     _connection: Connection,
     max_message_size: usize,
-    max_recv_buffer_size: usize,
     receive_message_timeout_ms: Duration,
 }
 
@@ -79,13 +78,11 @@ impl Protocol {
     pub fn new(
         conn: Connection,
         max_message_size: usize,
-        max_recv_buffer_size: usize,
         receive_message_timeout_ms: Duration,
     ) -> Self {
         Self {
             _connection: conn,
             max_message_size,
-            max_recv_buffer_size,
             receive_message_timeout_ms,
         }
     }
@@ -107,22 +104,21 @@ impl Protocol {
     }
 
     pub async fn receive_message(&self, mut recv_stream: RecvStream) -> Result<RaftMessageType> {
-        let mut message_data = Vec::with_capacity(self.max_message_size);
-        let mut buffer = vec![0; self.max_recv_buffer_size];
-
-        let data = tokio::time::timeout(self.receive_message_timeout_ms, async {
-            while let Some(n) = recv_stream.read(&mut buffer).await? {
-                message_data.extend_from_slice(&buffer[..n]);
-                if message_data.len() > self.max_message_size {
-                    return Err(anyhow!(
-                        "Message exceeded maximum size of {} bytes",
-                        self.max_message_size
-                    ));
-                }
-            }
-            Ok(message_data)
-        })
-        .await??;
+        // `read_to_end` enforces the size cap while reading directly into a
+        // single right-sized buffer, avoiding a per-message pre-allocation of
+        // `max_message_size` plus a separate zero-initialized scratch buffer.
+        let data = tokio::time::timeout(
+            self.receive_message_timeout_ms,
+            recv_stream.read_to_end(self.max_message_size),
+        )
+        .await?
+        .map_err(|e| {
+            anyhow!(
+                "Failed to read message (max {} bytes): {:?}",
+                self.max_message_size,
+                e
+            )
+        })?;
 
         if data.is_empty() {
             return Err(anyhow!("Received empty message"));

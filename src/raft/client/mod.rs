@@ -319,7 +319,6 @@ impl RClient {
         let proto = Protocol::new(
             conn.clone(),
             self.protocol_cfg.max_message_size,
-            self.protocol_cfg.max_recv_buffer_size,
             Duration::from_millis(self.protocol_cfg.receive_message_timeout_ms),
         );
         let msg: RaftMessageType = data.into();

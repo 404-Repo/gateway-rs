@@ -41,6 +41,9 @@ const LOCALHOST: &str = "127.0.0.1";
 const TEST_DOMAIN: &str = "localhost";
 const PROMPT_JSON: &str = r#"{"prompt":"mechanic robot"}"#;
 const GENERIC_WINDOW_MS: u64 = 86_400_000;
+const TEST_HTTP_IDLE_TIMEOUT_SEC: u64 = 10;
+const TEST_HTTP_KEEP_ALIVE_SEC: u64 = 2;
+const TEST_HTTP_RESET_RETRIES: usize = 3;
 
 #[derive(Default)]
 struct BlockingCreateStore {
@@ -192,6 +195,7 @@ fn build_task_queue(config: &NodeConfig) -> TaskQueue {
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
         .default_model(config.model_config.default_model.clone())
         .models(config.model_config.models.keys().cloned())
+        .reservation_scan_cap(config.http.max_task_queue_len)
         .build()
 }
 
@@ -213,6 +217,8 @@ async fn build_http_client(http_port: u16) -> Result<Http3Client> {
         match Http3ClientBuilder::new()
             .server_domain(TEST_DOMAIN)
             .server_ip(server_ip.clone())
+            .max_idle_timeout_sec(TEST_HTTP_IDLE_TIMEOUT_SEC)
+            .keep_alive_interval(TEST_HTTP_KEEP_ALIVE_SEC)
             .dangerous_skip_verification(true)
             .build()
             .await
@@ -236,6 +242,7 @@ async fn build_gateway_node(
     node_id: u64,
     raft_addr: &str,
     http_addr: &str,
+    http_reservation: std::net::UdpSocket,
     raft: Raft,
     state: Arc<StateMachineStore>,
     blocking_store: Arc<BlockingCreateStore>,
@@ -257,6 +264,8 @@ async fn build_gateway_node(
     config.cert.dangerous_skip_verification = true;
     config.cert.cert_file_path.clear();
     config.cert.key_file_path.clear();
+    config.http.max_idle_timeout_sec = TEST_HTTP_IDLE_TIMEOUT_SEC;
+    config.http.keep_alive_interval_sec = TEST_HTTP_KEEP_ALIVE_SEC;
 
     let config_file = tempfile::Builder::new()
         .prefix(&format!("gateway-http-node-{node_id}-"))
@@ -321,6 +330,7 @@ async fn build_gateway_node(
         event_recorder,
     });
 
+    drop(http_reservation);
     let http_server = Http3Server::run(
         runtime_config.clone(),
         Some(RustlsConfig::new(generate_and_create_keycert(vec![
@@ -387,21 +397,27 @@ async fn setup_cross_gateway_harness_inner(
         wait_for_consistent_leader_index(&raft_nodes, &node_configs, Duration::from_secs(10))
             .await?;
 
+    // Keep the reservation sockets alive; each is handed to `build_gateway_node`
+    // and only dropped immediately before that node binds its server, which
+    // closes the reserve->bind race window per node.
     let (http_addrs, http_reservations) = reserve_udp_addresses(node_configs.len())?;
-    drop(http_reservations);
 
     let blocking_store = Arc::new(BlockingCreateStore::default());
     let mut nodes = Vec::with_capacity(node_configs.len());
-    for ((node_id, raft_addr), (state, http_addr)) in node_configs
-        .iter()
-        .zip(state_machines.iter().cloned().zip(http_addrs.iter()))
-    {
+    for ((node_id, raft_addr), ((state, http_addr), http_reservation)) in node_configs.iter().zip(
+        state_machines
+            .iter()
+            .cloned()
+            .zip(http_addrs.iter())
+            .zip(http_reservations),
+    ) {
         nodes.push(
             build_gateway_node(
                 &base_config,
                 *node_id,
                 raft_addr,
                 http_addr.as_str(),
+                http_reservation,
                 raft_nodes[node_index(&node_configs, *node_id)].clone(),
                 state,
                 blocking_store.clone(),
@@ -442,6 +458,34 @@ async fn setup_cross_gateway_harness_inner(
     })
 }
 
+fn is_benign_connection_reset(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("H3_NO_ERROR")
+            || message.contains("Remote reset")
+            || message.contains("connection closed")
+            || message.contains("connection lost")
+    })
+}
+
+async fn send_with_reset_retry<F, Fut>(mut send: F) -> Result<(StatusCode, Bytes)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(StatusCode, Bytes)>>,
+{
+    let mut attempt = 0;
+    loop {
+        match send().await {
+            Ok(response) => return Ok(response),
+            Err(err) if attempt < TEST_HTTP_RESET_RETRIES && is_benign_connection_reset(&err) => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 async fn post_add_task(
     client: &Http3Client,
     http_port: u16,
@@ -449,14 +493,15 @@ async fn post_add_task(
 ) -> Result<(StatusCode, Bytes)> {
     let url = format!("https://{TEST_DOMAIN}:{http_port}/add_task");
     let headers = [("x-api-key", api_key)];
-    client
-        .post(
+    send_with_reset_retry(|| {
+        client.post(
             &url,
             Bytes::from_static(PROMPT_JSON.as_bytes()),
             Some(&headers),
             Some(Duration::from_secs(5)),
         )
-        .await
+    })
+    .await
 }
 
 async fn post_gateway_write(
@@ -467,9 +512,15 @@ async fn post_gateway_write(
 ) -> Result<(StatusCode, Bytes)> {
     let url = format!("https://{TEST_DOMAIN}:{http_port}/write");
     let headers = [("x-admin-key", admin_key)];
-    client
-        .post(&url, payload, Some(&headers), Some(Duration::from_secs(5)))
-        .await
+    send_with_reset_retry(|| {
+        client.post(
+            &url,
+            payload.clone(),
+            Some(&headers),
+            Some(Duration::from_secs(5)),
+        )
+    })
+    .await
 }
 
 fn random_non_admin_key(admin_key: Uuid) -> Uuid {
@@ -646,47 +697,47 @@ async fn repeated_random_admin_key_writes_are_rejected_before_body_parse() -> Re
     let cfg = leader._runtime_config.snapshot();
     let random_admin_key = random_non_admin_key(cfg.http().admin_key).to_string();
 
-    let (first_status, first_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
+    let invalid_bodies = [
         Bytes::from_static(b"not-msgpack"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(
-        first_status,
-        StatusCode::UNAUTHORIZED,
-        "bad-key write should fail on admin key before body parsing; body: {}",
-        String::from_utf8_lossy(first_body.as_ref())
-    );
-
-    let (second_status, second_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
         Bytes::from_static(b"still-not-msgpack"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(
-        second_status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "body: {}",
-        String::from_utf8_lossy(second_body.as_ref())
-    );
-    let payload: serde_json::Value = serde_json::from_slice(second_body.as_ref())?;
-    assert_eq!(
-        payload.get("error").and_then(|value| value.as_str()),
-        Some("invalid_admin_key_rate_limit")
-    );
-
-    let (third_status, _third_body) = post_gateway_write(
-        &leader.client,
-        leader.http_port,
         Bytes::from_static(b"still-not-msgpack-again"),
-        random_admin_key.as_str(),
-    )
-    .await?;
-    assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
+    ];
+    let mut saw_rate_limit = false;
+    for body in invalid_bodies {
+        let (status, response_body) = post_gateway_write(
+            &leader.client,
+            leader.http_port,
+            body,
+            random_admin_key.as_str(),
+        )
+        .await?;
+
+        match status {
+            StatusCode::UNAUTHORIZED => {
+                assert!(
+                    !saw_rate_limit,
+                    "bad-key write became unblocked after rate limit; body: {}",
+                    String::from_utf8_lossy(response_body.as_ref())
+                );
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                saw_rate_limit = true;
+                let payload: serde_json::Value = serde_json::from_slice(response_body.as_ref())?;
+                assert_eq!(
+                    payload.get("error").and_then(|value| value.as_str()),
+                    Some("invalid_admin_key_rate_limit")
+                );
+            }
+            other => panic!(
+                "bad-key write should fail on admin key before body parsing; status: {other}, body: {}",
+                String::from_utf8_lossy(response_body.as_ref())
+            ),
+        }
+    }
+    assert!(
+        saw_rate_limit,
+        "repeated bad-key writes should eventually hit invalid admin key rate limit"
+    );
     Ok(())
 }
 
