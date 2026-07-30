@@ -80,7 +80,7 @@ async fn parse_add_task_multipart(
             }
             "image" => {
                 let is_whitelisted = depot
-                    .obtain::<RateLimitContext>()
+                    .get_typed::<RateLimitContext>()
                     .map(|ctx| ctx.is_whitelisted_ip)
                     .unwrap_or(false);
 

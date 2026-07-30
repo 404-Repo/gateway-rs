@@ -1,14 +1,12 @@
 use super::*;
 
 #[tokio::test]
-async fn normalizes_default_model_on_enqueue() {
+#[should_panic(expected = "task queue requires every task to have a resolved model")]
+async fn enqueue_requires_resolved_model() {
     let queue = build_queue();
-    let hotkey = Hotkey::from_bytes(&[1u8; 32]);
-    queue.push(create_task("robot", None));
-
-    let items = queue.pop_for_models(1, &hotkey, &["404-3dgs"]);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].0.model.as_deref(), Some("404-3dgs"));
+    let mut task = create_task("robot", None);
+    task.model = None;
+    queue.push(task);
 }
 
 #[tokio::test]
@@ -205,8 +203,6 @@ async fn reservation_scan_cap_can_track_queue_limit_above_default() {
         .dup(2)
         .ttl(300)
         .cleanup_interval(1)
-        .default_model("404-3dgs")
-        .models(["404-3dgs"])
         .reservation_scan_cap(DEFAULT_RESERVATION_SCAN_CAP + 64)
         .build();
     let hotkey = Hotkey::from_bytes(&[32u8; 32]);
@@ -238,8 +234,6 @@ async fn reservation_scan_cap_can_be_built_below_default() {
         .dup(2)
         .ttl(300)
         .cleanup_interval(1)
-        .default_model("404-3dgs")
-        .models(["404-3dgs"])
         .reservation_scan_cap(2)
         .build();
     let hotkey = Hotkey::from_bytes(&[35u8; 32]);
@@ -469,14 +463,81 @@ async fn pop_for_models_round_robins_across_requested_buckets() {
 }
 
 #[tokio::test]
-async fn unknown_model_uses_default_bucket() {
+async fn newly_added_model_gets_its_own_dynamic_bucket() {
     let queue = build_queue();
     let hotkey = Hotkey::from_bytes(&[40u8; 32]);
     queue.push(create_task("robot", Some("missing-model")));
 
-    let items = queue.pop_for_models(1, &hotkey, &["404-3dgs"]);
+    assert!(
+        queue.pop_for_models(1, &hotkey, &["404-3dgs"]).is_empty(),
+        "a runtime-added model must not be routed through the default bucket"
+    );
+    let items = queue.pop_for_models(1, &hotkey, &["missing-model"]);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].0.model.as_deref(), Some("missing-model"));
+
+    queue.push(create_task("spaceship", Some("missing-model")));
+    let all_models_hotkey = Hotkey::from_bytes(&[42u8; 32]);
+    let items = queue.pop(1, &all_models_hotkey);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].0.model.as_deref(), Some("missing-model"));
+}
+
+#[tokio::test]
+async fn dynamic_model_buckets_share_the_aggregate_routing_cache_budget() {
+    let queue = build_queue();
+    queue.push(create_task("first", Some("first-model")));
+    queue.push(create_task("second", Some("second-model")));
+
+    let first = queue
+        .inner
+        .existing_bucket("first-model")
+        .expect("first bucket");
+    let second = queue
+        .inner
+        .existing_bucket("second-model")
+        .expect("second bucket");
+
+    assert!(Arc::ptr_eq(&first.routing_caches, &second.routing_caches));
+    assert_eq!(
+        first
+            .routing_caches
+            .exhausted_by_worker
+            .policy()
+            .max_capacity(),
+        Some(crate::common::queue::EXHAUSTED_CACHE_SOFT_TOTAL_CAPACITY)
+    );
+    assert_eq!(
+        first
+            .routing_caches
+            .scan_cursor_by_worker
+            .policy()
+            .max_capacity(),
+        Some(crate::common::queue::SCAN_CURSOR_CACHE_SOFT_TOTAL_CAPACITY)
+    );
+}
+
+#[tokio::test]
+async fn drained_dynamic_model_bucket_is_retired() {
+    let queue = build_queue_with_config(1, 300, 60);
+    let model = "short-lived-model";
+    queue.push(create_task("robot", Some(model)));
+    assert!(queue.inner.existing_bucket(model).is_some());
+
+    let hotkey = Hotkey::from_bytes(&[43u8; 32]);
+    let tasks = queue.pop_for_models(1, &hotkey, &[model]);
+
+    assert_eq!(tasks.len(), 1);
+    assert!(queue.inner.existing_bucket(model).is_none());
+    assert!(
+        !queue
+            .inner
+            .bucket_order
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|known| known == model)
+    );
 }
 
 #[tokio::test]

@@ -21,8 +21,6 @@ fn build_queue_with_config(dup: usize, ttl: u64, cleanup_interval: u64) -> TaskQ
         .dup(dup)
         .ttl(ttl)
         .cleanup_interval(cleanup_interval)
-        .default_model("404-3dgs")
-        .models(["404-3dgs", "404-mesh"])
         .build()
 }
 
@@ -33,8 +31,6 @@ fn build_queue_with_len_gauge() -> (TaskQueue, IntGauge) {
         .dup(1)
         .ttl(300)
         .cleanup_interval(1)
-        .default_model("404-3dgs")
-        .models(["404-3dgs"])
         .queue_len_gauge(gauge.clone())
         .build();
     (queue, gauge)
@@ -45,7 +41,7 @@ fn create_task(prompt: &str, model: Option<&str>) -> Task {
         id: Uuid::new_v4(),
         prompt: Some(Arc::new(prompt.to_string())),
         image: None,
-        model: model.map(ToOwned::to_owned),
+        model: Some(model.unwrap_or("404-3dgs").to_owned()),
         seed: 0,
         model_params: None,
     }

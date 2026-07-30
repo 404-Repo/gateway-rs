@@ -11,9 +11,6 @@ use crate::common::queue::WorkerRouting;
 use crate::db::{RecordedGenerationTaskAssignment, RecordedGenerationTaskAssignmentAction};
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
-use crate::http3::handlers::common::model_errors::{
-    ModelErrorContext, model_error_to_server_error,
-};
 use crate::http3::handlers::common::worker_auth::{WorkerAuthContext, validate_worker_request};
 use crate::http3::state::HttpState;
 use crate::raft::gateway_state::WorkerEventRef;
@@ -37,7 +34,6 @@ pub async fn get_tasks_handler(
     let state = depot.require::<HttpState>()?.clone();
     let cfg = state.config();
     let http_cfg = cfg.http();
-    let model_cfg = &cfg.node().model_config;
     let gateway_state = state.gateway_state().clone();
     let queue = state.task_queue().clone();
     let metrics = state.metrics().clone();
@@ -61,12 +57,6 @@ pub async fn get_tasks_handler(
         }
         let mut seen = HashSet::with_capacity(models.len());
         models.retain(|model| seen.insert(model.clone()));
-
-        for model in &models {
-            model_cfg.output_for(model).map_err(|err| {
-                model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
-            })?;
-        }
 
         models
     };

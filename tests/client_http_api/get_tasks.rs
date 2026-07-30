@@ -74,7 +74,7 @@ async fn get_tasks_invalid_signature_returns_unauthorized() {
 }
 
 #[tokio::test]
-async fn get_tasks_invalid_model_returns_bad_request() {
+async fn get_tasks_unknown_model_filter_returns_empty() {
     let h = build_harness().await;
     let (worker_hotkey, timestamp, signature) = sign_worker([1u8; 32]);
     let res = TestClient::post("http://localhost/get_tasks")
@@ -88,8 +88,16 @@ async fn get_tasks_invalid_model_returns_bad_request() {
         }))
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _headers, body) = read_response(res).await;
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload
+            .get("tasks")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
 }
 
 #[tokio::test]

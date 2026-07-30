@@ -12,11 +12,12 @@ use gateway::raft::rate_limit::RateLimitPolicies;
 
 use crate::common::GatewayHarnessOptions;
 use crate::support::{
-    TestClient, add_task_prompt, add_task_prompt_with_api_key, build_harness,
-    build_harness_with_options, fetch_generation_task_lifecycle, lookup_api_key, multipart_body,
-    read_response, revoke_api_key_without_timestamp, set_gateway_runtime_settings,
+    TestClient, add_task_prompt, add_task_prompt_with_api_key, archive_active_model_price,
+    build_harness, build_harness_with_options, fetch_generation_task_lifecycle,
+    insert_active_model_price, lookup_api_key, multipart_body, read_response,
+    revoke_api_key_without_timestamp, set_gateway_runtime_settings,
     set_generic_rate_limit_policies, set_guest_free_settings, set_registered_free_settings,
-    tiny_png_bytes, top_up_personal_api_key_balance,
+    sync_db_caches, tiny_png_bytes, top_up_personal_api_key_balance,
     try_create_personal_api_key_without_timestamps,
     update_company_api_key_limits_without_timestamp,
     update_personal_api_key_limits_without_timestamp,
@@ -46,7 +47,12 @@ fn pop_seed_for_task(h: &crate::support::TestHarness, task_id: Uuid) -> i32 {
 #[tokio::test]
 async fn add_task_json_success() {
     let h = build_harness().await;
-    let _task_id = add_task_prompt(&h, "robot", None).await;
+    let task_id = add_task_prompt(&h, "robot", None).await;
+    let worker = Hotkey::from_bytes(&[202u8; 32]);
+    let tasks = h.task_queue.pop_for_models(1, &worker, &["404-3dgs"]);
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].0.id, task_id);
+    assert_eq!(tasks[0].0.model.as_deref(), Some("404-3dgs"));
 }
 
 #[tokio::test]
@@ -685,6 +691,71 @@ async fn add_task_rejects_unknown_model() {
 }
 
 #[tokio::test]
+async fn add_task_accepts_model_present_only_in_database() {
+    let h = build_harness().await;
+    insert_active_model_price(&h, "text_to_3d", "database-only-model").await;
+
+    let before_refresh = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({
+            "prompt": "robot",
+            "model": "database-only-model"
+        }))
+        .send(&h.service)
+        .await;
+    let (before_status, _headers, _body) = read_response(before_refresh).await;
+    assert_eq!(before_status, StatusCode::BAD_REQUEST);
+
+    sync_db_caches(&h).await;
+
+    let task_id = add_task_prompt(&h, "robot", Some("database-only-model")).await;
+    let worker = Hotkey::from_bytes(&[201u8; 32]);
+    let tasks = h
+        .task_queue
+        .pop_for_models(1, &worker, &["database-only-model"]);
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].0.id, task_id);
+    assert_eq!(tasks[0].0.model.as_deref(), Some("database-only-model"));
+}
+
+#[tokio::test]
+async fn add_task_uses_configured_default_after_another_model_is_added() {
+    let h = build_harness().await;
+    insert_active_model_price(&h, "text_to_3d", "000-new-model").await;
+    sync_db_caches(&h).await;
+
+    let task_id = add_task_prompt(&h, "robot", None).await;
+    let worker = Hotkey::from_bytes(&[200u8; 32]);
+    let tasks = h.task_queue.pop_for_models(1, &worker, &["404-3dgs"]);
+
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].0.id, task_id);
+    assert_eq!(tasks[0].0.model.as_deref(), Some("404-3dgs"));
+}
+
+#[tokio::test]
+async fn add_task_reports_unavailable_task_kind_after_database_catalog_refresh() {
+    let h = build_harness().await;
+    archive_active_model_price(&h, "text_to_3d", "404-3dgs").await;
+    sync_db_caches(&h).await;
+
+    let res = TestClient::post("http://localhost/add_task")
+        .add_header("x-api-key", h.api_key.to_string(), true)
+        .json(&serde_json::json!({"prompt": "robot", "model": "404-3dgs"}))
+        .send(&h.service)
+        .await;
+    let (status, _headers, body) = read_response(res).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        String::from_utf8_lossy(&body),
+        "Service unavailable: No active model is available for text_to_3d"
+    );
+    assert!(h.task_queue.is_empty());
+}
+
+#[tokio::test]
 async fn add_task_missing_api_key() {
     let h = build_harness().await;
     let res = TestClient::post("http://localhost/add_task")
@@ -1140,7 +1211,7 @@ async fn add_task_rejects_when_queue_full() {
             id: Uuid::new_v4(),
             prompt: Some(Arc::new("robot".to_string())),
             image: None,
-            model: None,
+            model: Some("404-3dgs".to_string()),
             seed: 0,
             model_params: None,
         });

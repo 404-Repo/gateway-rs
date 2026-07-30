@@ -12,14 +12,10 @@ use uuid::Uuid;
 
 use crate::api::request::{GetTaskResultRequest, GetTaskStatus};
 use crate::api::response::GetTaskStatusResponse;
-use crate::config::ModelOutput;
 use crate::db::GenerationTaskStatusSnapshot;
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::handlers::common::activity::{TaskActivityContext, record_task_activity};
-use crate::http3::handlers::common::model_errors::{
-    ModelErrorContext, model_error_to_server_error,
-};
 use crate::http3::handlers::common::origin::normalize_origin;
 use crate::http3::rate_limits::RateLimitContext;
 use crate::http3::state::HttpState;
@@ -31,6 +27,29 @@ use http::HeaderValue;
 use itoa::Buffer;
 
 const ZIP_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum ResultOutput {
+    Ply,
+    Glb,
+}
+
+impl ResultOutput {
+    fn from_asset(asset: Option<&Bytes>) -> Self {
+        if asset.is_some_and(|bytes| bytes.starts_with(b"glTF")) {
+            Self::Glb
+        } else {
+            Self::Ply
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Ply => "application/octet-stream",
+            Self::Glb => "model/gltf-binary",
+        }
+    }
+}
 
 #[inline(always)]
 async fn process_asset(asset: Bytes, decompress_spz: bool) -> Result<Bytes, ServerError> {
@@ -213,8 +232,6 @@ pub async fn get_result_handler(
         },
         "get_result",
     );
-    let model_cfg = &cfg.node().model_config;
-
     let results_bundle = task_manager
         .get_result(get_task.id)
         .await
@@ -230,20 +247,6 @@ pub async fn get_result_handler(
         })?),
         None => None,
     };
-    let output = if let Some(model) = results_bundle.model.as_deref() {
-        model_cfg
-            .output_for(model)
-            .map_err(|err| model_error_to_server_error(err, ModelErrorContext::Internal))?
-    } else if matches!(requested_format.as_deref(), Some("ply" | "spz"))
-        || requested_compress.is_some()
-    {
-        ModelOutput::Ply
-    } else {
-        model_cfg
-            .output_for(model_cfg.default_model.as_str())
-            .map_err(|err| model_error_to_server_error(err, ModelErrorContext::Internal))?
-    };
-
     let wants_ply = if matches!(requested_format.as_deref(), Some("ply")) {
         true
     } else if matches!(requested_format.as_deref(), Some("spz")) {
@@ -252,17 +255,6 @@ pub async fn get_result_handler(
         !compress
     } else {
         false
-    };
-
-    let (extension, content_type, decompress_spz) = match output {
-        ModelOutput::Ply => {
-            if wants_ply {
-                ("ply", output.content_type(), true)
-            } else {
-                ("spz", "application/octet-stream", false)
-            }
-        }
-        ModelOutput::Glb => ("glb", output.content_type(), false),
     };
 
     let mut results_vec = results_bundle.results;
@@ -290,6 +282,21 @@ pub async fn get_result_handler(
     results_vec.retain(|r| r.is_success());
     results_vec.sort_by_key(|a| a.instant);
     let successful_results = results_vec;
+    let output = ResultOutput::from_asset(
+        successful_results
+            .iter()
+            .find_map(|result| result.asset.as_ref()),
+    );
+    let (extension, content_type, decompress_spz) = match output {
+        ResultOutput::Ply => {
+            if wants_ply {
+                ("ply", output.content_type(), true)
+            } else {
+                ("spz", output.content_type(), false)
+            }
+        }
+        ResultOutput::Glb => ("glb", output.content_type(), false),
+    };
 
     if get_task.all {
         let content_disposition = "attachment; filename=\"results.zip\"";

@@ -252,7 +252,7 @@ async fn get_result_compress_false_returns_ply() {
 }
 
 #[tokio::test]
-async fn get_result_invalid_model_config() {
+async fn get_result_infers_output_for_model_without_file_config() {
     let h = build_harness().await;
     let task_id = Uuid::new_v4();
     h.task_manager
@@ -272,14 +272,16 @@ async fn get_result_invalid_model_config() {
         .await;
 
     let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 17);
-    add_success_result(&h.task_manager, task_id, worker, b"spz".to_vec()).await;
+    let payload = b"spz".to_vec();
+    add_success_result(&h.task_manager, task_id, worker, payload.clone()).await;
 
     let res = TestClient::get(format!("http://localhost/get_result?id={task_id}"))
         .add_header("x-api-key", h.api_key.to_string(), true)
         .send(&h.service)
         .await;
-    let (status, _headers, _body) = read_response(res).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _headers, body) = read_response(res).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, payload);
 }
 
 #[tokio::test]
@@ -320,7 +322,7 @@ async fn get_result_model_glb_success() {
     let task_id = add_task_image(&h, &image, Some("404-mesh")).await;
 
     let worker = hotkey_from_seed(HOTKEY_SEED_BASE + 12);
-    let payload = b"glb-bytes".to_vec();
+    let payload = b"glTFglb-bytes".to_vec();
     add_success_result(&h.task_manager, task_id, worker, payload.clone()).await;
 
     let res = TestClient::get(format!("http://localhost/get_result?id={task_id}"))

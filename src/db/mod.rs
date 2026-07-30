@@ -3,6 +3,7 @@ mod data_access;
 mod event_recorder;
 mod gateway_settings;
 mod key_validator;
+mod model_catalog;
 mod task_lifecycle;
 
 use anyhow::Result;
@@ -22,6 +23,7 @@ pub use gateway_settings::{
 pub use key_validator::{
     ApiKeyLookup, ApiKeyValidator, ApiKeyValidatorConfig, api_key_sync_interval,
 };
+pub use model_catalog::{ModelCatalog, ModelCatalogResolveError};
 pub use task_lifecycle::{
     CreateGenerationTaskInput, CreateGenerationTaskOutcome, CreateGenerationTaskRejection,
     FinalizeGenerationTaskAssignmentInput, FinalizeGenerationTaskAssignmentOutcome,

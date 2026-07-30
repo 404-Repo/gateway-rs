@@ -23,7 +23,7 @@ use crate::config_runtime::RuntimeConfigStore;
 use crate::crypto::crypto_provider::init_crypto_provider;
 use crate::db::{
     ApiKeyValidator, ApiKeyValidatorConfig, DatabaseBuilder, EventRecorder, EventSinkHandle,
-    GatewayRuntimeSettingsStore, TaskLifecycleStoreHandle, api_key_sync_interval,
+    GatewayRuntimeSettingsStore, ModelCatalog, TaskLifecycleStoreHandle, api_key_sync_interval,
 };
 use crate::http3::client::Http3Client;
 use crate::http3::client::Http3ClientBuilder;
@@ -36,8 +36,7 @@ use crate::raft::store::Response;
 use crate::raft::store::{RateLimitMutation, RateLimitMutationBatch, Subject};
 use crate::task::rate_limit_completion_request_id;
 use crate::task::{TaskManager, TaskManagerInit};
-use anyhow::Result;
-use anyhow::bail;
+use anyhow::{Context, Result, bail};
 use backon::BackoffBuilder;
 use backon::ConstantBuilder;
 use backon::Retryable;
@@ -77,6 +76,13 @@ pub type Raft = openraft::Raft<TypeConfig>;
 
 pub(crate) const SNAPSHOT_COMPRESSION_LVL: i32 = 1;
 const GENERIC_GLOBAL_SUBJECT_ID: u128 = 0;
+const RATE_LIMIT_RAFT_ENVELOPE_RESERVE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy)]
+struct RaftTransportLimits {
+    max_message_size: usize,
+    max_payload_entries: u64,
+}
 
 fn generic_task_recovery_rate_limit_batch(
     task_id: uuid::Uuid,
@@ -146,12 +152,21 @@ impl Gateway {
     async fn collect_pending_rate_limit_mutations(
         rate_limit_queue: &RateLimitMutationBuffer,
         max_mutations_in_batch: usize,
+        max_message_size: usize,
+        max_payload_entries: u64,
         pending_batch: &mut Option<RateLimitMutationBatch>,
-    ) {
+    ) -> Result<()> {
         if pending_batch.is_some() {
-            return;
+            return Ok(());
         }
-        *pending_batch = rate_limit_queue.drain_batch(max_mutations_in_batch).await;
+        let max_payload_entries = usize::try_from(max_payload_entries.max(1)).unwrap_or(usize::MAX);
+        let max_request_size = max_message_size
+            .saturating_sub(RATE_LIMIT_RAFT_ENVELOPE_RESERVE_BYTES)
+            / max_payload_entries;
+        *pending_batch = rate_limit_queue
+            .drain_batch_with_max_bytes(max_mutations_in_batch, max_request_size)
+            .await?;
+        Ok(())
     }
 
     async fn flush_pending_rate_limit_mutations(
@@ -179,12 +194,13 @@ impl Gateway {
         }
     }
 
-    pub async fn gateway_info_updater(
+    async fn gateway_info_updater(
         config: Arc<RuntimeConfigStore>,
         gateway_state: GatewayState,
         task_queue: TaskQueue,
         last_task_acquisition: Arc<AtomicU64>,
         rate_limit_queue: RateLimitMutationBuffer,
+        raft_transport_limits: RaftTransportLimits,
         shutdown: CancellationToken,
     ) {
         let mut last_leader: Option<u64> = None;
@@ -213,9 +229,12 @@ impl Gateway {
             Gateway::collect_pending_rate_limit_mutations(
                 &rate_limit_queue,
                 max_mutations_in_batch,
+                raft_transport_limits.max_message_size,
+                raft_transport_limits.max_payload_entries,
                 &mut pending_batch,
             )
-            .await;
+            .await
+            .unwrap_or_else(|e| error!("Failed to collect rate-limit mutations: {e}"));
 
             let last_update = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -252,9 +271,12 @@ impl Gateway {
                 Gateway::collect_pending_rate_limit_mutations(
                     &rate_limit_queue,
                     max_mutations_in_batch,
+                    raft_transport_limits.max_message_size,
+                    raft_transport_limits.max_payload_entries,
                     &mut pending_batch,
                 )
-                .await;
+                .await
+                .unwrap_or_else(|e| error!("Failed to collect rate-limit mutations: {e}"));
                 last_leader = Some(leader);
                 client = None;
                 continue;
@@ -315,9 +337,12 @@ impl Gateway {
                 Gateway::collect_pending_rate_limit_mutations(
                     &rate_limit_queue,
                     max_mutations_in_batch,
+                    raft_transport_limits.max_message_size,
+                    raft_transport_limits.max_payload_entries,
                     &mut pending_batch,
                 )
-                .await;
+                .await
+                .unwrap_or_else(|e| error!("Failed to collect rate-limit mutations: {e}"));
             }
         }
     }
@@ -622,11 +647,31 @@ fn build_task_queue(cfg: &NodeConfig, metrics: &Metrics) -> TaskQueue {
         .dup(cfg.basic.unique_workers_per_task)
         .ttl(cfg.basic.taskqueue_task_ttl)
         .cleanup_interval(cfg.basic.taskqueue_cleanup_interval)
-        .default_model(cfg.model_config.default_model.clone())
-        .models(cfg.model_config.models.keys().cloned())
         .reservation_scan_cap(cfg.http.max_task_queue_len)
         .queue_len_gauge(metrics.queue_len_gauge())
         .build()
+}
+
+fn validate_model_defaults(cfg: &NodeConfig, catalog: &ModelCatalog) -> Result<()> {
+    for (task_kind, config_field, default_model) in [
+        (
+            "text_to_3d",
+            "model_defaults.text_to_3d",
+            cfg.model_defaults.text_to_3d.as_str(),
+        ),
+        (
+            "image_to_3d",
+            "model_defaults.image_to_3d",
+            cfg.model_defaults.image_to_3d.as_str(),
+        ),
+    ] {
+        if catalog.resolve(task_kind, None, default_model).is_err() {
+            bail!(
+                "{config_field} model '{default_model}' is not active for task kind '{task_kind}'"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn build_raft_config(cfg: &NodeConfig) -> Result<Arc<openraft::Config>> {
@@ -929,6 +974,13 @@ pub async fn start_gateway(
         },
     )?;
     let api_key_validator = Arc::new(api_key_validator);
+    let gateway_settings = api_key_validator.gateway_settings();
+    gateway_settings
+        .refresh_once()
+        .await
+        .context("load initial gateway settings and model catalog")?;
+    validate_model_defaults(cfg, gateway_settings.model_catalog().as_ref())
+        .context("validate configured default models")?;
     let events_flush_interval = cfg.db.events_flush_interval_sec.max(1);
     let events_queue_capacity = cfg.db.events_queue_capacity.max(1);
     let event_sink = Arc::new(EventSinkHandle::Database(Arc::clone(&db)));
@@ -958,7 +1010,7 @@ pub async fn start_gateway(
     .await;
 
     let gateway_settings_updater = tokio::spawn(GatewayRuntimeSettingsStore::run(
-        api_key_validator.gateway_settings(),
+        Arc::clone(&gateway_settings),
         Some(task_manager.clone()),
         gateway_shutdown.clone(),
     ));
@@ -1036,6 +1088,10 @@ pub async fn start_gateway(
         task_queue.clone(),
         last_task_acquisition,
         rate_limit_queue,
+        RaftTransportLimits {
+            max_message_size: cfg.rserver.max_message_size,
+            max_payload_entries: raft_config.max_payload_entries,
+        },
         gateway_shutdown.clone(),
     ));
     let gateway_leader_change = tokio::spawn(Gateway::gateway_leader_change(

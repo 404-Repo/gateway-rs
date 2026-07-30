@@ -443,6 +443,57 @@ fn read_dev_config(name: &str) -> crate::config::NodeConfig {
     toml::from_str(&text).expect("parse dev config")
 }
 
+fn model_catalog(rows: &[(&str, &str)]) -> crate::db::ModelCatalog {
+    crate::db::ModelCatalog::from_rows(
+        rows.iter()
+            .map(|(task_kind, model)| ((*task_kind).to_string(), (*model).to_string()))
+            .collect(),
+    )
+}
+
+#[test]
+fn configured_model_defaults_must_be_active_in_initial_catalog() {
+    let config = read_dev_config("config1.toml");
+    let catalog = model_catalog(&[
+        ("text_to_3d", "404-3dgs"),
+        ("image_to_3d", "404-3dgs"),
+        ("image_to_3d", "404-mesh"),
+    ]);
+
+    super::validate_model_defaults(&config, &catalog).expect("active defaults");
+}
+
+#[test]
+fn missing_text_default_rejects_initial_catalog() {
+    let config = read_dev_config("config1.toml");
+    let catalog = model_catalog(&[("image_to_3d", "404-3dgs")]);
+
+    let error = super::validate_model_defaults(&config, &catalog)
+        .expect_err("missing text default must fail startup");
+    assert!(error.to_string().contains("model_defaults.text_to_3d"));
+    assert!(error.to_string().contains("404-3dgs"));
+}
+
+#[test]
+fn missing_image_default_rejects_initial_catalog() {
+    let config = read_dev_config("config1.toml");
+    let catalog = model_catalog(&[("text_to_3d", "404-3dgs")]);
+
+    let error = super::validate_model_defaults(&config, &catalog)
+        .expect_err("missing image default must fail startup");
+    assert!(error.to_string().contains("model_defaults.image_to_3d"));
+    assert!(error.to_string().contains("404-3dgs"));
+}
+
+#[test]
+fn empty_initial_catalog_rejects_configured_defaults() {
+    let config = read_dev_config("config1.toml");
+
+    let error = super::validate_model_defaults(&config, &crate::db::ModelCatalog::default())
+        .expect_err("empty catalog must fail startup");
+    assert!(error.to_string().contains("model_defaults.text_to_3d"));
+}
+
 #[test]
 fn raft_peer_selection_uses_raft_dns_not_public_node_dns_names() {
     let mut config = read_dev_config("config1.toml");

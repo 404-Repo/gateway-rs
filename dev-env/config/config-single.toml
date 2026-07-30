@@ -1,10 +1,6 @@
-[model_config]
-default_model = "404-3dgs"
-
-[model_config.models]
-404-3dgs = { output = "ply", supports_txt3d = true, supports_img3d = true }
-404-mesh = { output = "glb", supports_txt3d = false, supports_img3d = true }
-404-mesh-v2 = { output = "glb", supports_txt3d = false, supports_img3d = true }
+[model_defaults]
+text_to_3d = "404-3dgs"
+image_to_3d = "404-3dgs"
 
 [network]
 node_id = 1

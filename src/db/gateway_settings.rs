@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::Database;
 use super::data_access::GatewaySettingsRow;
+use super::model_catalog::ModelCatalog;
 use crate::http3::whitelist::resolve_rate_limit_whitelist_with_status;
 use crate::task::TaskManager;
 
@@ -68,6 +69,7 @@ pub struct GatewayRuntimeSettingsStore {
     registered_generation_limit: AtomicU64,
     registered_window_ms: AtomicU64,
     rate_limit_whitelist: AtomicOwned<Arc<HashSet<IpAddr>>>,
+    model_catalog: AtomicOwned<Arc<ModelCatalog>>,
 }
 
 impl GatewayRuntimeSettingsStore {
@@ -98,6 +100,7 @@ impl GatewayRuntimeSettingsStore {
             registered_generation_limit: AtomicU64::new(DEFAULT_REGISTERED_GENERATION_LIMIT),
             registered_window_ms: AtomicU64::new(DEFAULT_REGISTERED_WINDOW_MS),
             rate_limit_whitelist: AtomicOwned::new(Arc::new(HashSet::new())),
+            model_catalog: AtomicOwned::new(Arc::new(ModelCatalog::default())),
         }
     }
 
@@ -111,16 +114,15 @@ impl GatewayRuntimeSettingsStore {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    if let Err(err) = self.refresh_once().await {
-                        error!("Error updating gateway settings: {:?}", err);
-                    } else if self.has_database_gateway_settings()
-                        && let Some(task_manager) = task_manager.as_ref()
-                    {
-                        task_manager.set_lifetimes(
-                            Duration::from_secs(self.taskmanager_task_lifetime_sec().max(1)),
-                            Duration::from_secs(self.taskmanager_result_lifetime_sec().max(1)),
-                        );
-                    }
+                    let (settings_result, catalog_result) = tokio::join!(
+                        self.refresh_gateway_settings_once(),
+                        self.update_model_catalog(),
+                    );
+                    self.handle_refresh_results(
+                        settings_result,
+                        catalog_result,
+                        task_manager.as_ref(),
+                    );
                 }
             }
         }
@@ -216,9 +218,71 @@ impl GatewayRuntimeSettingsStore {
         drop(previous);
     }
 
-    async fn refresh_once(&self) -> Result<()> {
+    pub(crate) async fn refresh_once(&self) -> Result<()> {
+        let (settings_result, models_result) = tokio::join!(
+            self.refresh_gateway_settings_once(),
+            self.update_model_catalog(),
+        );
+        settings_result?;
+        models_result?;
+        Ok(())
+    }
+
+    async fn refresh_gateway_settings_once(&self) -> Result<()> {
         let now = self.db.server_time_ms().await?;
         self.update_gateway_settings(now).await
+    }
+
+    fn handle_refresh_results(
+        &self,
+        settings_result: Result<()>,
+        catalog_result: Result<()>,
+        task_manager: Option<&TaskManager>,
+    ) {
+        match settings_result {
+            Ok(()) => {
+                if self.has_database_gateway_settings()
+                    && let Some(task_manager) = task_manager
+                {
+                    task_manager.set_lifetimes(
+                        Duration::from_secs(self.taskmanager_task_lifetime_sec().max(1)),
+                        Duration::from_secs(self.taskmanager_result_lifetime_sec().max(1)),
+                    );
+                }
+            }
+            Err(err) => {
+                error!("Error updating gateway settings: {:?}", err);
+            }
+        }
+        if let Err(err) = catalog_result {
+            error!("Error updating model catalog: {:?}", err);
+        }
+    }
+
+    async fn update_model_catalog(&self) -> Result<()> {
+        let rows = self.db.fetch_active_model_catalog().await?;
+        let next = Arc::new(ModelCatalog::from_rows(rows));
+        let previous = self.model_catalog();
+        if *next != *previous {
+            info!(
+                active_model_task_kind_pairs = next.model_count(),
+                "Refreshed active model catalog from database"
+            );
+        }
+        let previous = self
+            .model_catalog
+            .swap((Some(Owned::new(next)), Tag::None), Ordering::AcqRel);
+        drop(previous);
+        Ok(())
+    }
+
+    pub fn model_catalog(&self) -> Arc<ModelCatalog> {
+        let guard = Guard::new();
+        self.model_catalog
+            .load(Ordering::Acquire, &guard)
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(ModelCatalog::default()))
     }
 
     async fn update_gateway_settings(&self, now: i64) -> Result<()> {
@@ -383,6 +447,16 @@ impl GatewayRuntimeSettingsStore {
 
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
+    pub fn seed_model_catalog(&self, rows: Vec<(String, String)>) {
+        let catalog = Arc::new(ModelCatalog::from_rows(rows));
+        let previous = self
+            .model_catalog
+            .swap((Some(Owned::new(catalog)), Tag::None), Ordering::AcqRel);
+        drop(previous);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     pub fn seed_gateway_settings(&self, generic_key: Option<Uuid>) {
         let current = self.cached_gateway_settings();
         self.store_gateway_settings(CachedGatewaySettings {
@@ -429,5 +503,54 @@ impl GatewayRuntimeSettingsStore {
             registered_generation_limit: current.registered_generation_limit,
             registered_window_ms: current.registered_window_ms,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::*;
+    use crate::metrics::Metrics;
+
+    #[tokio::test]
+    async fn catalog_refresh_failure_does_not_block_task_lifetime_update() {
+        let store = GatewayRuntimeSettingsStore::new(
+            Arc::new(Database::new_mock()),
+            GatewayRuntimeSettingsConfig {
+                update_interval: Duration::from_secs(1),
+                fallback_generic_key: None,
+            },
+        );
+        let current = store.cached_gateway_settings();
+        store.store_gateway_settings(CachedGatewaySettings {
+            taskmanager_task_lifetime_sec: 7,
+            taskmanager_result_lifetime_sec: 11,
+            ..current
+        });
+        store
+            .has_database_gateway_settings
+            .store(true, Ordering::Release);
+        let task_manager = TaskManager::new_with_task_lifetime(
+            1,
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            Metrics::new(0.05).expect("metrics"),
+            None,
+        )
+        .await;
+
+        store.handle_refresh_results(
+            Ok(()),
+            Err(anyhow!("model catalog unavailable")),
+            Some(&task_manager),
+        );
+
+        assert_eq!(
+            task_manager.lifetimes_for_test(),
+            (Duration::from_secs(7), Duration::from_secs(11))
+        );
     }
 }

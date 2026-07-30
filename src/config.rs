@@ -7,11 +7,11 @@ use std::{fmt, path::Path, path::PathBuf};
 use tracing::Level;
 use uuid::Uuid;
 
+use crate::common::queue::MAX_DUP_SLOTS;
 use crate::config_env::{
     ALLOW_DANGEROUS_SKIP_VERIFICATION_ENV, dangerous_skip_verification_allowed,
     parse_config_from_contents,
 };
-pub use crate::config_model::{ModelConfig, ModelOutput, ModelResolveError};
 use crate::crypto::hotkey::Hotkey;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -210,6 +210,13 @@ pub struct ModelParamsConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ModelDefaultsConfig {
+    pub text_to_3d: String,
+    pub image_to_3d: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageConfig {
     pub max_width: u32,
     pub max_height: u32,
@@ -316,10 +323,6 @@ fn default_tls_versions() -> Vec<String> {
 }
 
 fn validate_loaded_config(config: NodeConfig) -> Result<NodeConfig> {
-    config
-        .model_config
-        .validate()
-        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
     validate_node_config(&config)?;
     Ok(config)
 }
@@ -335,7 +338,7 @@ pub struct Certificate {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    pub model_config: ModelConfig,
+    pub model_defaults: ModelDefaultsConfig,
     pub basic: BasicConfig,
     pub network: NetworkConfig,
     pub rserver: RServerConfig,
@@ -446,6 +449,31 @@ impl fmt::Display for NodeConfig {
 }
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
+    if config.model_defaults.text_to_3d.trim().is_empty() {
+        return Err(anyhow!(
+            "model_defaults.text_to_3d must be a non-empty model name"
+        ));
+    }
+    if config.model_defaults.image_to_3d.trim().is_empty() {
+        return Err(anyhow!(
+            "model_defaults.image_to_3d must be a non-empty model name"
+        ));
+    }
+    if !(1..=MAX_DUP_SLOTS).contains(&config.basic.unique_workers_per_task) {
+        return Err(anyhow!(
+            "basic.unique_workers_per_task must be between 1 and {MAX_DUP_SLOTS}"
+        ));
+    }
+    if config.basic.taskqueue_cleanup_interval == 0 {
+        return Err(anyhow!(
+            "basic.taskqueue_cleanup_interval must be greater than zero"
+        ));
+    }
+    if config.basic.taskqueue_task_ttl == 0 {
+        return Err(anyhow!(
+            "basic.taskqueue_task_ttl must be greater than zero"
+        ));
+    }
     if config.http.transport == TransportMode::Plain {
         tracing::warn!(
             "HTTP transport is configured without TLS; only use this in local development"
@@ -732,6 +760,32 @@ mod tests {
     }
 
     #[test]
+    fn node_config_rejects_invalid_task_queue_settings() {
+        let base: NodeConfig = toml::from_str(&read_config_single()).expect("parse config");
+
+        let mut empty_text_default = base.clone();
+        empty_text_default.model_defaults.text_to_3d = " ".to_string();
+        let err =
+            validate_node_config(&empty_text_default).expect_err("reject empty text model default");
+        assert!(err.to_string().contains("model_defaults.text_to_3d"));
+
+        let mut zero_workers = base.clone();
+        zero_workers.basic.unique_workers_per_task = 0;
+        let err = validate_node_config(&zero_workers).expect_err("reject zero workers");
+        assert!(err.to_string().contains("unique_workers_per_task"));
+
+        let mut zero_cleanup = base.clone();
+        zero_cleanup.basic.taskqueue_cleanup_interval = 0;
+        let err = validate_node_config(&zero_cleanup).expect_err("reject zero cleanup interval");
+        assert!(err.to_string().contains("taskqueue_cleanup_interval"));
+
+        let mut zero_ttl = base;
+        zero_ttl.basic.taskqueue_task_ttl = 0;
+        let err = validate_node_config(&zero_ttl).expect_err("reject zero queue ttl");
+        assert!(err.to_string().contains("taskqueue_task_ttl"));
+    }
+
+    #[test]
     fn trusted_proxy_cidr_parser_matches_ipv4_and_ipv6_ranges() {
         let ipv4 = parse_trusted_proxy_cidr("35.191.0.0/16").expect("ipv4 cidr");
         assert!(ipv4.contains("35.191.22.10".parse().unwrap()));
@@ -776,20 +830,6 @@ mod tests {
         let err = toml::from_str::<NodeConfig>(&config_text).expect_err("reject unknown section");
 
         assert!(err.to_string().contains("unexpected"));
-    }
-
-    #[test]
-    fn model_config_rejects_unknown_model_fields() {
-        let config_text = read_config_single().replacen(
-            "404-3dgs = { output = \"ply\", supports_txt3d = true, supports_img3d = true }",
-            "404-3dgs = { output = \"ply\", supports_txt3d = true, supports_img3d = true, extra = true }",
-            1,
-        );
-
-        let err =
-            toml::from_str::<NodeConfig>(&config_text).expect_err("reject unknown model field");
-
-        assert!(err.to_string().contains("extra"));
     }
 
     #[test]

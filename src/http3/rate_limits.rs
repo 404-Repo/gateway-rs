@@ -237,7 +237,7 @@ fn source_addr_from_req(
 }
 
 fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
-    if let Ok(ctx) = depot.obtain::<RateLimitContext>() {
+    if let Ok(ctx) = depot.get_typed::<RateLimitContext>() {
         if let Some(ip) = ctx.decimal_ip.as_ref() {
             return Some(Arc::clone(ip));
         }
@@ -245,7 +245,7 @@ fn cached_decimal_ip(req: &mut Request, depot: &Depot) -> Option<Arc<str>> {
             return Some(Arc::clone(addr));
         }
     }
-    if let Ok(state) = depot.obtain::<HttpState>() {
+    if let Ok(state) = depot.get_typed::<HttpState>() {
         let cfg = state.config();
         return decimal_ip_from_req(req, cfg.trusted_proxy_cidrs())
             .or_else(|| source_addr_from_req(req, cfg.trusted_proxy_cidrs()));
@@ -427,7 +427,7 @@ pub async fn prepare_rate_limit_context(
     req: &mut Request,
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
-    depot.inject(base_rate_limit_context(req, &state));
+    depot.insert_typed(base_rate_limit_context(req, &state));
     Ok(())
 }
 
@@ -437,7 +437,7 @@ pub async fn ensure_api_key_context(
 ) -> Result<(), ServerError> {
     let state = depot.require::<HttpState>()?.clone();
     let gateway_state = state.gateway_state().clone();
-    let mut context = match depot.obtain::<RateLimitContext>() {
+    let mut context = match depot.get_typed::<RateLimitContext>() {
         Ok(existing) => existing.clone(),
         Err(_) => base_rate_limit_context(req, &state),
     };
@@ -446,7 +446,7 @@ pub async fn ensure_api_key_context(
     }
 
     populate_api_key_context(&mut context, req, &gateway_state).await;
-    depot.inject(context);
+    depot.insert_typed(context);
     Ok(())
 }
 
@@ -505,9 +505,9 @@ impl RateLimiters {
             CachedIpIssuer,
             BasicQuota::per_minute(quota),
         )
-        .with_skipper(|_: &mut Request, depot: &Depot| {
+        .skipper(|_: &mut Request, depot: &Depot| {
             depot
-                .obtain::<RateLimitContext>()
+                .get_typed::<RateLimitContext>()
                 .map(|ctx| ctx.is_whitelisted_ip)
                 .unwrap_or(false)
         })
@@ -540,7 +540,7 @@ pub async fn unauthorized_only_rate_limit(
     ensure_api_key_context(depot, req).await?;
     let state = depot.require::<HttpState>()?.clone();
     let ctx = depot
-        .obtain::<RateLimitContext>()
+        .get_typed::<RateLimitContext>()
         .map_err(|e| ServerError::Internal(format!("RateLimitContext missing: {:?}", e)))?;
     if ctx.is_whitelisted_ip || ctx.has_authorized_key() {
         return Ok(());
@@ -722,7 +722,7 @@ pub async fn reserve_add_task_rate_limit(
     depot: &mut Depot,
 ) -> Result<Option<RateLimitReservation>, ServerError> {
     let ctx = depot
-        .obtain::<RateLimitContext>()
+        .get_typed::<RateLimitContext>()
         .map_err(|e| ServerError::Internal(format!("RateLimitContext missing: {:?}", e)))?;
 
     // Whitelisted IPs bypass the distributed /add_task quota checks too.
