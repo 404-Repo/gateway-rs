@@ -102,8 +102,6 @@ pub async fn build_shared_harness_core(
         .dup(config.basic.unique_workers_per_task)
         .ttl(config.basic.taskqueue_task_ttl)
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
-        .default_model(config.model_config.default_model.clone())
-        .models(config.model_config.models.keys().cloned())
         .reservation_scan_cap(config.http.max_task_queue_len)
         .queue_len_gauge(metrics.queue_len_gauge())
         .build();
@@ -129,6 +127,12 @@ pub async fn build_shared_harness_core(
         )
         .expect("api key validator"),
     );
+    key_validator.seed_model_catalog(vec![
+        ("text_to_3d".to_string(), "404-3dgs".to_string()),
+        ("image_to_3d".to_string(), "404-3dgs".to_string()),
+        ("image_to_3d".to_string(), "404-mesh".to_string()),
+        ("image_to_3d".to_string(), "404-mesh-v2".to_string()),
+    ]);
 
     let state_machine_store = Arc::new(StateMachineStore::default());
     let node_clients =

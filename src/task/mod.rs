@@ -423,6 +423,11 @@ impl TaskManager {
         self.inner.set_lifetimes(task_lifetime, result_lifetime);
     }
 
+    #[cfg(test)]
+    pub(crate) fn lifetimes_for_test(&self) -> (Duration, Duration) {
+        (self.inner.task_lifetime(), self.inner.result_lifetime())
+    }
+
     fn spawn_cleanup(
         inner: Arc<TaskManagerInner>,
         token_child: CancellationToken,

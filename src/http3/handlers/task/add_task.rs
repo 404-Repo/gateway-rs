@@ -7,13 +7,10 @@ use uuid::Uuid;
 
 use crate::api::Task;
 use crate::common::queue::TaskRouting;
-use crate::db::{CreateGenerationTaskInput, CreateGenerationTaskOutcome};
+use crate::db::{CreateGenerationTaskInput, CreateGenerationTaskOutcome, ModelCatalogResolveError};
 use crate::http3::depot_ext::DepotExt;
 use crate::http3::error::ServerError;
 use crate::http3::handlers::common::activity::{TaskActivityContext, record_task_activity};
-use crate::http3::handlers::common::model_errors::{
-    ModelErrorContext, model_error_to_server_error,
-};
 use crate::http3::handlers::common::origin::normalize_origin;
 use crate::http3::handlers::common::peer::request_ip;
 use crate::http3::rate_limits::{RateLimitContext, reserve_add_task_rate_limit};
@@ -48,8 +45,6 @@ pub async fn add_task_handler(
     let outcome = async {
         let add_task = parse_add_task_request(depot, req).await?;
         let validated = validate_add_task_input(depot, add_task)?;
-        let has_prompt = validated.prompt.is_some();
-        let has_image = validated.image.is_some();
         let task_kind = validated.task_kind;
         let user_seed = validated.seed.filter(|seed| *seed != -1);
         let seed_kind = if user_seed.is_some() {
@@ -81,11 +76,45 @@ pub async fn add_task_handler(
             ServerError::ServiceUnavailable("Task queue is full".to_string())
         })?;
 
-        let model_cfg = &cfg.node().model_config;
-        let resolved_model = model_cfg
-            .resolve_and_validate_input(validated.model.as_deref(), has_prompt, has_image)
-            .map_err(|err| {
-                model_error_to_server_error(err, ModelErrorContext::ClientInput { field: "model" })
+        let default_model = match task_kind {
+            crate::metrics::TaskKind::TextTo3D => {
+                cfg.node().model_defaults.text_to_3d.as_str()
+            }
+            crate::metrics::TaskKind::ImageTo3D => {
+                cfg.node().model_defaults.image_to_3d.as_str()
+            }
+        };
+        let model_name = gateway_state
+            .model_catalog()
+            .resolve(
+                billing_task_kind(task_kind),
+                validated.model.as_deref(),
+                default_model,
+            )
+            .map_err(|err| match err {
+                ModelCatalogResolveError::Unavailable { task_kind } => {
+                    ServerError::ServiceUnavailable(format!(
+                        "No active model is available for {task_kind}"
+                    ))
+                }
+                ModelCatalogResolveError::Unsupported {
+                    task_kind,
+                    model,
+                    known,
+                } => {
+                    let expected = if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    };
+                    ServerError::BadRequestJson(serde_json::json!({
+                        "error": "invalid_field",
+                        "field": "model",
+                        "message": format!(
+                            "Model '{model}' is not active for {task_kind}. Expected one of: {expected}"
+                        ),
+                    }))
+                }
             })?;
         let reservation = reserve_add_task_rate_limit(depot).await?;
         rollback_guard.arm(reservation.clone());
@@ -99,7 +128,6 @@ pub async fn add_task_handler(
         let now_ms = current_time_ms();
 
         let task_id = Uuid::new_v4();
-        let model_name = resolved_model.model.clone();
         let billing_owner =
             if rate_ctx.key_is_uuid && (rate_ctx.user_id.is_some() || rate_ctx.is_company_key) {
                 let owner = rate_ctx.billing_owner.clone();
@@ -140,7 +168,7 @@ pub async fn add_task_handler(
             id: task_id,
             prompt: validated.prompt.map(Arc::new),
             image: validated.image.as_ref().map(|img| img.data.clone()),
-            model: Some(resolved_model.model),
+            model: Some(model_name.clone()),
             seed,
             model_params,
         };

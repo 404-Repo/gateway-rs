@@ -1,18 +1,27 @@
 use super::*;
 
 #[test]
-#[should_panic(expected = "task queue requires a non-empty default_model")]
-fn build_requires_non_empty_default_model() {
-    let _ = TaskQueue::builder().default_model(" ").build();
+#[should_panic(expected = "task queue dup must be between 1")]
+fn build_rejects_unsupported_dup_count() {
+    let _ = TaskQueue::builder().dup(usize::MAX).build();
 }
 
 #[test]
-#[should_panic(expected = "task queue dup exceeds supported internal slot count")]
-fn build_rejects_unsupported_dup_count() {
-    let _ = TaskQueue::builder()
-        .dup(usize::MAX)
-        .default_model("404-3dgs")
-        .build();
+#[should_panic(expected = "task queue dup must be between 1")]
+fn build_rejects_zero_dup_count() {
+    let _ = TaskQueue::builder().dup(0).build();
+}
+
+#[test]
+#[should_panic(expected = "task queue ttl must be non-zero")]
+fn build_rejects_zero_ttl() {
+    let _ = TaskQueue::builder().ttl(0).build();
+}
+
+#[test]
+#[should_panic(expected = "task queue cleanup interval must be non-zero")]
+fn build_rejects_zero_cleanup_interval() {
+    let _ = TaskQueue::builder().cleanup_interval(0).build();
 }
 
 #[tokio::test]

@@ -319,6 +319,32 @@ pub(crate) async fn add_task_image(h: &TestHarness, image: &[u8], model: Option<
     Uuid::parse_str(task_id).expect("uuid")
 }
 
+pub(crate) async fn insert_active_model_price(h: &TestHarness, task_kind: &str, model: &str) {
+    let now_ms = current_timestamp() as i64 * 1000;
+    h.core
+        .db_client
+        .execute(
+            "INSERT INTO model_prices (task_kind, model, amount_cents, currency, created_at) VALUES ($1, $2, 1, 'USD', $3)",
+            &[&task_kind, &model, &now_ms],
+        )
+        .await
+        .expect("insert active model price");
+}
+
+pub(crate) async fn archive_active_model_price(h: &TestHarness, task_kind: &str, model: &str) {
+    let now_ms = current_timestamp() as i64 * 1000;
+    let updated = h
+        .core
+        .db_client
+        .execute(
+            "UPDATE model_prices SET archived_at = $3 WHERE task_kind = $1 AND model = $2 AND archived_at IS NULL",
+            &[&task_kind, &model, &now_ms],
+        )
+        .await
+        .expect("archive active model price");
+    assert_eq!(updated, 1, "expected one active model price to archive");
+}
+
 pub(crate) async fn set_generic_rate_limit_policies(h: &TestHarness, policies: RateLimitPolicies) {
     update_app_settings_generic_key(
         &h.core.db_client,
@@ -375,7 +401,7 @@ fn api_key_hash_bytes(h: &TestHarness, api_key: &str) -> [u8; 32] {
     hasher.compute_hash_array(api_key)
 }
 
-async fn sync_db_caches(h: &TestHarness) {
+pub(crate) async fn sync_db_caches(h: &TestHarness) {
     h.core
         .gateway
         .sync_db_caches_for_test()

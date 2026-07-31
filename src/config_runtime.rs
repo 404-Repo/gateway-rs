@@ -230,13 +230,14 @@ impl RuntimeConfigStore {
         let current = self.snapshot();
         warn_restart_required_changes(current.node(), &cfg);
 
-        let snapshot = match build_runtime_snapshot(cfg).await {
+        let mut snapshot = match build_runtime_snapshot(cfg).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 warn!("Invalid runtime config reload: {}", err);
                 return false;
             }
         };
+        retain_restart_required_task_queue_config(current.node(), &mut snapshot.raw);
 
         let previous = self
             .inner
@@ -250,6 +251,32 @@ impl RuntimeConfigStore {
         );
 
         true
+    }
+}
+
+fn retain_restart_required_task_queue_config(current: &NodeConfig, updated: &mut NodeConfig) {
+    if current.basic.unique_workers_per_task != updated.basic.unique_workers_per_task {
+        warn!(
+            "Runtime config changed basic.unique_workers_per_task from {} to {}; restart required to apply",
+            current.basic.unique_workers_per_task, updated.basic.unique_workers_per_task
+        );
+        updated.basic.unique_workers_per_task = current.basic.unique_workers_per_task;
+    }
+
+    if current.basic.taskqueue_task_ttl != updated.basic.taskqueue_task_ttl {
+        warn!(
+            "Runtime config changed basic.taskqueue_task_ttl from {} to {}; restart required to apply",
+            current.basic.taskqueue_task_ttl, updated.basic.taskqueue_task_ttl
+        );
+        updated.basic.taskqueue_task_ttl = current.basic.taskqueue_task_ttl;
+    }
+
+    if current.basic.taskqueue_cleanup_interval != updated.basic.taskqueue_cleanup_interval {
+        warn!(
+            "Runtime config changed basic.taskqueue_cleanup_interval from {} to {}; restart required to apply",
+            current.basic.taskqueue_cleanup_interval, updated.basic.taskqueue_cleanup_interval
+        );
+        updated.basic.taskqueue_cleanup_interval = current.basic.taskqueue_cleanup_interval;
     }
 }
 
@@ -335,10 +362,6 @@ async fn modified_millis_from_path(path: &Path) -> Option<u64> {
 }
 
 async fn build_runtime_snapshot(config: NodeConfig) -> Result<RuntimeConfigSnapshot> {
-    config
-        .model_config
-        .validate()
-        .map_err(|e| anyhow!("Invalid model configuration: {}", e))?;
     validate_node_config(&config)?;
 
     let prompt_regex = Regex::new(&config.prompt.allowed_pattern).map_err(|e| {
@@ -515,6 +538,32 @@ mod tests {
         std::fs::write(file.path(), updated)?;
         assert!(store.reload_from_disk().await);
         let after = store.snapshot();
+        assert_eq!(after.http().request_size_limit, 8192);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_retains_restart_required_task_queue_settings() -> Result<()> {
+        let file = Builder::new().suffix(".toml").tempfile()?;
+        std::fs::write(file.path(), BASE_CONFIG)?;
+        let initial = parse_node_config()?;
+        let store = RuntimeConfigStore::new(PathBuf::from(file.path()), initial).await?;
+
+        let updated = BASE_CONFIG
+            .replace("unique_workers_per_task = 3", "unique_workers_per_task = 5")
+            .replace(
+                "taskqueue_cleanup_interval = 1",
+                "taskqueue_cleanup_interval = 2",
+            )
+            .replace("taskqueue_task_ttl = 1800", "taskqueue_task_ttl = 1900")
+            .replace("request_size_limit = 4096", "request_size_limit = 8192");
+        std::fs::write(file.path(), updated)?;
+
+        assert!(store.reload_from_disk().await);
+        let after = store.snapshot();
+        assert_eq!(after.node().basic.unique_workers_per_task, 3);
+        assert_eq!(after.node().basic.taskqueue_cleanup_interval, 1);
+        assert_eq!(after.node().basic.taskqueue_task_ttl, 1800);
         assert_eq!(after.http().request_size_limit, 8192);
         Ok(())
     }

@@ -287,6 +287,12 @@ impl ApiKeyValidator {
         Arc::clone(&self.gateway_settings)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub fn seed_model_catalog(&self, rows: Vec<(String, String)>) {
+        self.gateway_settings.seed_model_catalog(rows);
+    }
+
     fn cached_company_meta(meta: CompanyMeta) -> CachedCompanyMeta {
         CachedCompanyMeta {
             name: Arc::<str>::from(meta.name),

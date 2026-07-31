@@ -193,8 +193,6 @@ fn build_task_queue(config: &NodeConfig) -> TaskQueue {
         .dup(config.basic.unique_workers_per_task)
         .ttl(config.basic.taskqueue_task_ttl)
         .cleanup_interval(config.basic.taskqueue_cleanup_interval)
-        .default_model(config.model_config.default_model.clone())
-        .models(config.model_config.models.keys().cloned())
         .reservation_scan_cap(config.http.max_task_queue_len)
         .build()
 }
@@ -295,6 +293,11 @@ async fn build_gateway_node(
             fallback_generic_key: config.http.generic_key,
         },
     )?);
+    key_validator.seed_model_catalog(vec![
+        ("text_to_3d".to_string(), "404-3dgs".to_string()),
+        ("image_to_3d".to_string(), "404-3dgs".to_string()),
+        ("image_to_3d".to_string(), "404-mesh".to_string()),
+    ]);
 
     let event_sink = Arc::new(EventSinkHandle::Noop);
     let shutdown = CancellationToken::new();

@@ -9,7 +9,7 @@ use crate::db::{
     ApiKeyLookup, ApiKeyValidator, CreateGenerationTaskInput, CreateGenerationTaskOutcome,
     EventRecorder, FinalizeGenerationTaskAssignmentInput, FinalizeGenerationTaskAssignmentOutcome,
     GatewayRuntimeSettingsStore, GenerationTaskAccessOwner, GenerationTaskStatusSnapshot,
-    RecordedGenerationTaskAssignment, TaskLifecycleStore, TaskLifecycleStoreHandle,
+    ModelCatalog, RecordedGenerationTaskAssignment, TaskLifecycleStore, TaskLifecycleStoreHandle,
 };
 use crate::http3::client::{Http3Client, Http3ClientBuilder};
 use crate::task::TaskManager;
@@ -529,6 +529,10 @@ where
 
     pub fn registered_window_ms(&self) -> u64 {
         self.internal.gateway_settings.registered_window_ms()
+    }
+
+    pub fn model_catalog(&self) -> Arc<ModelCatalog> {
+        self.internal.gateway_settings.model_catalog()
     }
 
     pub fn is_rate_limit_whitelisted_ip(&self, ip: &IpAddr) -> bool {

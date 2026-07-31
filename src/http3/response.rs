@@ -60,7 +60,7 @@ pub async fn custom_response(
     if let Some(status) = res.status_code {
         if status.is_client_error() || status.is_server_error() {
             let client_ip = depot
-                .obtain::<HttpState>()
+                .get_typed::<HttpState>()
                 .ok()
                 .and_then(|state| {
                     let cfg = state.config();

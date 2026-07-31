@@ -1,12 +1,13 @@
 use crossbeam_skiplist::SkipMap;
+use foldhash::HashSet as FoldHashSet;
 use foldhash::fast::RandomState;
-use foldhash::{HashMap as FoldHashMap, HashSet as FoldHashSet};
 use moka::sync::Cache;
 use prometheus::IntGauge;
 use scc::HashMap;
 use scc::hash_map::Entry as SccEntry;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task;
@@ -20,9 +21,7 @@ const ACTIVE_ID_START_CAPACITY: usize = 1024;
 const DEFAULT_DUP_COUNT: usize = 1;
 const DEFAULT_TTL_SECS: u64 = 300;
 const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 1;
-// Soft aggregate targets for per-model routing caches. The budget is divided
-// across configured model buckets, with a minimum of one entry per bucket, so
-// pathological model counts can exceed this by requiring one cache slot each.
+// Aggregate targets shared by every model bucket.
 const EXHAUSTED_CACHE_SOFT_TOTAL_CAPACITY: u64 = 16_384;
 const SCAN_CURSOR_CACHE_SOFT_TOTAL_CAPACITY: u64 = 16_384;
 const MAX_CLEANUP_SCAN_PER_TICK: usize = 64;
@@ -31,7 +30,7 @@ const ENTRY_COUNT_BITS: u64 = 30;
 const ENTRY_COUNT_MASK: u64 = (1u64 << ENTRY_COUNT_BITS) - 1;
 const ENTRY_LEASED_SHIFT: u64 = ENTRY_COUNT_BITS;
 const ENTRY_RETIRED_FLAG: u64 = 1u64 << 61;
-const MAX_DUP_SLOTS: usize = ENTRY_COUNT_MASK as usize;
+pub(crate) const MAX_DUP_SLOTS: usize = ENTRY_COUNT_MASK as usize;
 
 type SentKey = (Uuid, usize);
 
@@ -44,6 +43,12 @@ struct WorkerRoutingKey {
 struct ExhaustedKey {
     hotkey: Hotkey,
     routing: WorkerRoutingKey,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct BucketCacheKey {
+    bucket_id: u64,
+    exhausted: ExhaustedKey,
 }
 
 #[derive(Clone, Default)]
@@ -295,45 +300,63 @@ impl QueueEntry {
     }
 }
 
-struct ModelBucket {
-    entries: SkipMap<u64, Arc<QueueEntry>>,
-    next_seq: AtomicU64,
-    live: AtomicUsize,
-    activity: AtomicUsize,
-    generation: AtomicUsize,
-    exhausted_by_worker: Cache<ExhaustedKey, usize, RandomState>,
-    scan_cursor_by_worker: Cache<ExhaustedKey, u64, RandomState>,
+struct RoutingCaches {
+    exhausted_by_worker: Cache<BucketCacheKey, usize, RandomState>,
+    scan_cursor_by_worker: Cache<BucketCacheKey, u64, RandomState>,
 }
 
-#[cfg(test)]
-impl Default for ModelBucket {
-    fn default() -> Self {
-        Self::with_cache_capacity(
-            EXHAUSTED_CACHE_SOFT_TOTAL_CAPACITY,
-            SCAN_CURSOR_CACHE_SOFT_TOTAL_CAPACITY,
-        )
-    }
-}
-
-impl ModelBucket {
-    fn with_cache_capacity(exhausted_capacity: u64, scan_cursor_capacity: u64) -> Self {
+impl RoutingCaches {
+    fn new() -> Self {
         Self {
-            entries: SkipMap::new(),
-            next_seq: AtomicU64::new(0),
-            live: AtomicUsize::new(0),
-            activity: AtomicUsize::new(0),
-            generation: AtomicUsize::new(0),
             exhausted_by_worker: Cache::builder()
-                .max_capacity(exhausted_capacity.max(1))
+                .max_capacity(EXHAUSTED_CACHE_SOFT_TOTAL_CAPACITY)
                 .build_with_hasher(RandomState::default()),
             scan_cursor_by_worker: Cache::builder()
-                .max_capacity(scan_cursor_capacity.max(1))
+                .max_capacity(SCAN_CURSOR_CACHE_SOFT_TOTAL_CAPACITY)
                 .build_with_hasher(RandomState::default()),
         }
     }
 }
 
+struct ModelBucket {
+    id: u64,
+    model: Arc<str>,
+    entries: SkipMap<u64, Arc<QueueEntry>>,
+    next_seq: AtomicU64,
+    live: AtomicUsize,
+    activity: AtomicUsize,
+    generation: AtomicUsize,
+    routing_caches: Arc<RoutingCaches>,
+}
+
+#[cfg(test)]
+impl Default for ModelBucket {
+    fn default() -> Self {
+        Self::new(0, Arc::from("test-model"), Arc::new(RoutingCaches::new()))
+    }
+}
+
 impl ModelBucket {
+    fn new(id: u64, model: Arc<str>, routing_caches: Arc<RoutingCaches>) -> Self {
+        Self {
+            id,
+            model,
+            entries: SkipMap::new(),
+            next_seq: AtomicU64::new(0),
+            live: AtomicUsize::new(0),
+            activity: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            routing_caches,
+        }
+    }
+
+    fn routing_cache_key(&self, exhausted: &ExhaustedKey) -> BucketCacheKey {
+        BucketCacheKey {
+            bucket_id: self.id,
+            exhausted: exhausted.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn snapshot_entries(&self, limit: usize) -> Vec<(u64, Arc<QueueEntry>)> {
         self.entries
@@ -348,19 +371,28 @@ impl ModelBucket {
     }
 
     fn clear_exhausted(&self, key: &ExhaustedKey) {
-        self.exhausted_by_worker.invalidate(key);
+        self.routing_caches
+            .exhausted_by_worker
+            .invalidate(&self.routing_cache_key(key));
     }
 
     fn scan_cursor(&self, key: &ExhaustedKey) -> u64 {
-        self.scan_cursor_by_worker.get(key).unwrap_or(0)
+        self.routing_caches
+            .scan_cursor_by_worker
+            .get(&self.routing_cache_key(key))
+            .unwrap_or(0)
     }
 
     fn update_scan_cursor(&self, key: &ExhaustedKey, seq: u64) {
-        self.scan_cursor_by_worker.insert(key.clone(), seq);
+        self.routing_caches
+            .scan_cursor_by_worker
+            .insert(self.routing_cache_key(key), seq);
     }
 
     fn rewind_scan_cursor(&self, key: &ExhaustedKey, seq: u64) {
-        self.scan_cursor_by_worker.insert(key.clone(), seq);
+        self.routing_caches
+            .scan_cursor_by_worker
+            .insert(self.routing_cache_key(key), seq);
     }
 
     fn enqueue_new(&self, entry: Arc<QueueEntry>) {
@@ -384,7 +416,9 @@ impl ModelBucket {
     }
 
     fn exhausted_generation(&self, key: &ExhaustedKey) -> Option<usize> {
-        self.exhausted_by_worker.get(key)
+        self.routing_caches
+            .exhausted_by_worker
+            .get(&self.routing_cache_key(key))
     }
 
     fn mark_exhausted_if_stable(
@@ -401,22 +435,25 @@ impl ModelBucket {
             return;
         }
 
-        self.exhausted_by_worker.insert(key.clone(), generation);
+        self.routing_caches
+            .exhausted_by_worker
+            .insert(self.routing_cache_key(key), generation);
     }
 }
 
 struct Inner {
     dup: usize,
-    default_model: Arc<str>,
-    buckets: FoldHashMap<String, Arc<ModelBucket>>,
+    buckets: HashMap<String, Arc<ModelBucket>, RandomState>,
     #[allow(dead_code)]
-    bucket_order: Vec<String>,
+    bucket_order: RwLock<Vec<String>>,
+    routing_caches: Arc<RoutingCaches>,
     sent: HashMap<SentKey, FoldHashSet<Hotkey>, RandomState>,
     active_ids: HashMap<Uuid, ActiveTaskState, RandomState>,
     ttl: Duration,
     len: AtomicUsize,
     queue_len_gauge: Option<IntGauge>,
     next_bucket: AtomicUsize,
+    next_bucket_id: AtomicU64,
     next_generation: AtomicUsize,
     reservation_scan_cap: AtomicUsize,
 }
@@ -448,15 +485,13 @@ pub struct TaskQueueBuilder {
     dup: usize,
     ttl: Duration,
     cleanup_interval: Duration,
-    default_model: Option<String>,
-    models: Vec<String>,
     queue_len_gauge: Option<IntGauge>,
     reservation_scan_cap: usize,
 }
 
 impl TaskQueueBuilder {
     pub fn dup(mut self, dup: usize) -> Self {
-        self.dup = dup.max(1);
+        self.dup = dup;
         self
     }
 
@@ -467,20 +502,6 @@ impl TaskQueueBuilder {
 
     pub fn cleanup_interval(mut self, interval_secs: u64) -> Self {
         self.cleanup_interval = Duration::from_secs(interval_secs);
-        self
-    }
-
-    pub fn default_model(mut self, model: impl Into<String>) -> Self {
-        self.default_model = Some(model.into());
-        self
-    }
-
-    pub fn models<I, S>(mut self, models: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.models = models.into_iter().map(Into::into).collect();
         self
     }
 
@@ -496,45 +517,22 @@ impl TaskQueueBuilder {
 
     pub fn build(self) -> TaskQueue {
         assert!(
-            self.dup.max(1) <= MAX_DUP_SLOTS,
-            "task queue dup exceeds supported internal slot count"
+            (1..=MAX_DUP_SLOTS).contains(&self.dup),
+            "task queue dup must be between 1 and the supported internal slot count"
         );
-        let default_model = self
-            .default_model
-            .filter(|value| !value.trim().is_empty())
-            .expect("task queue requires a non-empty default_model");
-
-        let mut seen = FoldHashSet::default();
-        let mut bucket_order = Vec::new();
-        bucket_order.push(default_model.clone());
-        seen.insert(default_model.clone());
-
-        for model in self.models {
-            if !model.trim().is_empty() && seen.insert(model.clone()) {
-                bucket_order.push(model);
-            }
-        }
-
-        let bucket_count = bucket_order.len().max(1) as u64;
-        let exhausted_cache_capacity = (EXHAUSTED_CACHE_SOFT_TOTAL_CAPACITY / bucket_count).max(1);
-        let scan_cursor_cache_capacity =
-            (SCAN_CURSOR_CACHE_SOFT_TOTAL_CAPACITY / bucket_count).max(1);
-        let mut buckets = FoldHashMap::default();
-        for model in &bucket_order {
-            buckets.insert(
-                model.clone(),
-                Arc::new(ModelBucket::with_cache_capacity(
-                    exhausted_cache_capacity,
-                    scan_cursor_cache_capacity,
-                )),
-            );
-        }
+        assert!(!self.ttl.is_zero(), "task queue ttl must be non-zero");
+        assert!(
+            !self.cleanup_interval.is_zero(),
+            "task queue cleanup interval must be non-zero"
+        );
+        let bucket_order: Vec<String> = Vec::new();
+        let buckets = HashMap::with_capacity_and_hasher(0, RandomState::default());
 
         let inner = Arc::new(Inner {
-            dup: self.dup.max(1),
-            default_model: Arc::from(default_model),
+            dup: self.dup,
             buckets,
-            bucket_order,
+            bucket_order: RwLock::new(bucket_order),
+            routing_caches: Arc::new(RoutingCaches::new()),
             sent: HashMap::with_capacity_and_hasher(SENTMAP_START_CAPACITY, RandomState::default()),
             active_ids: HashMap::with_capacity_and_hasher(
                 ACTIVE_ID_START_CAPACITY,
@@ -544,6 +542,7 @@ impl TaskQueueBuilder {
             len: AtomicUsize::new(0),
             queue_len_gauge: self.queue_len_gauge,
             next_bucket: AtomicUsize::new(0),
+            next_bucket_id: AtomicU64::new(1),
             next_generation: AtomicUsize::new(1),
             reservation_scan_cap: AtomicUsize::new(self.reservation_scan_cap.max(1)),
         });
@@ -554,7 +553,12 @@ impl TaskQueueBuilder {
             while let Some(inner) = weak_inner.upgrade() {
                 tokio::time::sleep(cleanup_interval).await;
 
-                for bucket in inner.buckets.values() {
+                let mut buckets = Vec::new();
+                inner.buckets.iter_sync(|_, bucket| {
+                    buckets.push(Arc::clone(bucket));
+                    true
+                });
+                for bucket in buckets {
                     let scan_limit = bucket
                         .live
                         .load(Ordering::Acquire)
@@ -572,10 +576,11 @@ impl TaskQueueBuilder {
                             let task_id = *entry.item.id();
                             let generation = entry.generation;
                             if retired_now {
-                                inner.retire_entry(bucket.as_ref(), seq, task_id, generation);
+                                inner.retire_entry(&bucket, seq, task_id, generation);
                             }
                         }
                     }
+                    inner.try_retire_bucket(&bucket);
                 }
             }
         });
@@ -626,7 +631,7 @@ impl TaskQueueDelivery {
 
         if retired_now {
             self.inner
-                .retire_entry(self.bucket.as_ref(), self.seq, task.id, generation);
+                .retire_entry(&self.bucket, self.seq, task.id, generation);
         }
 
         let duration = retired_now.then(|| entry.timestamp.elapsed());
@@ -667,12 +672,8 @@ impl TaskQueueDelivery {
             self.bucket.bump_generation();
         }
         if outcome.retire_now {
-            self.inner.retire_entry(
-                self.bucket.as_ref(),
-                self.seq,
-                *entry.item.id(),
-                entry.generation,
-            );
+            self.inner
+                .retire_entry(&self.bucket, self.seq, *entry.item.id(), entry.generation);
         }
     }
 }
@@ -755,10 +756,11 @@ impl Inner {
         }
     }
 
-    fn retire_entry(&self, bucket: &ModelBucket, seq: u64, task_id: Uuid, generation: usize) {
+    fn retire_entry(&self, bucket: &Arc<ModelBucket>, seq: u64, task_id: Uuid, generation: usize) {
         if bucket.remove_entry(seq) {
             self.decrement_len();
             self.release_task_id(task_id, generation);
+            self.try_retire_bucket(bucket);
         }
     }
 
@@ -806,17 +808,88 @@ impl Inner {
         let model = task
             .model
             .clone()
-            .unwrap_or_else(|| self.default_model.to_string());
+            .filter(|model| !model.trim().is_empty())
+            .expect("task queue requires every task to have a resolved model");
         task.model = Some(model.clone());
         (task, model)
     }
 
+    fn new_bucket(&self, model: &str) -> Arc<ModelBucket> {
+        Arc::new(ModelBucket::new(
+            self.next_bucket_id.fetch_add(1, Ordering::Relaxed),
+            Arc::from(model),
+            Arc::clone(&self.routing_caches),
+        ))
+    }
+
+    #[cfg(test)]
     fn bucket_for_model(&self, model: &str) -> Arc<ModelBucket> {
+        match self.buckets.entry_sync(model.to_owned()) {
+            SccEntry::Occupied(entry) => Arc::clone(entry.get()),
+            SccEntry::Vacant(entry) => {
+                let bucket = self.new_bucket(model);
+                entry.insert_entry(Arc::clone(&bucket));
+                self.bucket_order
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(model.to_owned());
+                bucket
+            }
+        }
+    }
+
+    fn enqueue_entry(&self, model: &str, queue_entry: Arc<QueueEntry>) {
+        match self.buckets.entry_sync(model.to_owned()) {
+            SccEntry::Occupied(entry) => entry.get().enqueue_new(queue_entry),
+            SccEntry::Vacant(entry) => {
+                let bucket = self.new_bucket(model);
+                bucket.enqueue_new(queue_entry);
+                entry.insert_entry(Arc::clone(&bucket));
+                self.bucket_order
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(model.to_owned());
+            }
+        }
+    }
+
+    fn try_retire_bucket(&self, bucket: &Arc<ModelBucket>) {
+        if bucket.live.load(Ordering::Acquire) != 0 || !bucket.entries.is_empty() {
+            return;
+        }
+
+        if let SccEntry::Occupied(entry) = self.buckets.entry_sync(bucket.model.to_string())
+            && Arc::ptr_eq(entry.get(), bucket)
+            && bucket.live.load(Ordering::Acquire) == 0
+            && bucket.entries.is_empty()
+        {
+            // Keep the map and ordering updates atomic with respect to bucket
+            // creation. Both paths acquire the map entry before this lock.
+            let mut bucket_order = self
+                .bucket_order
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = entry.remove_entry();
+            bucket_order.retain(|model| model != bucket.model.as_ref());
+        }
+    }
+
+    fn existing_bucket(&self, model: &str) -> Option<Arc<ModelBucket>> {
         self.buckets
-            .get(model)
-            .cloned()
-            .or_else(|| self.buckets.get(self.default_model.as_ref()).cloned())
-            .expect("task queue must contain the default bucket")
+            .get_sync(model)
+            .map(|bucket| Arc::clone(&bucket))
+    }
+
+    fn ordered_buckets(&self) -> Vec<Arc<ModelBucket>> {
+        let bucket_order = self
+            .bucket_order
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        bucket_order
+            .iter()
+            .filter_map(|name| self.existing_bucket(name))
+            .collect()
     }
 
     fn push_internal(&self, task: Task) {
@@ -834,7 +907,7 @@ impl Inner {
             timestamp: Instant::now(),
             generation,
         });
-        self.bucket_for_model(&model).enqueue_new(entry);
+        self.enqueue_entry(&model, entry);
     }
 }
 
@@ -844,8 +917,6 @@ impl TaskQueue {
             dup: DEFAULT_DUP_COUNT,
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
-            default_model: None,
-            models: Vec::new(),
             queue_len_gauge: None,
             reservation_scan_cap: DEFAULT_RESERVATION_SCAN_CAP,
         }
@@ -869,14 +940,7 @@ impl TaskQueue {
 
     #[allow(dead_code)]
     pub fn pop(&self, num: usize, hotkey: &Hotkey) -> Vec<(Task, Option<Duration>)> {
-        self.pop_from_bucket_refs(
-            num,
-            hotkey,
-            self.inner
-                .bucket_order
-                .iter()
-                .filter_map(|name| self.inner.buckets.get(name).cloned()),
-        )
+        self.pop_from_bucket_refs(num, hotkey, self.inner.ordered_buckets())
     }
 
     #[allow(dead_code)]
@@ -885,10 +949,7 @@ impl TaskQueue {
             num,
             hotkey,
             WorkerRouting::default(),
-            self.inner
-                .bucket_order
-                .iter()
-                .filter_map(|name| self.inner.buckets.get(name).cloned()),
+            self.inner.ordered_buckets(),
         )
     }
 
@@ -906,7 +967,7 @@ impl TaskQueue {
             hotkey,
             models
                 .iter()
-                .filter_map(|model| self.inner.buckets.get(model.as_ref()).cloned()),
+                .filter_map(|model| self.inner.existing_bucket(model.as_ref())),
         )
     }
 
@@ -938,7 +999,7 @@ impl TaskQueue {
             routing,
             models
                 .iter()
-                .filter_map(|model| self.inner.buckets.get(model.as_ref()).cloned()),
+                .filter_map(|model| self.inner.existing_bucket(model.as_ref())),
         )
     }
 
@@ -1121,8 +1182,7 @@ impl TaskQueue {
             let generation = entry.generation;
             let retired_now = entry.retire_if_idle();
             if retired_now {
-                self.inner
-                    .retire_entry(bucket.as_ref(), seq, task_id, generation);
+                self.inner.retire_entry(bucket, seq, task_id, generation);
             }
             return None;
         }
@@ -1136,8 +1196,7 @@ impl TaskQueue {
             // has_visible_capacity() check above and this point; retiring then
             // would destroy a live, still-deliverable slot and strand the task.
             if entry.retire_if_drained() {
-                self.inner
-                    .retire_entry(bucket.as_ref(), seq, task_id, generation);
+                self.inner.retire_entry(bucket, seq, task_id, generation);
             }
             return None;
         }

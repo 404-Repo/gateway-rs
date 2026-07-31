@@ -278,6 +278,13 @@ async fn write_copy_batch<T>(
 }
 
 impl Database {
+    pub(super) const Q_ACTIVE_MODEL_CATALOG: &'static str = r#"
+SELECT task_kind, model
+FROM model_prices
+WHERE archived_at IS NULL
+ORDER BY task_kind ASC, model ASC;
+"#;
+
     async fn write_activity_events_batch(
         client: &Client,
         rows: &[ActivityEventRow],
@@ -653,6 +660,16 @@ created_at\
             .next()
             .map(decode_gateway_settings_row)
             .transpose()
+    }
+
+    pub async fn fetch_active_model_catalog(&self) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .query_prepared(StmtKey::ActiveModelCatalog, &[])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("task_kind"), row.get("model")))
+            .collect())
     }
 
     pub async fn server_time_ms(&self) -> Result<i64> {

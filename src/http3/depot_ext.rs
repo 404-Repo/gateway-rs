@@ -8,7 +8,7 @@ pub(crate) trait DepotExt {
 
 impl DepotExt for Depot {
     fn require<T: Send + Sync + 'static>(&self) -> Result<&T, ServerError> {
-        self.obtain::<T>().map_err(|e| {
+        self.get_typed::<T>().map_err(|e| {
             ServerError::Internal(format!(
                 "Failed to obtain {}: {:?}",
                 std::any::type_name::<T>(),

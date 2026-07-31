@@ -25,6 +25,7 @@ use super::{Database, DatabaseBuilder};
 pub(super) enum StmtKey {
     ServerTimeMs,
     GatewaySettings,
+    ActiveModelCatalog,
     AllUserKeyHashes,
     DeltaUserKeyHashes,
     AllApiKeyBillingOwners,
@@ -59,6 +60,7 @@ const SLOT_RECONNECTING: u8 = 2;
 const STARTUP_STMT_KEYS: &[StmtKey] = &[
     StmtKey::ServerTimeMs,
     StmtKey::GatewaySettings,
+    StmtKey::ActiveModelCatalog,
     StmtKey::AllUserKeyHashes,
     StmtKey::DeltaUserKeyHashes,
     StmtKey::AllApiKeyBillingOwners,
@@ -878,6 +880,7 @@ impl Database {
         match key {
             StmtKey::ServerTimeMs => Self::Q_SERVER_TIME_MS,
             StmtKey::GatewaySettings => Self::Q_GATEWAY_SETTINGS,
+            StmtKey::ActiveModelCatalog => Self::Q_ACTIVE_MODEL_CATALOG,
             StmtKey::AllUserKeyHashes => Self::Q_ALL_USER_KEY_HASHES,
             StmtKey::DeltaUserKeyHashes => Self::Q_DELTA_USER_KEY_HASHES,
             StmtKey::AllApiKeyBillingOwners => Self::Q_ALL_API_KEY_BILLING_OWNERS,
